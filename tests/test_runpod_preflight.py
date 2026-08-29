@@ -14,6 +14,9 @@ assert SPEC and SPEC.loader
 preflight = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(preflight)
 
+GPU_ID = "NVIDIA H100 80GB HBM3"
+IMAGE = "runpod/pytorch@sha256:" + "a" * 64
+
 
 def _inventory(name: str = "NVIDIA H100 80GB HBM3") -> list[dict[str, object]]:
     return [
@@ -91,8 +94,13 @@ def _watchdog_state(now: datetime) -> dict[str, object]:
         "live_metadata": {
             "pod_id": "pod_123",
             "gpu_count": 8,
+            "provider_gpu_id": GPU_ID,
             "gpu_display_name": "NVIDIA H100 80GB HBM3",
             "machine_gpu_identity": ["NVIDIA H100 80GB HBM3"],
+            "machine_id_hash": "sha256:" + "b" * 64,
+            "data_center_id": "US-IL-1",
+            "secure_cloud": True,
+            "container_image": IMAGE,
             "desired_status": "RUNNING",
             "cost_per_hr": 20.0,
             "adjusted_cost_per_hr": 20.0,
@@ -105,6 +113,8 @@ def _watchdog_state(now: datetime) -> dict[str, object]:
             "safe_budget_usd": 213.4,
             "safety_margin_fraction": 0.03,
             "prior_committed_gpu_usd": 0.0,
+            "maximum_approved_hourly_total_usd": 24.0,
+            "maximum_approved_storage_hourly_usd": 0.1,
         },
         "deadline": {
             "effective_deadline": deadline.isoformat(),
@@ -120,9 +130,13 @@ def test_watchdog_state_must_be_live_exact_and_fit_planned_total_runtime() -> No
         _watchdog_state(now),
         expected_pod_id="pod_123",
         expected_gpu_family="H100_80GB",
+        expected_provider_gpu_id=GPU_ID,
+        allowed_data_center_ids=("US-IL-1",),
+        expected_container_image=IMAGE,
         expected_gpu_count=8,
         planned_hours=7,
         approved_hourly_total_usd=24,
+        approved_storage_hourly_usd=0.1,
         gpu_budget_usd=220,
         now=now,
     )
@@ -136,9 +150,13 @@ def test_watchdog_state_must_be_live_exact_and_fit_planned_total_runtime() -> No
             wrong_pod,
             expected_pod_id="pod_123",
             expected_gpu_family="H100_80GB",
+            expected_provider_gpu_id=GPU_ID,
+            allowed_data_center_ids=("US-IL-1",),
+            expected_container_image=IMAGE,
             expected_gpu_count=8,
             planned_hours=7,
             approved_hourly_total_usd=24,
+            approved_storage_hourly_usd=0.1,
             gpu_budget_usd=220,
             now=now,
         )
@@ -160,9 +178,13 @@ def test_watchdog_state_binds_prior_canonical_gpu_spend_and_remaining_budget() -
         state,
         expected_pod_id="pod_123",
         expected_gpu_family="H100_80GB",
+        expected_provider_gpu_id=GPU_ID,
+        allowed_data_center_ids=("US-IL-1",),
+        expected_container_image=IMAGE,
         expected_gpu_count=8,
         planned_hours=7,
         approved_hourly_total_usd=24,
+        approved_storage_hourly_usd=0.1,
         gpu_budget_usd=220,
         expected_prior_committed_gpu_usd=73.4,
         now=now,
@@ -175,9 +197,13 @@ def test_watchdog_state_binds_prior_canonical_gpu_spend_and_remaining_budget() -
             state,
             expected_pod_id="pod_123",
             expected_gpu_family="H100_80GB",
+            expected_provider_gpu_id=GPU_ID,
+            allowed_data_center_ids=("US-IL-1",),
+            expected_container_image=IMAGE,
             expected_gpu_count=8,
             planned_hours=7,
             approved_hourly_total_usd=24,
+            approved_storage_hourly_usd=0.1,
             gpu_budget_usd=220,
             expected_prior_committed_gpu_usd=70,
             now=now,
@@ -189,9 +215,13 @@ def test_watchdog_state_binds_prior_canonical_gpu_spend_and_remaining_budget() -
             stale,
             expected_pod_id="pod_123",
             expected_gpu_family="H100_80GB",
+            expected_provider_gpu_id=GPU_ID,
+            allowed_data_center_ids=("US-IL-1",),
+            expected_container_image=IMAGE,
             expected_gpu_count=8,
             planned_hours=7,
             approved_hourly_total_usd=24,
+            approved_storage_hourly_usd=0.1,
             gpu_budget_usd=220,
             now=now,
         )

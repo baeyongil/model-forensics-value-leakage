@@ -37,6 +37,7 @@ def main() -> int:
     parser.add_argument("--approved-phase-maximum-usd", type=float, required=True)
     parser.add_argument("--gpu-count", type=int, required=True)
     parser.add_argument("--quote-hourly-per-gpu-usd", type=float, required=True)
+    parser.add_argument("--running-storage-hourly-usd", type=float, required=True)
     parser.add_argument("--safety-margin-fraction", type=float, default=0.03)
     parser.add_argument("--gpu-hard-stop-usd", type=float, required=True)
     parser.add_argument("--api-hard-stop-usd", type=float, required=True)
@@ -64,14 +65,20 @@ def main() -> int:
             )
         ):
             raise ValueError("GPU reservation quote, runtime, and maximum must be positive")
+        if (
+            not math.isfinite(args.running_storage_hourly_usd)
+            or args.running_storage_hourly_usd < 0
+        ):
+            raise ValueError("running storage hourly rate must be finite and nonnegative")
         implied_maximum = approved_gpu_phase_maximum_usd(
             gpu_count=args.gpu_count,
             quote_hourly_per_gpu_usd=args.quote_hourly_per_gpu_usd,
+            running_storage_hourly_usd=args.running_storage_hourly_usd,
             approved_runtime_hours=args.approved_phase_runtime_hours,
         )
         if abs(implied_maximum - args.approved_phase_maximum_usd) > 1e-6:
             raise ValueError(
-                "approved phase maximum must exactly equal 8 GPUs x quote rate x runtime"
+                "approved phase maximum must exactly equal all-in compute plus storage x runtime"
             )
         if os.path.lexists(args.receipt):
             raise ValueError(f"refusing to overwrite claimed GPU receipt: {args.receipt}")
@@ -89,7 +96,10 @@ def main() -> int:
             session_id=session_id,
             approved_phase_maximum_usd=args.approved_phase_maximum_usd,
             approved_maximum_runtime_hours=args.approved_phase_runtime_hours,
-            live_hourly_total_usd=args.gpu_count * args.quote_hourly_per_gpu_usd,
+            live_hourly_total_usd=(
+                args.gpu_count * args.quote_hourly_per_gpu_usd
+                + args.running_storage_hourly_usd
+            ),
             safety_margin_fraction=args.safety_margin_fraction,
         )
         payload = reservation.manifest()

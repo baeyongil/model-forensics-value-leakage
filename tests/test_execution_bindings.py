@@ -17,7 +17,7 @@ from model_forensics.execution_bindings import (
     load_api_route_quote_lock,
     load_gpu_quote_lock,
 )
-from model_forensics.io import read_json, write_json
+from model_forensics.io import read_json, stable_hash, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -156,8 +156,15 @@ def _quote() -> dict:
         "provider": "runpod",
         "quote_id": "runpod-secure-h100-20260829-01",
         "gpu_family": "H100_80GB",
+        "provider_gpu_id": "NVIDIA H100 80GB HBM3",
+        "cloud_type": "SECURE",
+        "allowed_cuda_versions": ["12.8"],
+        "data_center_ids": ["US-IL-1"],
         "gpu_count": 8,
+        "container_disk_gb": 50,
+        "volume_disk_gb": 650,
         "usd_per_gpu_hour": 3.0,
+        "running_storage_usd_per_hour": 700 * 0.10 / 720,
         "quoted_at": datetime(2026, 8, 29, 18, tzinfo=UTC).isoformat(),
         "phase_runtime_allocations": [
             {
@@ -205,8 +212,16 @@ def test_bindings_are_built_independently_from_frozen_sources(tmp_path: Path) ->
     )
 
     assert bindings.gpu.family == "H100_80GB"
+    assert bindings.gpu.provider_gpu_id == "NVIDIA H100 80GB HBM3"
+    assert bindings.gpu.cloud_type == "SECURE"
+    assert bindings.gpu.allowed_cuda_versions == ("12.8",)
+    assert bindings.gpu.data_center_ids == ("US-IL-1",)
     assert bindings.gpu.count == 8
-    assert bindings.gpu.container_image_digest.startswith("vllm/vllm-openai@sha256:")
+    assert bindings.gpu.container_disk_gb == 50
+    assert bindings.gpu.volume_disk_gb == 650
+    assert bindings.gpu.quote.running_storage_usd_per_hour == pytest.approx(700 * 0.10 / 720)
+    assert bindings.gpu_lock_hash == stable_hash(gpu_lock)
+    assert bindings.gpu.container_image_digest == gpu_lock["container_image"]["reference"]
     assert bindings.gpu.vllm_wheel_sha256 == gpu_lock["source_repositories"]["vllm"]["wheel_sha256"]
     assert bindings.gpu.quote.source_url == "https://www.runpod.io/pricing"
     assert bindings.gpu.quote.content_hash == quote.content_hash
@@ -255,6 +270,30 @@ def test_bindings_change_when_preregistered_route_price_changes(tmp_path: Path) 
             api_quote_lock=api_quote,
         )
     assert first.preregistration_hash
+
+
+def test_bindings_hash_the_entire_gpu_software_lock(tmp_path: Path) -> None:
+    config, preregistration, gpu_lock, quote, api_quote = _inputs(tmp_path)
+    original = build_approval_bindings(
+        config=config,
+        preregistration=preregistration,
+        gpu_lock=gpu_lock,
+        quote_lock=quote,
+        api_quote_lock=api_quote,
+    )
+    mutated = yaml.safe_load(yaml.safe_dump(gpu_lock))
+    mutated["source_repositories"]["transformers"]["commit"] = "a" * 40
+    changed = build_approval_bindings(
+        config=config,
+        preregistration=preregistration,
+        gpu_lock=mutated,
+        quote_lock=quote,
+        api_quote_lock=api_quote,
+    )
+
+    assert changed.gpu.container_image_digest == original.gpu.container_image_digest
+    assert changed.gpu.vllm_wheel_sha256 == original.gpu.vllm_wheel_sha256
+    assert changed.gpu_lock_hash != original.gpu_lock_hash
 
 
 def test_bindings_reject_live_api_quote_that_disagrees_with_preregistration(

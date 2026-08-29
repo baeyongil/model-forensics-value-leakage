@@ -229,8 +229,14 @@ clean:
 gpu-reserve:
 	$(call require-var,GPU_PHASE)
 	@mkdir -p "$(dir $(GPU_RESERVATION_RECEIPT))"
-	@quote_values="$$( $(PYTHON) -c 'import sys; from model_forensics.execution_bindings import load_gpu_quote_lock; from model_forensics.gpu_budget import approved_gpu_phase_maximum_usd; quote = load_gpu_quote_lock(sys.argv[1]); phase = sys.argv[2]; allocation = next((item for item in quote.phase_runtime_allocations if item.command_phase == phase), None); assert allocation is not None, f"phase absent from quote lock: {phase}"; maximum = approved_gpu_phase_maximum_usd(gpu_count=quote.gpu_count, quote_hourly_per_gpu_usd=quote.usd_per_gpu_hour, approved_runtime_hours=allocation.maximum_runtime_hours); print(quote.gpu_count, quote.usd_per_gpu_hour, allocation.maximum_runtime_hours, maximum, sep="\t")' "$(GPU_QUOTE_LOCK)" "$(GPU_PHASE)" )"; \
-	IFS=$$'\t' read -r gpu_count per_gpu_rate runtime_hours phase_maximum <<< "$$quote_values"; \
+	@$(PYTHON) scripts/runpod_storage_budget.py reserve \
+		--cost-ledger "$(COST_LEDGER)" \
+		--amount-usd 5 \
+		--gpu-hard-stop-usd 220 \
+		--api-hard-stop-usd 100 \
+		--total-hard-stop-usd 325
+	@quote_values="$$( $(PYTHON) -c 'import sys; from model_forensics.execution_bindings import load_gpu_quote_lock; from model_forensics.gpu_budget import approved_gpu_phase_maximum_usd; quote = load_gpu_quote_lock(sys.argv[1]); phase = sys.argv[2]; allocation = next((item for item in quote.phase_runtime_allocations if item.command_phase == phase), None); assert allocation is not None, f"phase absent from quote lock: {phase}"; maximum = approved_gpu_phase_maximum_usd(gpu_count=quote.gpu_count, quote_hourly_per_gpu_usd=quote.usd_per_gpu_hour, running_storage_hourly_usd=quote.running_storage_usd_per_hour, approved_runtime_hours=allocation.maximum_runtime_hours); print(quote.gpu_count, quote.usd_per_gpu_hour, quote.running_storage_usd_per_hour, allocation.maximum_runtime_hours, maximum, sep="\t")' "$(GPU_QUOTE_LOCK)" "$(GPU_PHASE)" )"; \
+	IFS=$$'\t' read -r gpu_count per_gpu_rate storage_rate runtime_hours phase_maximum <<< "$$quote_values"; \
 	$(PYTHON) scripts/gpu_budget_reserve.py \
 		--cost-ledger "$(COST_LEDGER)" \
 		--phase "$(GPU_PHASE)" \
@@ -239,6 +245,7 @@ gpu-reserve:
 		--approved-phase-maximum-usd "$$phase_maximum" \
 		--gpu-count "$$gpu_count" \
 		--quote-hourly-per-gpu-usd "$$per_gpu_rate" \
+		--running-storage-hourly-usd "$$storage_rate" \
 		--gpu-hard-stop-usd 220 \
 		--api-hard-stop-usd 100 \
 		--total-hard-stop-usd 325 \
@@ -246,12 +253,14 @@ gpu-reserve:
 
 gpu-bootstrap:
 	$(call require-var,GPU_PHASE)
-	@quote_values="$$( $(PYTHON_BOOTSTRAP) -c 'import sys; from model_forensics.execution_bindings import load_gpu_quote_lock; quote = load_gpu_quote_lock(sys.argv[1]); phase = sys.argv[2]; allocation = next((item for item in quote.phase_runtime_allocations if item.command_phase == phase), None); assert allocation is not None, f"phase absent from quote lock: {phase}"; print(quote.gpu_family, quote.usd_per_gpu_hour, allocation.maximum_runtime_hours, quote.source_url, quote.quoted_at.isoformat(), sep="\t")' "$(GPU_QUOTE_LOCK)" "$(GPU_PHASE)" )"; \
-	IFS=$$'\t' read -r gpu_family per_gpu_rate runtime_hours price_source price_checked_at <<< "$$quote_values"; \
-	lock_values="$$( $(PYTHON_BOOTSTRAP) -c 'import sys, yaml; from pathlib import Path; lock = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8")); print(lock["container_image"]["reference"], lock["source_repositories"]["vllm"]["wheel_url"], lock["source_repositories"]["vllm"]["wheel_sha256"], sep="\t")' "$(GPU_LOCK)" )"; \
-	IFS=$$'\t' read -r container_digest wheel_url wheel_sha256 <<< "$$lock_values"; \
+	@bootstrap_values="$$( $(PYTHON_BOOTSTRAP) scripts/extract_gpu_bootstrap_inputs.py --gpu-quote-lock "$(GPU_QUOTE_LOCK)" --gpu-lock "$(GPU_LOCK)" --phase "$(GPU_PHASE)" )"; \
+	IFS=$$'\t' read -r gpu_family provider_gpu_id allowed_cuda_versions data_center_ids storage_rate per_gpu_rate runtime_hours price_source price_checked_at container_digest wheel_url wheel_sha256 <<< "$$bootstrap_values"; \
 	bash scripts/bootstrap_gpu.sh \
 		"$$gpu_family" \
+		"$$provider_gpu_id" \
+		"$$allowed_cuda_versions" \
+		"$$data_center_ids" \
+		"$$storage_rate" \
 		"$$per_gpu_rate" \
 		"$$runtime_hours" \
 		"$$price_source" \

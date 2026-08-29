@@ -57,6 +57,7 @@ def approved_gpu_phase_maximum_usd(
     *,
     gpu_count: int,
     quote_hourly_per_gpu_usd: float,
+    running_storage_hourly_usd: float = 0.0,
     approved_runtime_hours: float,
 ) -> float:
     """Return the upward-rounded maximum implied by the approved GPU quote."""
@@ -67,11 +68,19 @@ def approved_gpu_phase_maximum_usd(
         quote_hourly_per_gpu_usd,
         field="quote_hourly_per_gpu_usd",
     )
+    if (
+        isinstance(running_storage_hourly_usd, bool)
+        or not math.isfinite(float(running_storage_hourly_usd))
+        or float(running_storage_hourly_usd) < 0
+    ):
+        raise ValueError("running_storage_hourly_usd must be finite and non-negative")
     runtime = _positive_finite(
         approved_runtime_hours,
         field="approved_runtime_hours",
     )
-    return _ceil_usd(gpu_count * per_gpu * runtime)
+    return _ceil_usd(
+        (gpu_count * per_gpu + float(running_storage_hourly_usd)) * runtime
+    )
 
 
 def write_json_exclusive(path: str | Path, payload: Any) -> Path:

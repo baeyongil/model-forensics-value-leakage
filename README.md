@@ -66,24 +66,33 @@ frozen and content-addressed:
 
 - `config/gpu_lock.yaml`: pinned container, vLLM wheel and hash, software commits, model and lens
   revisions;
-- `.runpod/gpu_quote_lock.json`: exact eight-GPU offer, current per-GPU rate, source, timestamp,
+- `.runpod/gpu_quote_lock.json`: exact eight-GPU provider identity, secure-cloud/data-center
+  allowlist, CUDA compatibility, disk sizes, compute and running-storage rates, source, timestamp,
   and one runtime allocation for each canonical GPU phase;
 - `.runpod/api_route_quote_lock.json`: the exact four OpenRouter roles, model slugs, current token
   prices, source, and timestamp;
 - `.runpod/paid_run_approval.json`: the user's explicit approval of the exact hashes, routes,
   phase list, hardware, runtimes, and USD caps.
 
-The preregistered high-quality route plan uses Claude Opus 5 for primary final-and-trajectory
-measurement and Gemini 3.1 Pro Preview as the independent all-final judge; the two routes also
-serve as distinct replacement classifiers. Those names are a frozen design statement, not a
-current-price claim. The fresh API quote lock is authoritative, and every response records its
-reported model/provider, usage, and raw-response hash.
+The approval document uses schema version 2. Its bindings include a canonical SHA-256 of the
+entire parsed `config/gpu_lock.yaml` mapping, not only the image and wheel fields. Any change to a
+repository commit, Hub revision, lens hash, image metadata, note, or other lock entry therefore
+invalidates the approval even when the container digest and wheel hash are unchanged.
+
+The preregistered quality-first route plan dual-judges every valid final with Claude Opus 5 and
+Gemini 3.1 Pro Preview; Claude Opus 5 also performs primary trajectory measurement, and the two
+frontier routes serve as distinct replacement classifiers. Entry-tier or economy models are not
+used for primary measurement. Those names are a frozen design statement, not a current-price
+claim. The fresh API quote lock is authoritative, and every response records its reported
+model/provider, usage, and raw-response hash. The API hard stop remains USD 100 and the total hard
+stop remains USD 325.
 
 Every paid command first reconstructs the expected bindings from the run config,
 preregistration, software lock, and both quote locks. It then validates the exact user approval
 before a provider client, tokenizer download, or model backend can be constructed. A second
 immutable receipt binds that phase to one content-addressed execution plan before the first paid
-operation. The quote freshness window is six hours; an expired quote or approval fails closed.
+operation. Each phase-relevant quote has a six-hour freshness window; an expired quote or a
+mismatched, malformed, predated, or future-dated approval fails closed.
 
 Keep `HF_TOKEN`, `OPENROUTER_API_KEY`, and `RUNPOD_API_KEY` in RunPod Secrets or an ignored
 `.env.local`. Never paste values into chat, a report, a Make variable, a command-line argument,
@@ -94,6 +103,60 @@ No command in this README authorizes paid execution. Before the first reservatio
 the exact live RunPod offer and OpenRouter catalog must be checked, the software lock must match,
 both quote locks and the approval must be fresh, and the user must explicitly approve the
 displayed costed plan.
+
+### Freeze and review the private paid bundle
+
+`scripts/freeze_paid_bundle.py` is an offline artifact helper; it does not query a provider,
+reserve a GPU, start a Pod, construct a model backend, or call an API. All of its outputs are
+exclusive, content-addressed files below a non-symlink `.runpod/` directory. It enforces mode
+`0700` on private directories and `0600` on private files and refuses to overwrite an existing
+lock or approval.
+
+Prepare independently reviewed, unhashed JSON quote specifications at
+`.runpod/specs/gpu_quote_spec.json` and `.runpod/specs/api_route_quote_spec.json`. They must contain
+the complete strict quote-lock schemas but omit `content_hash`. Then freeze both locks and inspect
+the non-authorizing, secret-free cost and binding preview:
+
+For the currently reviewed RunPod storage schedule, the GPU specification records the combined
+running storage rate as `(50 GB + 650 GB) × USD 0.10/GB-month ÷ 720 hours`, or approximately
+`0.0972222222` USD/hour. The source URL and timestamp belong in the quote specification; do not
+silently substitute a different billing divisor or omit storage from the projected GPU spend.
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python scripts/freeze_paid_bundle.py preview \
+  --config config/run_122b.yaml \
+  --preregistration config/preregistration.yaml \
+  --gpu-lock config/gpu_lock.yaml \
+  --gpu-quote-lock .runpod/gpu_quote_lock.json \
+  --api-quote-lock .runpod/api_route_quote_lock.json \
+  --gpu-quote-spec .runpod/specs/gpu_quote_spec.json \
+  --api-quote-spec .runpod/specs/api_route_quote_spec.json
+```
+
+If authenticated quote locks already exist, rerun `preview` without the two `--*-quote-spec`
+arguments; it reloads and validates them instead of rewriting them. `ready_for_explicit_user_approval`
+is true only while both quotes are fresh. Review every displayed path, hash, route, hardware field,
+phase runtime, and cap. Only after the user explicitly approves that exact preview, provide a
+non-secret approval identifier, an explicit timezone-aware approval timestamp no earlier than the
+applicable quotes, and each approved canonical phase:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python scripts/freeze_paid_bundle.py approve \
+  --config config/run_122b.yaml \
+  --preregistration config/preregistration.yaml \
+  --gpu-lock config/gpu_lock.yaml \
+  --gpu-quote-lock .runpod/gpu_quote_lock.json \
+  --api-quote-lock .runpod/api_route_quote_lock.json \
+  --output .runpod/paid_run_approval.json \
+  --approval-id "$EXPLICIT_NONSECRET_APPROVAL_ID" \
+  --approved-at "$EXPLICIT_APPROVAL_TIMESTAMP" \
+  --allow-phase behavior_baseline_gpu \
+  --allow-phase behavior_baseline_api
+```
+
+Repeat `--allow-phase` only for phases the user actually approved. The helper never infers approval
+from a preview, environment variable, chat message, or existing file; `approve` requires every
+approval field on its command line and emits only hashes and non-secret metadata.
 
 ## Split-phase command reference
 

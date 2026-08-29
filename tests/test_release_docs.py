@@ -37,7 +37,7 @@ def test_runpod_docs_match_bootstrap_watchdog_and_budget_interfaces() -> None:
     runpod = _text("RUNPOD.md")
     bootstrap = _text("scripts/bootstrap_gpu.sh")
 
-    assert 'if [[ "$#" -ne 11 ]]' in bootstrap
+    assert 'if [[ "$#" -ne 15 ]]' in bootstrap
     for value in ("USD 220", "USD 100", "USD 5", "USD 325"):
         assert value in runpod
     for argument in (
@@ -54,18 +54,31 @@ def test_runpod_docs_match_bootstrap_watchdog_and_budget_interfaces() -> None:
     assert "nohup python3 scripts/runpod_watchdog.py" in bootstrap
     assert "costPerHr" in runpod
     assert "adjustedCostPerHr" in runpod
-    assert "CONTAINER_DIGEST" in runpod
-    assert "VLLM_WHEEL_SHA256" in runpod
+    assert "config/gpu_lock.yaml" in runpod
+    assert "container image digest" in runpod
+    assert "wheel hash" in runpod
     assert "GPU_BUDGET_SESSION_ID" in runpod
     assert "scripts/gpu_budget_reserve.py" in runpod
     assert "scripts/runpod_active_session_verify.py" in runpod
     assert "scripts/gpu_budget_settle.py" in runpod
+    assert "scripts/freeze_paid_bundle.py" in _text("README.md")
     assert ".runpod/sessions/" in runpod
     assert "stopped_confirmed" in runpod
     assert "settled" in runpod
     assert "data/manifests/runpod_watchdog.json" not in runpod
     assert "data/manifests/gpu_preflight.json" not in runpod
-    assert "not current prices or approved values" in runpod
+    assert "schema-v2" in runpod
+    assert "full\nsoftware/GPU lock" in runpod
+    assert "make behavior-baseline-generate" in runpod
+    assert "make behavior-baseline-adjudicate" in runpod
+    assert "make behavior-treatment-generate" in runpod
+    assert "make behavior-treatment-adjudicate" in runpod
+    assert "make resample-generate" in runpod
+    assert "make resample-adjudicate" in runpod
+    assert "always validation-only aliases" in runpod
+    assert "When its\ncanonical JSONL is absent, `make resample`" not in runpod
+    assert "PER_GPU_RATE=" not in runpod
+    assert "--quote-hourly-per-gpu-usd" not in runpod
 
 
 def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
@@ -176,6 +189,20 @@ def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
     assert "load_gpu_quote_lock" in reserve
     assert "--approved-phase-runtime-hours" in reserve
     assert "--quote-hourly-per-gpu-usd" in reserve
+    assert "--running-storage-hourly-usd" in reserve
+
+    bootstrap_target = subprocess.run(
+        [*common, "gpu-bootstrap", "GPU_PHASE=behavior_baseline_gpu"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "scripts/extract_gpu_bootstrap_inputs.py" in bootstrap_target
+    assert "scripts/bootstrap_gpu.sh" in bootstrap_target
+    assert "provider_gpu_id" in bootstrap_target
+    assert "allowed_cuda_versions" in bootstrap_target
+    assert "data_center_ids" in bootstrap_target
+    assert "storage_rate" in bootstrap_target
 
     active_verify = subprocess.run(
         [*common, "gpu-active-verify", "GPU_PHASE=resample_gpu"],

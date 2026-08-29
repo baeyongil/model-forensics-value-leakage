@@ -59,6 +59,7 @@ def test_resample_adjudicate_has_no_model_or_price_override_surface() -> None:
 def test_resample_adjudicate_fails_at_approval_before_any_model_or_client(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     constructed: list[str] = []
 
@@ -70,7 +71,19 @@ def test_resample_adjudicate_fails_at_approval_before_any_model_or_client(
     monkeypatch.setattr(cli, "OpenRouterAdjudicationCaller", forbidden)
     monkeypatch.setattr(cli, "PinnedSentenceTransformerEmbedder", forbidden)
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(["resample-adjudicate", "--config", str(PRIMARY_CONFIG)])
+        cli.main(
+            [
+                "resample-adjudicate",
+                "--config",
+                str(PRIMARY_CONFIG),
+                "--gpu-quote-lock",
+                str(tmp_path / "gpu_quote_lock.json"),
+                "--api-quote-lock",
+                str(tmp_path / "api_route_quote_lock.json"),
+                "--paid-approval",
+                str(tmp_path / "paid_run_approval.json"),
+            ]
+        )
     assert exc_info.value.code == 2
     assert constructed == []
     assert "quote lock" in capsys.readouterr().err.lower()

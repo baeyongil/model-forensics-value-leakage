@@ -1,22 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" -ne 11 ]]; then
-  echo "usage: $0 GPU_FAMILY HOURLY_PER_GPU_USD APPROVED_PHASE_RUNTIME_HOURS PRICE_SOURCE PRICE_CHECKED_AT CONTAINER_IMAGE_DIGEST VLLM_WHEEL_URL VLLM_WHEEL_SHA256 GPU_PHASE GPU_RESERVATION_RECEIPT COST_LEDGER" >&2
+if [[ "$#" -ne 15 ]]; then
+  echo "usage: $0 GPU_FAMILY PROVIDER_GPU_ID ALLOWED_CUDA_VERSIONS_CSV DATA_CENTER_IDS_CSV RUNNING_STORAGE_USD_PER_HOUR HOURLY_PER_GPU_USD APPROVED_PHASE_RUNTIME_HOURS PRICE_SOURCE PRICE_CHECKED_AT CONTAINER_IMAGE_DIGEST VLLM_WHEEL_URL VLLM_WHEEL_SHA256 GPU_PHASE GPU_RESERVATION_RECEIPT COST_LEDGER" >&2
   exit 2
 fi
 
 GPU_FAMILY="$1"
-HOURLY_PER_GPU_USD="$2"
-APPROVED_PHASE_RUNTIME_HOURS="$3"
-PRICE_SOURCE="$4"
-PRICE_CHECKED_AT="$5"
-CONTAINER_IMAGE_DIGEST="$6"
-VLLM_WHEEL_URL="$7"
-VLLM_WHEEL_SHA256="$8"
-GPU_PHASE="$9"
-GPU_RESERVATION_RECEIPT="${10}"
-COST_LEDGER="${11}"
+PROVIDER_GPU_ID="$2"
+ALLOWED_CUDA_VERSIONS_CSV="$3"
+DATA_CENTER_IDS_CSV="$4"
+RUNNING_STORAGE_USD_PER_HOUR="$5"
+HOURLY_PER_GPU_USD="$6"
+APPROVED_PHASE_RUNTIME_HOURS="$7"
+PRICE_SOURCE="$8"
+PRICE_CHECKED_AT="$9"
+CONTAINER_IMAGE_DIGEST="${10}"
+VLLM_WHEEL_URL="${11}"
+VLLM_WHEEL_SHA256="${12}"
+GPU_PHASE="${13}"
+GPU_RESERVATION_RECEIPT="${14}"
+COST_LEDGER="${15}"
+
+if [[ "$ALLOWED_CUDA_VERSIONS_CSV" != "12.8" ]]; then
+  echo "approved CUDA host version set must be exactly 12.8" >&2
+  exit 2
+fi
+IFS=',' read -r -a DATA_CENTER_IDS <<< "$DATA_CENTER_IDS_CSV"
+if [[ "${#DATA_CENTER_IDS[@]}" -eq 0 ]]; then
+  echo "at least one frozen RunPod data center id is required" >&2
+  exit 2
+fi
+DATA_CENTER_ARGS=()
+for data_center_id in "${DATA_CENTER_IDS[@]}"; do
+  if [[ ! "$data_center_id" =~ ^[A-Z0-9][A-Z0-9-]{2,31}$ ]]; then
+    echo "invalid frozen RunPod data center id" >&2
+    exit 2
+  fi
+  DATA_CENTER_ARGS+=(--allowed-data-center-id "$data_center_id")
+done
 
 umask 077
 mkdir -p .runpod
@@ -49,8 +71,12 @@ cleanup_on_exit() {
       env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" python3 scripts/runpod_watchdog.py \
         --pod-id "$RUNPOD_POD_ID" \
         --expected-gpu-family "$EMERGENCY_GPU_FAMILY" \
+        --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
+        "${DATA_CENTER_ARGS[@]}" \
+        --expected-container-image "$CONTAINER_IMAGE_DIGEST" \
         --expected-gpu-count 8 \
         --maximum-approved-hourly-per-gpu-usd 1000000 \
+        --maximum-approved-storage-hourly-usd "$RUNNING_STORAGE_USD_PER_HOUR" \
         --gpu-hard-stop-usd 220 \
         --maximum-runtime-hours 0.000001 \
         --safety-margin-fraction 0.03 \
@@ -107,7 +133,7 @@ PYTHONPATH="$PWD/src" python3 scripts/gpu_budget_preflight.py \
   --phase "$GPU_PHASE" \
   --session-id-env GPU_BUDGET_SESSION_ID \
   --expected-approved-runtime-hours "$APPROVED_PHASE_RUNTIME_HOURS" \
-  --expected-live-hourly-total-usd "$(python3 -c 'import sys; print(8 * float(sys.argv[1]))' "$HOURLY_PER_GPU_USD")" \
+  --expected-live-hourly-total-usd "$(python3 -c 'import sys; print(8 * float(sys.argv[1]) + float(sys.argv[2]))' "$HOURLY_PER_GPU_USD" "$RUNNING_STORAGE_USD_PER_HOUR")" \
   --gpu-hard-stop-usd 220 \
   --api-hard-stop-usd 100 \
   --total-hard-stop-usd 325 \
@@ -160,6 +186,7 @@ GPU_PREFLIGHT_STATE="$SESSION_DIR/gpu_preflight.json"
 GPU_SETUP_DIR=".runpod/setup"
 GPU_SETUP_LOCK="$GPU_SETUP_DIR/setup_lock.json"
 GPU_ENVIRONMENT_MANIFEST="$GPU_SETUP_DIR/gpu_environment.json"
+QWEN4B_SMOKE_MANIFEST="$GPU_SETUP_DIR/qwen4b_prefix_smoke.json"
 GPU_SETUP_VALIDATION="$SESSION_DIR/gpu_setup_validation.json"
 TRANSFORMERS_COMMIT="42ca97014c85d71a88ad60d55f08cb9fb4d26e2c"
 JLENS_COMMIT="581d398613e5602a5af361e1c34d3a92ea82ba8e"
@@ -168,8 +195,12 @@ JLENS_COMMIT="581d398613e5602a5af361e1c34d3a92ea82ba8e"
 env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" nohup python3 scripts/runpod_watchdog.py \
   --pod-id "$RUNPOD_POD_ID" \
   --expected-gpu-family "$GPU_FAMILY" \
+  --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
+  "${DATA_CENTER_ARGS[@]}" \
+  --expected-container-image "$CONTAINER_IMAGE_DIGEST" \
   --expected-gpu-count 8 \
   --maximum-approved-hourly-per-gpu-usd "$HOURLY_PER_GPU_USD" \
+  --maximum-approved-storage-hourly-usd "$RUNNING_STORAGE_USD_PER_HOUR" \
   --gpu-hard-stop-usd "$GPU_HARD_STOP_USD" \
   --maximum-runtime-hours "$MAXIMUM_SAFE_RUNTIME_HOURS" \
   --safety-margin-fraction "$SAFETY_MARGIN_FRACTION" \
@@ -218,10 +249,14 @@ PYTHONPATH="$PWD/src" python3 scripts/runpod_preflight.py \
   --minimum-memory-gib 79 \
   --minimum-free-disk-gib 520 \
   --expected-gpu-family "$GPU_FAMILY" \
+  --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
+  "${DATA_CENTER_ARGS[@]}" \
+  --allowed-cuda-version "$ALLOWED_CUDA_VERSIONS_CSV" \
   --pod-id "$RUNPOD_POD_ID" \
   --watchdog-state "$WATCHDOG_STATE" \
   --watchdog-pid-file "$WATCHDOG_PID_FILE" \
   --hourly-per-gpu-usd "$HOURLY_PER_GPU_USD" \
+  --approved-storage-hourly-usd "$RUNNING_STORAGE_USD_PER_HOUR" \
   --approved-phase-runtime-hours "$APPROVED_PHASE_RUNTIME_HOURS" \
   --planned-hours "$MAXIMUM_SAFE_RUNTIME_HOURS" \
   --gpu-budget-usd "$GPU_HARD_STOP_USD" \
@@ -245,13 +280,14 @@ unset GPU_BUDGET_SESSION_ID
 
 mkdir -p "$GPU_SETUP_DIR"
 if [[ -e .venv-gpu ]]; then
-  if [[ ! -x .venv-gpu/bin/python || ! -f "$GPU_SETUP_LOCK" || ! -f "$GPU_ENVIRONMENT_MANIFEST" ]]; then
+  if [[ ! -x .venv-gpu/bin/python || ! -f "$GPU_SETUP_LOCK" || ! -f "$GPU_ENVIRONMENT_MANIFEST" || ! -f "$QWEN4B_SMOKE_MANIFEST" ]]; then
     echo "existing GPU environment is incomplete and cannot be re-armed" >&2
     exit 2
   fi
   PYTHONPATH="$PWD/src" python3 scripts/gpu_setup_lock.py validate \
     --lock "$GPU_SETUP_LOCK" \
     --environment-manifest "$GPU_ENVIRONMENT_MANIFEST" \
+    --qwen4b-smoke-manifest "$QWEN4B_SMOKE_MANIFEST" \
     --venv-python .venv-gpu/bin/python \
     --container-image-digest "$CONTAINER_IMAGE_DIGEST" \
     --vllm-wheel-url "$VLLM_WHEEL_URL" \
@@ -260,7 +296,7 @@ if [[ -e .venv-gpu ]]; then
     --jlens-commit "$JLENS_COMMIT" \
     > "$GPU_SETUP_VALIDATION"
 else
-  if [[ -e "$GPU_SETUP_LOCK" || -e "$GPU_ENVIRONMENT_MANIFEST" ]]; then
+  if [[ -e "$GPU_SETUP_LOCK" || -e "$GPU_ENVIRONMENT_MANIFEST" || -e "$QWEN4B_SMOKE_MANIFEST" ]]; then
     echo "GPU setup lock exists without its virtual environment" >&2
     exit 2
   fi
@@ -291,9 +327,16 @@ else
   .venv-gpu/bin/python scripts/capture_environment.py \
     --output "$GPU_ENVIRONMENT_MANIFEST" \
     --vllm-wheel "$VLLM_WHEEL_PATH"
+  .venv-gpu/bin/python scripts/qwen4b_prefix_smoke.py \
+    --output "$QWEN4B_SMOKE_MANIFEST" \
+    --tensor-parallel-size 1 \
+    --max-model-len 4096 \
+    --rollout-max-tokens 1024 \
+    --continuation-max-tokens 256
   PYTHONPATH="$PWD/src" python3 scripts/gpu_setup_lock.py create \
     --lock "$GPU_SETUP_LOCK" \
     --environment-manifest "$GPU_ENVIRONMENT_MANIFEST" \
+    --qwen4b-smoke-manifest "$QWEN4B_SMOKE_MANIFEST" \
     --venv-python .venv-gpu/bin/python \
     --container-image-digest "$CONTAINER_IMAGE_DIGEST" \
     --vllm-wheel-url "$VLLM_WHEEL_URL" \

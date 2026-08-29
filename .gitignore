@@ -30,5 +30,6 @@ reports/staging/
 .omx/
 .runpod/
 *.log
+data/manifests/.*.lock
 data/manifests/runpod_watchdog.pid
 data/manifests/runpod_stop.request

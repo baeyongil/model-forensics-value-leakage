@@ -8,6 +8,7 @@ operation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,8 @@ _EXPECTED_FAMILY_ALIASES = {
     "A100_80GB": "A100",
 }
 _TERMINAL_STATUSES = frozenset({"EXITED", "TERMINATED"})
+_CONTAINER_DIGEST_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+_MACHINE_ID_RE = re.compile(r"[A-Za-z0-9_-]{3,191}\Z")
 
 
 class WatchdogError(RuntimeError):
@@ -61,6 +64,7 @@ class WatchdogLimits:
     maximum_runtime_hours: float
     safety_margin_fraction: float = 0.03
     maximum_approved_hourly_total_usd: float | None = None
+    maximum_approved_storage_hourly_usd: float = 0.0
     prior_committed_gpu_usd: float = 0.0
 
     def __post_init__(self) -> None:
@@ -68,6 +72,7 @@ class WatchdogLimits:
             self.gpu_hard_stop_usd,
             self.maximum_runtime_hours,
             self.safety_margin_fraction,
+            self.maximum_approved_storage_hourly_usd,
             self.prior_committed_gpu_usd,
         )
         if any(isinstance(value, bool) or not math.isfinite(float(value)) for value in numeric):
@@ -78,11 +83,15 @@ class WatchdogLimits:
             raise ValueError("safety margin must be between 0 and 0.25")
         if self.prior_committed_gpu_usd < 0:
             raise ValueError("prior committed GPU cost must be non-negative")
+        if self.maximum_approved_storage_hourly_usd < 0:
+            raise ValueError("approved storage hourly cost must be non-negative")
         approved = self.maximum_approved_hourly_total_usd
         if approved is not None and (
             isinstance(approved, bool) or not math.isfinite(float(approved)) or approved <= 0
         ):
             raise ValueError("maximum approved hourly total must be positive and finite")
+        if approved is not None and self.maximum_approved_storage_hourly_usd >= approved:
+            raise ValueError("approved storage hourly cost must be below the all-in hourly total")
         if self.prior_committed_gpu_usd >= self.global_safe_budget_usd:
             raise ValueError("prior committed GPU cost leaves no safety-adjusted GPU budget")
 
@@ -101,8 +110,13 @@ class PodMetadata:
 
     pod_id: str
     gpu_count: int
+    provider_gpu_id: str
     gpu_display_name: str
     machine_gpu_identity: tuple[str, ...]
+    machine_id_hash: str
+    data_center_id: str
+    secure_cloud: bool
+    container_image: str
     desired_status: str
     cost_per_hr: float
     adjusted_cost_per_hr: float
@@ -134,8 +148,13 @@ class PodMetadata:
         return {
             "pod_id": self.pod_id,
             "gpu_count": self.gpu_count,
+            "provider_gpu_id": self.provider_gpu_id,
             "gpu_display_name": self.gpu_display_name,
             "machine_gpu_identity": list(self.machine_gpu_identity),
+            "machine_id_hash": self.machine_id_hash,
+            "data_center_id": self.data_center_id,
+            "secure_cloud": self.secure_cloud,
+            "container_image": self.container_image,
             "desired_status": self.desired_status,
             "cost_per_hr": self.cost_per_hr,
             "adjusted_cost_per_hr": self.adjusted_cost_per_hr,
@@ -223,6 +242,19 @@ def _parse_positive_number(value: Any, *, field: str) -> float:
     return parsed
 
 
+def _parse_container_digest(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or _CONTAINER_DIGEST_RE.fullmatch(value) is None:
+        raise WatchdogError(f"RunPod metadata field {field} must be an exact image digest")
+    return value
+
+
+def _hash_machine_id(value: Any) -> str:
+    if not isinstance(value, str) or _MACHINE_ID_RE.fullmatch(value) is None:
+        raise WatchdogError("RunPod metadata machineId must be a nonempty provider identifier")
+    digest = hashlib.sha256(f"runpod-machine-id-v1:{value}".encode()).hexdigest()
+    return f"sha256:{digest}"
+
+
 def parse_pod_metadata(
     payload: Mapping[str, Any],
     *,
@@ -239,6 +271,9 @@ def parse_pod_metadata(
     count = gpu.get("count")
     if isinstance(count, bool) or not isinstance(count, (int, float)) or int(count) != count:
         raise WatchdogError("RunPod metadata gpu.count must be an integer")
+    provider_gpu_id = gpu.get("id")
+    if not isinstance(provider_gpu_id, str) or not provider_gpu_id.strip():
+        raise WatchdogError("RunPod metadata gpu.id must be nonempty")
     display_name = gpu.get("displayName")
     if not isinstance(display_name, str) or not display_name.strip():
         raise WatchdogError("RunPod metadata gpu.displayName must be nonempty")
@@ -258,6 +293,12 @@ def parse_pod_metadata(
     machine_labels = list(dict.fromkeys(machine_labels))
     if not machine_labels:
         raise WatchdogError("RunPod includeMachine output has no GPU identity")
+    secure_cloud = machine.get("secureCloud")
+    if not isinstance(secure_cloud, bool):
+        raise WatchdogError("RunPod includeMachine output has no secureCloud flag")
+    data_center_id = machine.get("dataCenterId")
+    if not isinstance(data_center_id, str) or not data_center_id.strip():
+        raise WatchdogError("RunPod includeMachine output has no dataCenterId")
     desired_status = payload.get("desiredStatus")
     if desired_status not in {"RUNNING", "EXITED", "TERMINATED"}:
         raise WatchdogError("RunPod metadata desiredStatus is unsupported")
@@ -271,8 +312,13 @@ def parse_pod_metadata(
     return PodMetadata(
         pod_id=expected_pod_id,
         gpu_count=int(count),
+        provider_gpu_id=provider_gpu_id.strip(),
         gpu_display_name=display_name.strip(),
         machine_gpu_identity=tuple(machine_labels),
+        machine_id_hash=_hash_machine_id(payload.get("machineId")),
+        data_center_id=data_center_id.strip(),
+        secure_cloud=secure_cloud,
+        container_image=_parse_container_digest(payload.get("image"), field="image"),
         desired_status=str(desired_status),
         cost_per_hr=_parse_positive_number(payload.get("costPerHr"), field="costPerHr"),
         adjusted_cost_per_hr=_parse_positive_number(
@@ -297,11 +343,18 @@ def validate_live_metadata(
     *,
     expected_gpu_count: int,
     expected_gpu_family: str,
+    expected_provider_gpu_id: str,
+    allowed_data_center_ids: tuple[str, ...],
+    expected_container_image: str,
     limits: WatchdogLimits,
 ) -> None:
     """Validate the exact live Pod against the pre-approved execution profile."""
 
     family = normalize_gpu_family(expected_gpu_family)
+    approved_image = _parse_container_digest(
+        expected_container_image,
+        field="expected_container_image",
+    )
     if expected_gpu_count != 8 or metadata.gpu_count != expected_gpu_count:
         raise WatchdogError(
             f"RunPod live metadata must report exactly 8 GPUs; observed {metadata.gpu_count}"
@@ -310,6 +363,16 @@ def validate_live_metadata(
         raise WatchdogError(
             "RunPod live GPU family does not match the approved profile: "
             f"expected {family}, observed {metadata.gpu_display_name!r}"
+        )
+    if metadata.provider_gpu_id != expected_provider_gpu_id:
+        raise WatchdogError(
+            "RunPod live provider GPU id does not match the frozen quote: "
+            f"expected {expected_provider_gpu_id!r}, observed {metadata.provider_gpu_id!r}"
+        )
+    if not allowed_data_center_ids or metadata.data_center_id not in allowed_data_center_ids:
+        raise WatchdogError(
+            "RunPod live data center is outside the frozen launch set: "
+            f"observed {metadata.data_center_id!r}"
         )
     recognized_machine_families = {
         candidate
@@ -321,6 +384,17 @@ def validate_live_metadata(
         raise WatchdogError(
             "RunPod machine GPU identity disagrees with the approved homogeneous family: "
             f"expected {family}, observed {metadata.machine_gpu_identity!r}"
+        )
+    if expected_provider_gpu_id not in metadata.machine_gpu_identity:
+        raise WatchdogError(
+            "RunPod machine GPU identity does not contain the exact frozen provider GPU id"
+        )
+    if not metadata.secure_cloud:
+        raise WatchdogError("RunPod live machine is not in Secure Cloud")
+    if metadata.container_image != approved_image:
+        raise WatchdogError(
+            "RunPod live image does not match the approval-bound digest: "
+            f"expected {approved_image!r}, observed {metadata.container_image!r}"
         )
     if metadata.desired_status != "RUNNING":
         raise WatchdogError(
@@ -472,6 +546,9 @@ def _state(
             "safety_margin_fraction": limits.safety_margin_fraction,
             "maximum_runtime_hours": limits.maximum_runtime_hours,
             "maximum_approved_hourly_total_usd": limits.maximum_approved_hourly_total_usd,
+            "maximum_approved_storage_hourly_usd": (
+                limits.maximum_approved_storage_hourly_usd
+            ),
             "prior_committed_gpu_usd": limits.prior_committed_gpu_usd,
         },
         "deadline": (
@@ -590,6 +667,9 @@ def run_watchdog(
     *,
     pod_id: str,
     expected_gpu_family: str,
+    expected_provider_gpu_id: str,
+    allowed_data_center_ids: tuple[str, ...],
+    expected_container_image: str,
     limits: WatchdogLimits,
     state_path: str | Path,
     client: RunpodStopClient,
@@ -621,9 +701,18 @@ def run_watchdog(
             metadata,
             expected_gpu_count=expected_gpu_count,
             expected_gpu_family=expected_gpu_family,
+            expected_provider_gpu_id=expected_provider_gpu_id,
+            allowed_data_center_ids=allowed_data_center_ids,
+            expected_container_image=expected_container_image,
             limits=limits,
         )
-        calculation_rate = metadata.effective_hourly_usd
+        # RunPod's live Pod rate has historically represented compute while
+        # volume/container storage is billed separately. Add the frozen storage
+        # allowance even if a future response includes it; double-counting the
+        # small storage component is deliberately conservative.
+        calculation_rate = (
+            metadata.effective_hourly_usd + limits.maximum_approved_storage_hourly_usd
+        )
         derived = derive_deadline(metadata, limits, calculation_hourly_usd=calculation_rate)
     except WatchdogError as exc:
         write_json(
@@ -683,6 +772,7 @@ def run_watchdog(
         ),
     )
     initial_started_at = metadata.last_started_at
+    initial_machine_id_hash = metadata.machine_id_hash
     while True:
         current_time = now().astimezone(UTC)
         current_monotonic = monotonic()
@@ -723,12 +813,20 @@ def run_watchdog(
                 current,
                 expected_gpu_count=expected_gpu_count,
                 expected_gpu_family=expected_gpu_family,
+                expected_provider_gpu_id=expected_provider_gpu_id,
+                allowed_data_center_ids=allowed_data_center_ids,
+                expected_container_image=expected_container_image,
                 limits=limits,
             )
             if current.last_started_at != initial_started_at:
                 raise WatchdogError("RunPod lastStartedAt changed after watchdog arming")
+            if current.machine_id_hash != initial_machine_id_hash:
+                raise WatchdogError("RunPod machineId changed after watchdog arming")
             # Never extend the deadline if RunPod later reports a lower rate.
-            calculation_rate = max(calculation_rate, current.effective_hourly_usd)
+            calculation_rate = max(
+                calculation_rate,
+                current.effective_hourly_usd + limits.maximum_approved_storage_hourly_usd,
+            )
             metadata = current
             derived = derive_deadline(
                 current,

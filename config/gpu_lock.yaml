@@ -1,5 +1,5 @@
 schema_version: 2
-resolved_at_utc: "2026-08-29T15:56:00Z"
+resolved_at_utc: "2026-08-29T18:26:00Z"
 source_repositories:
   jacobian_lens:
     url: https://github.com/anthropics/jacobian-lens.git
@@ -19,15 +19,17 @@ source_repositories:
     torch: "2.13.0"
     transformers_requirement: ">=5.5.3"
 container_image:
-  reference: vllm/vllm-openai@sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14
-  tag_observed: v0.28.0
-  registry_manifest_list_sha256: 61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14
-  linux_amd64_manifest_sha256: 2286e8533ca8b6bc777594bae30524f1426ba46ca21797524e06df6a94b06635
+  reference: runpod/pytorch@sha256:e855789ff7e4b1ad76698171b1974a99a5c48c5b3e80a908976987938b090992
+  tag_observed: 1.0.7-cu1300-torch291-ubuntu2404
+  registry_manifest_sha256: e855789ff7e4b1ad76698171b1974a99a5c48c5b3e80a908976987938b090992
+  linux_amd64_manifest_sha256: e855789ff7e4b1ad76698171b1974a99a5c48c5b3e80a908976987938b090992
+  config_sha256: 18d90716b6bb9f4bed820c08e5b80cf6e0a99eb14e611b3446db82729b2d0b18
 notes:
   - The stable vLLM wheel URL and SHA-256 were resolved from the official PyPI JSON API.
   - Exact installed distributions and hashes are captured again on the GPU host.
   - The GPU host must satisfy the official CUDA 13 driver/compatibility requirements.
-  - The official vLLM image is pinned by registry manifest-list digest; local preflight records the selected linux/amd64 digest.
+  - The SSH-capable official RunPod CUDA 13 image is pinned by its linux/amd64 OCI manifest digest; the exact vLLM wheel is installed and verified separately.
+  - VLLM_ENABLE_CUDA_COMPATIBILITY=1 is required on the currently available H100 hosts, whose catalog CUDA capability is 12.8.
   - Model and lens Hub commits are revalidated immediately before the primary run.
 hub_revisions:
   qwen35_122b_a10b: dc4d348443bc740c68e2d77492492c11606384d5

@@ -52,6 +52,8 @@ def _reserve_command(tmp_path: Path, *, receipt: Path) -> list[str]:
         "8",
         "--quote-hourly-per-gpu-usd",
         "3",
+        "--running-storage-hourly-usd",
+        "0",
         "--gpu-hard-stop-usd",
         "220",
         "--api-hard-stop-usd",

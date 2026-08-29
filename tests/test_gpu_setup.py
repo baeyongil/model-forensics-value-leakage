@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ from model_forensics.gpu_setup import (
     create_gpu_setup_lock,
     validate_gpu_setup_lock,
 )
-from model_forensics.io import write_json
+from model_forensics.io import stable_hash, write_json
 
 
 def _pip_freeze() -> list[str]:
@@ -35,6 +36,25 @@ def _spec(*, wheel_hash: str = "a" * 64) -> GpuSetupSpec:
     )
 
 
+def _smoke_manifest(path: Path) -> None:
+    payload = {
+        "schema_version": 1,
+        "status": "passed",
+        "scope": "one_full_rollout_plus_one_raw_prefix_continuation",
+        "experimental_sample": False,
+        "paid_api_calls": 0,
+        "model": {
+            "id": "Qwen/Qwen3.5-4B",
+            "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        },
+        "registered_prefix": {"exact_original_ids_reused": True},
+        "forced_append_check": {"immutable_prefix_preserved": True},
+        "raw_prefix_continuation": {"prompt_ids_exact": True},
+    }
+    payload["manifest_hash"] = stable_hash(payload)
+    write_json(path, payload)
+
+
 def test_gpu_setup_lock_allows_exact_rearm_and_rejects_drift(tmp_path: Path) -> None:
     environment_path = tmp_path / "gpu_environment.json"
     write_json(
@@ -46,16 +66,20 @@ def test_gpu_setup_lock_allows_exact_rearm_and_rejects_drift(tmp_path: Path) -> 
         },
     )
     lock_path = tmp_path / "setup_lock.json"
+    smoke_path = tmp_path / "qwen4b_prefix_smoke.json"
+    _smoke_manifest(smoke_path)
     created = create_gpu_setup_lock(
         path=lock_path,
         spec=_spec(),
         environment_manifest_path=environment_path,
+        qwen4b_smoke_manifest_path=smoke_path,
         venv_python_path=sys.executable,
     )
     validated = validate_gpu_setup_lock(
         path=lock_path,
         expected_spec=_spec(),
         environment_manifest_path=environment_path,
+        qwen4b_smoke_manifest_path=smoke_path,
         venv_python_path=sys.executable,
     )
     assert validated == created
@@ -65,6 +89,7 @@ def test_gpu_setup_lock_allows_exact_rearm_and_rejects_drift(tmp_path: Path) -> 
             path=lock_path,
             expected_spec=_spec(wheel_hash="e" * 64),
             environment_manifest_path=environment_path,
+            qwen4b_smoke_manifest_path=smoke_path,
             venv_python_path=sys.executable,
         )
     with pytest.raises(GpuBudgetGateError, match="overwrite"):
@@ -72,6 +97,19 @@ def test_gpu_setup_lock_allows_exact_rearm_and_rejects_drift(tmp_path: Path) -> 
             path=lock_path,
             spec=_spec(),
             environment_manifest_path=environment_path,
+            qwen4b_smoke_manifest_path=smoke_path,
+            venv_python_path=sys.executable,
+        )
+
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["raw_prefix_continuation"]["prompt_ids_exact"] = False
+    write_json(smoke_path, smoke)
+    with pytest.raises(GpuBudgetGateError, match="raw-prefix evidence"):
+        validate_gpu_setup_lock(
+            path=lock_path,
+            expected_spec=_spec(),
+            environment_manifest_path=environment_path,
+            qwen4b_smoke_manifest_path=smoke_path,
             venv_python_path=sys.executable,
         )
 

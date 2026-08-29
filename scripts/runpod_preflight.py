@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,13 @@ GPU_PATTERNS = {
     "H100_80GB": re.compile(r"\bH100\b", re.IGNORECASE),
     "A100_80GB": re.compile(r"\bA100\b", re.IGNORECASE),
 }
+CUDA_13_COMPAT_DIRECTORY = Path("/usr/local/cuda-13.0/compat")
+CUDA_13_COMPAT_LIBRARIES = (
+    "libcuda.so.1",
+    "libnvidia-ptxjitcompiler.so.1",
+)
+_CONTAINER_DIGEST_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+_MACHINE_ID_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def _command_output(command: list[str]) -> str:
@@ -100,6 +108,40 @@ def validate_cuda_visible_devices(value: str | None, *, required_gpus: int) -> N
         raise ValueError("CUDA_VISIBLE_DEVICES must expose exactly 8 unique devices when set")
 
 
+def validate_cuda_13_compatibility(
+    *,
+    environment: Mapping[str, str] | None = None,
+    compat_directory: Path = CUDA_13_COMPAT_DIRECTORY,
+) -> dict[str, Any]:
+    """Require vLLM's opt-in forward-compatibility path before model downloads.
+
+    The pinned image is CUDA 13 while the approved H100 placement filter is
+    CUDA 12.8.  A caller-controlled flag alone is insufficient, so this also
+    verifies the two driver-compatibility libraries provided by
+    ``cuda-compat-13-0`` at the versioned path.
+    """
+
+    env = os.environ if environment is None else environment
+    if env.get("VLLM_ENABLE_CUDA_COMPATIBILITY") != "1":
+        raise ValueError("VLLM_ENABLE_CUDA_COMPATIBILITY must be exactly 1")
+    if not compat_directory.is_dir():
+        raise ValueError(f"CUDA 13 compatibility directory is missing: {compat_directory}")
+    missing = [
+        library
+        for library in CUDA_13_COMPAT_LIBRARIES
+        if not (compat_directory / library).is_file()
+    ]
+    if missing:
+        raise ValueError(
+            "CUDA 13 compatibility libraries are missing: " + ", ".join(sorted(missing))
+        )
+    return {
+        "required_environment": "VLLM_ENABLE_CUDA_COMPATIBILITY=1",
+        "compatibility_directory": str(compat_directory),
+        "required_libraries": list(CUDA_13_COMPAT_LIBRARIES),
+    }
+
+
 def parse_fresh_price_timestamp(value: str, *, now: datetime | None = None) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -140,14 +182,30 @@ def _positive_finite(value: Any, *, field: str) -> float:
     return parsed
 
 
+def _nonnegative_finite(value: Any, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"watchdog {field} must be numeric")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"watchdog {field} must be numeric") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"watchdog {field} must be nonnegative and finite")
+    return parsed
+
+
 def validate_watchdog_state(
     payload: Any,
     *,
     expected_pod_id: str,
     expected_gpu_family: str,
+    expected_provider_gpu_id: str,
+    allowed_data_center_ids: tuple[str, ...],
+    expected_container_image: str,
     expected_gpu_count: int,
     planned_hours: float,
     approved_hourly_total_usd: float,
+    approved_storage_hourly_usd: float,
     gpu_budget_usd: float,
     expected_prior_committed_gpu_usd: float = 0.0,
     now: datetime | None = None,
@@ -181,6 +239,22 @@ def validate_watchdog_state(
         raise ValueError("watchdog live metadata must report an unlocked Pod")
     if metadata.get("gpu_count") != expected_gpu_count or expected_gpu_count != 8:
         raise ValueError("watchdog live metadata must report exactly 8 GPUs")
+    if metadata.get("provider_gpu_id") != expected_provider_gpu_id:
+        raise ValueError("watchdog provider GPU id disagrees with the frozen quote")
+    if metadata.get("secure_cloud") is not True:
+        raise ValueError("watchdog live metadata must report RunPod Secure Cloud")
+    if not allowed_data_center_ids or metadata.get("data_center_id") not in allowed_data_center_ids:
+        raise ValueError("watchdog live data center is outside the frozen launch set")
+    machine_id_hash = metadata.get("machine_id_hash")
+    if (
+        not isinstance(machine_id_hash, str)
+        or _MACHINE_ID_HASH_RE.fullmatch(machine_id_hash) is None
+    ):
+        raise ValueError("watchdog live metadata is missing a sanitized machineId hash")
+    if _CONTAINER_DIGEST_RE.fullmatch(expected_container_image) is None:
+        raise ValueError("expected container image must be pinned by SHA-256 digest")
+    if metadata.get("container_image") != expected_container_image:
+        raise ValueError("watchdog live image disagrees with the approval-bound digest")
     family = normalize_gpu_family(expected_gpu_family)
     display_name = metadata.get("gpu_display_name")
     if (
@@ -208,6 +282,8 @@ def validate_watchdog_state(
     }
     if recognized_machine_families != {family}:
         raise ValueError("watchdog machine GPU identity disagrees with the approved family")
+    if expected_provider_gpu_id not in machine_identity:
+        raise ValueError("watchdog machine identity omits the exact frozen provider GPU id")
     live_nominal = _positive_finite(metadata.get("cost_per_hr"), field="cost_per_hr")
     live_effective = _positive_finite(
         metadata.get("adjusted_cost_per_hr"), field="adjusted_cost_per_hr"
@@ -227,6 +303,19 @@ def validate_watchdog_state(
     margin = _positive_finite(limits.get("safety_margin_fraction"), field="safety_margin_fraction")
     if margin >= 0.25:
         raise ValueError("watchdog safety margin must be below 0.25")
+    storage_hourly = _nonnegative_finite(
+        limits.get("maximum_approved_storage_hourly_usd"),
+        field="maximum_approved_storage_hourly_usd",
+    )
+    approved_all_in = _positive_finite(
+        limits.get("maximum_approved_hourly_total_usd"),
+        field="maximum_approved_hourly_total_usd",
+    )
+    if (
+        abs(storage_hourly - approved_storage_hourly_usd) > 1e-9
+        or abs(approved_all_in - approved_hourly_total_usd) > 1e-9
+    ):
+        raise ValueError("watchdog all-in hourly quote disagrees with frozen storage pricing")
     raw_prior = limits.get("prior_committed_gpu_usd")
     if isinstance(raw_prior, bool):
         raise ValueError("watchdog prior_committed_gpu_usd must be numeric")
@@ -281,6 +370,11 @@ def validate_watchdog_state(
         "safe_budget_usd": safe_budget,
         "global_safe_budget_usd": global_safe_budget,
         "prior_committed_gpu_usd": prior_committed,
+        "provider_gpu_id": expected_provider_gpu_id,
+        "machine_id_hash": machine_id_hash,
+        "container_image": expected_container_image,
+        "data_center_id": metadata["data_center_id"],
+        "approved_storage_hourly_usd": storage_hourly,
     }
 
 
@@ -305,10 +399,14 @@ def main() -> None:
     parser.add_argument("--minimum-memory-gib", type=float, required=True)
     parser.add_argument("--minimum-free-disk-gib", type=float, required=True)
     parser.add_argument("--expected-gpu-family", choices=sorted(GPU_PATTERNS), required=True)
+    parser.add_argument("--expected-provider-gpu-id", required=True)
+    parser.add_argument("--allowed-data-center-id", action="append", required=True)
+    parser.add_argument("--allowed-cuda-version", action="append", required=True)
     parser.add_argument("--pod-id", required=True)
     parser.add_argument("--watchdog-state", type=Path, required=True)
     parser.add_argument("--watchdog-pid-file", type=Path, required=True)
     parser.add_argument("--hourly-per-gpu-usd", type=float, required=True)
+    parser.add_argument("--approved-storage-hourly-usd", type=float, required=True)
     parser.add_argument("--approved-phase-runtime-hours", type=float, required=True)
     parser.add_argument("--planned-hours", type=float, required=True)
     parser.add_argument("--gpu-budget-usd", type=float, required=True)
@@ -329,6 +427,10 @@ def main() -> None:
 
     if args.required_gpus != 8:
         raise SystemExit("primary/fallback profiles both require exactly 8 GPUs")
+    if tuple(args.allowed_cuda_version) != ("12.8",):
+        raise SystemExit("frozen launch must allow exactly CUDA host version 12.8")
+    if len(set(args.allowed_data_center_id)) != len(args.allowed_data_center_id):
+        raise SystemExit("allowed data center ids must be nonempty and unique")
     for name, value in (
         ("minimum GPU memory", args.minimum_memory_gib),
         ("minimum free disk", args.minimum_free_disk_gib),
@@ -341,6 +443,11 @@ def main() -> None:
     ):
         if not math.isfinite(value) or value <= 0:
             raise SystemExit(f"{name} must be positive and finite")
+    if (
+        not math.isfinite(args.approved_storage_hourly_usd)
+        or args.approved_storage_hourly_usd <= 0
+    ):
+        raise SystemExit("approved running-storage hourly rate must be positive and finite")
     if not re.fullmatch(r"[0-9a-f]{64}", args.vllm_wheel_sha256):
         raise SystemExit("vLLM wheel SHA-256 must be exactly 64 lowercase hex characters")
     if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", args.container_image_digest):
@@ -385,7 +492,10 @@ def main() -> None:
             phase=args.gpu_phase,
             session_id=session_id,
             expected_approved_runtime_hours=(args.approved_phase_runtime_hours),
-            expected_live_hourly_total_usd=(args.required_gpus * args.hourly_per_gpu_usd),
+            expected_live_hourly_total_usd=(
+                args.required_gpus * args.hourly_per_gpu_usd
+                + args.approved_storage_hourly_usd
+            ),
         )
         if abs(args.planned_hours - gpu_reservation.maximum_safe_runtime_hours) > 1e-9:
             raise ValueError("planned hours disagree with the cumulative GPU reservation")
@@ -397,9 +507,16 @@ def main() -> None:
             watchdog_payload,
             expected_pod_id=args.pod_id,
             expected_gpu_family=args.expected_gpu_family,
+            expected_provider_gpu_id=args.expected_provider_gpu_id,
+            allowed_data_center_ids=tuple(args.allowed_data_center_id),
+            expected_container_image=args.container_image_digest,
             expected_gpu_count=args.required_gpus,
             planned_hours=args.planned_hours,
-            approved_hourly_total_usd=args.required_gpus * args.hourly_per_gpu_usd,
+            approved_hourly_total_usd=(
+                args.required_gpus * args.hourly_per_gpu_usd
+                + args.approved_storage_hourly_usd
+            ),
+            approved_storage_hourly_usd=args.approved_storage_hourly_usd,
             gpu_budget_usd=args.gpu_budget_usd,
             expected_prior_committed_gpu_usd=args.prior_committed_gpu_usd,
         )
@@ -408,6 +525,7 @@ def main() -> None:
 
     inventory = gpu_inventory()
     try:
+        cuda_compatibility = validate_cuda_13_compatibility()
         validate_cuda_visible_devices(
             os.environ.get("CUDA_VISIBLE_DEVICES"), required_gpus=args.required_gpus
         )
@@ -436,10 +554,17 @@ def main() -> None:
         "python": sys.version,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "gpus": inventory,
+        "cuda_compatibility": cuda_compatibility,
         "free_disk_gib": free_disk_gib,
         "price": {
             "approved_hourly_per_gpu_usd": args.hourly_per_gpu_usd,
-            "approved_hourly_total_usd": args.required_gpus * args.hourly_per_gpu_usd,
+            "approved_compute_hourly_total_usd": args.required_gpus
+            * args.hourly_per_gpu_usd,
+            "approved_storage_hourly_total_usd": args.approved_storage_hourly_usd,
+            "approved_hourly_total_usd": (
+                args.required_gpus * args.hourly_per_gpu_usd
+                + args.approved_storage_hourly_usd
+            ),
             "live_nominal_hourly_total_usd": watchdog["live_nominal_hourly_usd"],
             "live_effective_hourly_total_usd": watchdog["live_effective_hourly_usd"],
             "source": args.price_source,
@@ -460,7 +585,11 @@ def main() -> None:
             "remaining_seconds": round(watchdog["remaining_seconds"], 3),
             "safe_budget_usd": watchdog["safe_budget_usd"],
         },
-        "container_image_digest": args.container_image_digest,
+        "container_image_digest": watchdog["container_image"],
+        "provider_gpu_id": watchdog["provider_gpu_id"],
+        "machine_id_hash": watchdog["machine_id_hash"],
+        "data_center_id": watchdog["data_center_id"],
+        "allowed_cuda_versions": args.allowed_cuda_version,
         "vllm_wheel": {
             "url": args.vllm_wheel_url,
             "sha256": args.vllm_wheel_sha256,

@@ -31,8 +31,8 @@ from pydantic import (
 from model_forensics.io import stable_hash
 
 APPROVAL_FILENAME = "paid_run_approval.json"
-APPROVAL_SCHEMA_VERSION = 1
-PHASE_CONTRACT_VERSION = "gpu-api-phase-split-v1"
+APPROVAL_SCHEMA_VERSION = 2
+PHASE_CONTRACT_VERSION = "gpu-api-phase-split-v2"
 MAX_GPU_QUOTE_AGE = timedelta(hours=6)
 MAX_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
 PAID_COMMAND_PHASES = frozenset(
@@ -122,6 +122,7 @@ class GpuQuote(_StrictModel):
     provider: str
     quote_id: str
     usd_per_gpu_hour: StrictFloat
+    running_storage_usd_per_hour: StrictFloat
     quoted_at: datetime
     source_url: str
     content_hash: str
@@ -134,10 +135,10 @@ class GpuQuote(_StrictModel):
             raise ValueError(f"{info.field_name} is not a valid identifier")
         return value
 
-    @field_validator("usd_per_gpu_hour")
+    @field_validator("usd_per_gpu_hour", "running_storage_usd_per_hour")
     @classmethod
-    def validate_rate(cls, value: float) -> float:
-        return _require_finite_positive(value, field_name="usd_per_gpu_hour")
+    def validate_rate(cls, value: float, info: Any) -> float:
+        return _require_finite_positive(value, field_name=info.field_name)
 
     @field_validator("quoted_at")
     @classmethod
@@ -178,16 +179,59 @@ class GpuPhaseRuntimeAllocation(_StrictModel):
 
 class GpuBinding(_StrictModel):
     family: str
+    provider_gpu_id: str
+    cloud_type: Literal["SECURE"]
+    allowed_cuda_versions: tuple[str, ...]
+    data_center_ids: tuple[str, ...]
     count: StrictInt = Field(ge=1)
+    container_disk_gb: StrictInt
+    volume_disk_gb: StrictInt
     quote: GpuQuote
     phase_runtime_allocations: tuple[GpuPhaseRuntimeAllocation, ...]
     container_image_digest: str
     vllm_wheel_sha256: str
 
-    @field_validator("family")
+    @field_validator("family", "provider_gpu_id")
     @classmethod
-    def validate_family(cls, value: str) -> str:
-        return _reject_placeholder(value, field_name="family")
+    def validate_gpu_identity(cls, value: str, info: Any) -> str:
+        return _reject_placeholder(value, field_name=info.field_name)
+
+    @field_validator("allowed_cuda_versions")
+    @classmethod
+    def validate_cuda_versions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value != ("12.8",):
+            raise ValueError("allowed_cuda_versions must be exactly ('12.8',)")
+        return value
+
+    @field_validator("data_center_ids")
+    @classmethod
+    def validate_data_center_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or len(set(value)) != len(value):
+            raise ValueError("data_center_ids must be nonempty and unique")
+        for item in value:
+            _reject_placeholder(item, field_name="data_center_ids")
+        return value
+
+    @field_validator("container_disk_gb", "volume_disk_gb", mode="before")
+    @classmethod
+    def reject_boolean_storage_size(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("storage sizes must be integers")
+        return value
+
+    @field_validator("container_disk_gb")
+    @classmethod
+    def validate_container_disk(cls, value: int) -> int:
+        if value != 50:
+            raise ValueError("container_disk_gb must equal the frozen 50 GB launch size")
+        return value
+
+    @field_validator("volume_disk_gb")
+    @classmethod
+    def validate_volume_disk(cls, value: int) -> int:
+        if value != 650:
+            raise ValueError("volume_disk_gb must equal the frozen 650 GB launch size")
+        return value
 
     @field_validator("count", mode="before")
     @classmethod
@@ -302,6 +346,7 @@ class ApprovalBindings(_StrictModel):
     phase_contract_version: Literal[PHASE_CONTRACT_VERSION]
     config_hash: str
     preregistration_hash: str
+    gpu_lock_hash: str
     gpu: GpuBinding
     api_quote: ApiQuoteBinding
     caps_usd: SpendingCaps
@@ -312,7 +357,7 @@ class ApprovalBindings(_StrictModel):
     def validate_contract_version(cls, value: str) -> str:
         return _reject_placeholder(value, field_name="phase_contract_version")
 
-    @field_validator("config_hash", "preregistration_hash")
+    @field_validator("config_hash", "preregistration_hash", "gpu_lock_hash")
     @classmethod
     def validate_namespaced_hash(cls, value: str, info: Any) -> str:
         if not _HASH_RE.fullmatch(value):
@@ -334,7 +379,10 @@ class ApprovalBindings(_StrictModel):
         allocated_hours = sum(
             allocation.maximum_runtime_hours for allocation in self.gpu.phase_runtime_allocations
         )
-        projected = self.gpu.count * self.gpu.quote.usd_per_gpu_hour * allocated_hours
+        projected = (
+            self.gpu.count * self.gpu.quote.usd_per_gpu_hour
+            + self.gpu.quote.running_storage_usd_per_hour
+        ) * allocated_hours
         if projected > self.caps_usd.gpu:
             raise ValueError("approved GPU phase runtime allocations would exceed the GPU cap")
         return self

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -120,8 +121,19 @@ class GpuQuoteLock(BaseModel):
     provider: Literal["runpod"]
     quote_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$")
     gpu_family: Literal["H100_80GB", "A100_80GB"]
+    provider_gpu_id: str = Field(
+        min_length=3,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9 ._:/()+-]+$",
+    )
+    cloud_type: Literal["SECURE"]
+    allowed_cuda_versions: tuple[Literal["12.8"], ...]
+    data_center_ids: tuple[str, ...]
     gpu_count: StrictInt
+    container_disk_gb: StrictInt
+    volume_disk_gb: StrictInt
     usd_per_gpu_hour: StrictFloat
+    running_storage_usd_per_hour: StrictFloat
     quoted_at: datetime
     phase_runtime_allocations: tuple[GpuPhaseRuntimeAllocation, ...]
     source_url: str
@@ -134,11 +146,46 @@ class GpuQuoteLock(BaseModel):
             raise ValueError("primary quote must contain exactly eight GPUs")
         return value
 
-    @field_validator("usd_per_gpu_hour")
+    @field_validator("provider_gpu_id")
+    @classmethod
+    def require_matching_exact_provider_gpu_id(cls, value: str, info: Any) -> str:
+        family = info.data.get("gpu_family")
+        expected_token = "H100" if family == "H100_80GB" else "A100"
+        if re.search(rf"(?:^|[^A-Z0-9]){expected_token}(?:$|[^A-Z0-9])", value, re.I) is None:
+            raise ValueError("provider_gpu_id must match gpu_family")
+        return value
+
+    @field_validator("usd_per_gpu_hour", "running_storage_usd_per_hour")
     @classmethod
     def require_positive_finite(cls, value: float, info: Any) -> float:
         if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{info.field_name} must be finite and positive")
+        return value
+
+    @field_validator("allowed_cuda_versions")
+    @classmethod
+    def require_cuda_12_8_only(
+        cls, value: tuple[Literal["12.8"], ...]
+    ) -> tuple[Literal["12.8"], ...]:
+        if value != ("12.8",):
+            raise ValueError("allowed_cuda_versions must contain exactly 12.8")
+        return value
+
+    @field_validator("data_center_ids")
+    @classmethod
+    def require_unique_data_centers(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or len(set(value)) != len(value):
+            raise ValueError("data_center_ids must be nonempty and unique")
+        if any(re.fullmatch(r"[A-Z0-9][A-Z0-9-]{2,31}", item) is None for item in value):
+            raise ValueError("data_center_ids contain an invalid provider identifier")
+        return value
+
+    @field_validator("container_disk_gb", "volume_disk_gb")
+    @classmethod
+    def require_frozen_storage_sizes(cls, value: int, info: Any) -> int:
+        expected = 50 if info.field_name == "container_disk_gb" else 650
+        if isinstance(value, bool) or value != expected:
+            raise ValueError(f"{info.field_name} must equal {expected}")
         return value
 
     @field_validator("quoted_at")
@@ -385,13 +432,21 @@ def build_approval_bindings(
         phase_contract_version=PHASE_CONTRACT_VERSION,
         config_hash=stable_hash(config.model_dump(mode="json", exclude={"source_path"})),
         preregistration_hash=stable_hash(dict(preregistration)),
+        gpu_lock_hash=stable_hash(dict(gpu_lock)),
         gpu=GpuBinding(
             family=quote_lock.gpu_family,
+            provider_gpu_id=quote_lock.provider_gpu_id,
+            cloud_type=quote_lock.cloud_type,
+            allowed_cuda_versions=quote_lock.allowed_cuda_versions,
+            data_center_ids=quote_lock.data_center_ids,
             count=quote_lock.gpu_count,
+            container_disk_gb=quote_lock.container_disk_gb,
+            volume_disk_gb=quote_lock.volume_disk_gb,
             quote=GpuQuote(
                 provider=quote_lock.provider,
                 quote_id=quote_lock.quote_id,
                 usd_per_gpu_hour=quote_lock.usd_per_gpu_hour,
+                running_storage_usd_per_hour=quote_lock.running_storage_usd_per_hour,
                 quoted_at=quote_lock.quoted_at,
                 source_url=quote_lock.source_url,
                 content_hash=quote_lock.content_hash,

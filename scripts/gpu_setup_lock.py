@@ -19,6 +19,7 @@ def main() -> int:
     parser.add_argument("mode", choices=("create", "validate"))
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--environment-manifest", type=Path, required=True)
+    parser.add_argument("--qwen4b-smoke-manifest", type=Path, required=True)
     parser.add_argument("--venv-python", type=Path, required=True)
     parser.add_argument("--container-image-digest", required=True)
     parser.add_argument("--vllm-wheel-url", required=True)
@@ -28,7 +29,11 @@ def main() -> int:
     args = parser.parse_args()
 
     private_root = (Path.cwd() / ".runpod").resolve()
-    for path in (args.lock.resolve(), args.environment_manifest.resolve()):
+    for path in (
+        args.lock.resolve(),
+        args.environment_manifest.resolve(),
+        args.qwen4b_smoke_manifest.resolve(),
+    ):
         if not path.is_relative_to(private_root):
             raise SystemExit("GPU setup artifacts must remain under ignored .runpod/")
     try:
@@ -45,6 +50,7 @@ def main() -> int:
                 path=args.lock,
                 spec=spec,
                 environment_manifest_path=args.environment_manifest,
+                qwen4b_smoke_manifest_path=args.qwen4b_smoke_manifest,
                 venv_python_path=args.venv_python,
             )
         else:
@@ -52,6 +58,7 @@ def main() -> int:
                 path=args.lock,
                 expected_spec=spec,
                 environment_manifest_path=args.environment_manifest,
+                qwen4b_smoke_manifest_path=args.qwen4b_smoke_manifest,
                 venv_python_path=args.venv_python,
             )
     except (OSError, RuntimeError, ValueError) as exc:

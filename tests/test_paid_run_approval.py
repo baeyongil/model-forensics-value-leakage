@@ -7,6 +7,7 @@ import pytest
 
 from model_forensics.approval import (
     APPROVAL_FILENAME,
+    APPROVAL_SCHEMA_VERSION,
     PHASE_CONTRACT_VERSION,
     ApiQuoteBinding,
     ApprovalBindings,
@@ -29,6 +30,8 @@ SHA_A = stable_hash({"fixture": "frozen-config"})
 SHA_B = stable_hash({"fixture": "frozen-preregistration"})
 SHA_C = stable_hash({"fixture": "mutated-config"})
 SHA_D = stable_hash({"fixture": "mutated-preregistration"})
+SHA_GPU_LOCK = stable_hash({"fixture": "gpu-lock"})
+SHA_OTHER_GPU_LOCK = stable_hash({"fixture": "other-gpu-lock"})
 RAW_C = stable_hash({"fixture": "container"}).removeprefix("sha256:")
 RAW_D = stable_hash({"fixture": "wheel"}).removeprefix("sha256:")
 RAW_E = stable_hash({"fixture": "other-container"}).removeprefix("sha256:")
@@ -53,13 +56,21 @@ def _bindings() -> ApprovalBindings:
         phase_contract_version=PHASE_CONTRACT_VERSION,
         config_hash=SHA_A,
         preregistration_hash=SHA_B,
+        gpu_lock_hash=SHA_GPU_LOCK,
         gpu=GpuBinding(
             family="H100_80GB",
+            provider_gpu_id="NVIDIA H100 80GB HBM3",
+            cloud_type="SECURE",
+            allowed_cuda_versions=("12.8",),
+            data_center_ids=("US-IL-1",),
             count=8,
+            container_disk_gb=50,
+            volume_disk_gb=650,
             quote=GpuQuote(
                 provider="runpod",
                 quote_id="runpod-secure-h100-20260829",
                 usd_per_gpu_hour=3.0,
+                running_storage_usd_per_hour=700 * 0.10 / 720,
                 quoted_at=NOW - timedelta(hours=1),
                 source_url="https://www.runpod.io/pricing",
                 content_hash=GPU_QUOTE_HASH,
@@ -110,7 +121,7 @@ def _bindings() -> ApprovalBindings:
 
 def _approval(bindings: ApprovalBindings | None = None) -> PaidRunApproval:
     document = PaidRunApproval(
-        schema_version=1,
+        schema_version=APPROVAL_SCHEMA_VERSION,
         bindings=bindings or _bindings(),
         allowed_command_phases=("behavior_baseline_gpu", "behavior_baseline_api"),
         user_approval=UserApproval(
@@ -178,8 +189,9 @@ def test_duplicate_json_keys_are_rejected(tmp_path) -> None:
     raw = _approval().model_dump(mode="json")
     encoded = json.dumps(raw)
     encoded = encoded.replace(
-        '"schema_version": 1,',
-        '"schema_version": 1, "schema_version": 1,',
+        f'"schema_version": {APPROVAL_SCHEMA_VERSION},',
+        f'"schema_version": {APPROVAL_SCHEMA_VERSION}, '
+        f'"schema_version": {APPROVAL_SCHEMA_VERSION},',
         1,
     )
     path = tmp_path / APPROVAL_FILENAME
@@ -194,11 +206,14 @@ def test_duplicate_json_keys_are_rejected(tmp_path) -> None:
     [
         (("bindings", "config_hash"), SHA_C),
         (("bindings", "preregistration_hash"), SHA_D),
+        (("bindings", "gpu_lock_hash"), SHA_OTHER_GPU_LOCK),
         (("bindings", "gpu", "family"), "A100_80GB"),
+        (("bindings", "gpu", "provider_gpu_id"), "NVIDIA H100 SXM 80GB"),
         (("bindings", "gpu", "count"), 4),
         (("bindings", "gpu", "quote", "provider"), "another-cloud"),
         (("bindings", "gpu", "quote", "quote_id"), "another-quote-20260829"),
         (("bindings", "gpu", "quote", "usd_per_gpu_hour"), 2.9),
+        (("bindings", "gpu", "quote", "running_storage_usd_per_hour"), 0.09),
         (
             ("bindings", "gpu", "quote", "quoted_at"),
             (NOW - timedelta(hours=2)).isoformat(),
@@ -275,7 +290,14 @@ def test_route_removal_and_extra_route_are_binding_mismatches(tmp_path) -> None:
 
 def test_unsupported_phase_contract_version_is_rejected(tmp_path) -> None:
     raw = _approval().model_dump(mode="json")
-    _replace_path(raw, ("bindings", "phase_contract_version"), "gpu-api-phase-split-v2")
+    _replace_path(raw, ("bindings", "phase_contract_version"), "gpu-api-phase-split-v3")
+    with pytest.raises(PaidRunApprovalError, match="schema"):
+        load_paid_run_approval(_write_raw(tmp_path, raw))
+
+
+def test_obsolete_approval_schema_version_is_rejected(tmp_path) -> None:
+    raw = _approval().model_dump(mode="json")
+    raw["schema_version"] = 1
     with pytest.raises(PaidRunApprovalError, match="schema"):
         load_paid_run_approval(_write_raw(tmp_path, raw))
 
@@ -538,6 +560,7 @@ def test_unknown_fields_are_rejected_at_every_schema_level(
     [
         (("bindings", "config_hash"), "sha256:" + "0" * 64),
         (("bindings", "preregistration_hash"), "sha256:" + "f" * 64),
+        (("bindings", "gpu_lock_hash"), "sha256:" + "e" * 64),
         (("bindings", "gpu", "vllm_wheel_sha256"), "a" * 64),
         (
             ("bindings", "gpu", "container_image_digest"),

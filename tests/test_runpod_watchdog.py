@@ -17,6 +17,10 @@ from model_forensics.runpod_watchdog import (
     validate_live_metadata,
 )
 
+GPU_ID = "NVIDIA H100 80GB HBM3"
+IMAGE = "runpod/pytorch@sha256:" + "a" * 64
+DATA_CENTERS = ("US-IL-1",)
+
 
 def _payload(
     *,
@@ -28,15 +32,23 @@ def _payload(
     adjusted: float = 80.0,
     started_at: str = "2026-08-29T12:00:00Z",
     locked: bool = False,
+    image: str = IMAGE,
+    machine_id: str = "machine_123",
+    secure_cloud: bool = True,
+    data_center_id: str = "US-IL-1",
 ) -> dict[str, object]:
     return {
         "id": pod_id,
-        "gpu": {"count": count, "displayName": display_name},
+        "gpu": {"id": display_name, "count": count, "displayName": display_name},
         "machine": {
             "gpuTypeId": display_name,
             "gpuType": {"displayName": display_name},
             "gpuDisplayName": display_name,
+            "secureCloud": secure_cloud,
+            "dataCenterId": data_center_id,
         },
+        "machineId": machine_id,
+        "image": image,
         "costPerHr": cost,
         "adjustedCostPerHr": adjusted,
         "desiredStatus": status,
@@ -92,6 +104,9 @@ def test_live_metadata_requires_exact_pod_hardware_status_quote_and_unlock() -> 
         metadata,
         expected_gpu_count=8,
         expected_gpu_family="H100_80GB",
+        expected_provider_gpu_id=GPU_ID,
+        allowed_data_center_ids=DATA_CENTERS,
+        expected_container_image=IMAGE,
         limits=limits,
     )
 
@@ -101,12 +116,18 @@ def test_live_metadata_requires_exact_pod_hardware_status_quote_and_unlock() -> 
         (_payload(status="EXITED"), "RUNNING"),
         (_payload(locked=True), "locked"),
         (_payload(cost=84), "approved quote"),
+        (_payload(image="runpod/pytorch@sha256:" + "b" * 64), "live image"),
+        (_payload(secure_cloud=False), "Secure Cloud"),
+        (_payload(data_center_id="US-TX-1"), "data center"),
     ):
         with pytest.raises(WatchdogError, match=match):
             validate_live_metadata(
                 _metadata(payload, observed),
                 expected_gpu_count=8,
                 expected_gpu_family="H100_80GB",
+                expected_provider_gpu_id=GPU_ID,
+                allowed_data_center_ids=DATA_CENTERS,
+                expected_container_image=IMAGE,
                 limits=limits,
             )
 
@@ -114,12 +135,17 @@ def test_live_metadata_requires_exact_pod_hardware_status_quote_and_unlock() -> 
     split_brain["machine"] = {
         "gpuTypeId": "NVIDIA A100-SXM4-80GB",
         "gpuType": {"displayName": "NVIDIA A100-SXM4-80GB"},
+        "secureCloud": True,
+        "dataCenterId": "US-IL-1",
     }
     with pytest.raises(WatchdogError, match="machine GPU identity"):
         validate_live_metadata(
             _metadata(split_brain, observed),
             expected_gpu_count=8,
             expected_gpu_family="H100_80GB",
+            expected_provider_gpu_id=GPU_ID,
+            allowed_data_center_ids=DATA_CENTERS,
+            expected_container_image=IMAGE,
             limits=limits,
         )
 
@@ -134,7 +160,7 @@ def test_live_metadata_requires_exact_pod_hardware_status_quote_and_unlock() -> 
 def test_watchdog_gets_live_metadata_stops_exact_pod_and_confirms_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("TEST_RUNPOD_KEY", "do-not-persist")
+    monkeypatch.setenv("TEST_RUNPOD_KEY", "rpa_do-not-persist")
     base = datetime(2026, 8, 29, 12, tzinfo=UTC)
     metadata_responses = iter(
         (
@@ -167,6 +193,9 @@ def test_watchdog_gets_live_metadata_stops_exact_pod_and_confirms_exit(
     result = run_watchdog(
         pod_id="pod_123",
         expected_gpu_family="H100_80GB",
+        expected_provider_gpu_id=GPU_ID,
+        allowed_data_center_ids=DATA_CENTERS,
+        expected_container_image=IMAGE,
         limits=WatchdogLimits(gpu_hard_stop_usd=220, maximum_runtime_hours=1 / 3600),
         state_path=state_path,
         client=client,
@@ -176,11 +205,13 @@ def test_watchdog_gets_live_metadata_stops_exact_pod_and_confirms_exit(
 
     assert get_requests[0][0].startswith("https://rest.runpod.io/v1/pods/pod_123?")
     assert "includeMachine=true" in get_requests[0][0]
-    assert stop_requests == [("https://rest.runpod.io/v1/pods/pod_123/stop", "do-not-persist")]
+    assert stop_requests == [
+        ("https://rest.runpod.io/v1/pods/pod_123/stop", "rpa_do-not-persist")
+    ]
     assert result["status"] == "stopped_confirmed"
     state_text = state_path.read_text(encoding="utf-8")
     assert read_json(state_path)["action"] == "stop_only_preserve_volume"
-    assert "do-not-persist" not in state_text
+    assert "rpa_do-not-persist" not in state_text
     assert "must-not-leak" not in state_text
 
 
@@ -219,6 +250,9 @@ def test_live_verification_failure_requests_stop_without_deletion(
         run_watchdog(
             pod_id="pod_123",
             expected_gpu_family="H100_80GB",
+            expected_provider_gpu_id=GPU_ID,
+            allowed_data_center_ids=DATA_CENTERS,
+            expected_container_image=IMAGE,
             limits=WatchdogLimits(220, 10),
             state_path=state_path,
             client=client,
@@ -282,6 +316,9 @@ def test_monotonic_guard_stops_even_if_wall_clock_does_not_advance(
     result = run_watchdog(
         pod_id="pod_123",
         expected_gpu_family="H100_80GB",
+        expected_provider_gpu_id=GPU_ID,
+        allowed_data_center_ids=DATA_CENTERS,
+        expected_container_image=IMAGE,
         limits=WatchdogLimits(220, 1 / 3600),
         state_path=tmp_path / "state.json",
         client=client,
