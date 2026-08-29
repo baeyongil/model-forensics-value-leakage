@@ -47,6 +47,31 @@ entries:
   started_at: '2026-08-29T18:05:43+00:00'
   ended_at: '2026-08-29T18:39:52.913035+00:00'
   elapsed_seconds: 2049.913035
+- category: lens_analysis
+  minutes: 9
+  description: Pre-results audit and remediation of probe comparability, temporal
+    lens evidence, and trace-level causal alignment.
+  status: counted
+  started_at: '2026-08-29T20:18:21.425266+00:00'
+  ended_at: '2026-08-29T20:26:28.222463+00:00'
+  elapsed_seconds: 486.797197
+- category: lens_analysis
+  minutes: 3
+  description: Independent pre-results adversarial review and decision closure for
+    lens evidence authentication.
+  status: counted
+  started_at: '2026-08-29T20:50:58.792567+00:00'
+  ended_at: '2026-08-29T20:53:54.255295+00:00'
+  elapsed_seconds: 175.462728
+- category: behavior_and_resampling_analysis
+  minutes: 24
+  description: Pre-results adversarial review and decision closure for authoritative
+    replacement-token spans, missing-outcome verdict bounds, and causal-pipeline
+    failure gates; concurrent implementation and test runtime excluded.
+  status: counted
+  started_at: '2026-08-29T21:14:14+00:00'
+  ended_at: '2026-08-29T22:03:04+00:00'
+  elapsed_seconds: 2930.0
 categories:
   counted:
     hypotheses_and_preregistration: 35

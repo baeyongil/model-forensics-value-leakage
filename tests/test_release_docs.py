@@ -33,11 +33,43 @@ def test_release_docs_state_no_results_and_the_frozen_primary_boundaries() -> No
         assert f"  - {excluded_category}" in preregistration
 
 
+def test_prereg_v3_freezes_lens_corroboration_and_release_authentication() -> None:
+    readme = _text("README.md")
+    preregistration = _text("config/preregistration.yaml")
+    lens_contract = _text("docs/lens-position-input.md")
+
+    for phrase in (
+        "strictly_positive_J_and_R_tau_a",
+        "p_value_and_leave_one_out_are_reported_descriptors_not_gate_requirements",
+        "lens_compatibility_prefix_manifest.json",
+        "lens_release_authorization.json",
+        "pinned-tokenizer recomputation",
+    ):
+        assert phrase in preregistration or phrase in lens_contract or phrase in readme
+    assert "exactly_4_above_plus_4_below_and_576_permutations" in preregistration
+    assert "every smoke analysis row" in readme.lower()
+
+
+def test_prereg_v3_freezes_exact_resampling_attrition_floors() -> None:
+    preregistration = _text("config/preregistration.yaml")
+
+    for phrase in (
+        "resampling_generation_attrition_floors_v1",
+        "minimum_overall_generation_valid_rate: 0.95",
+        "expected_per_anchor_arm: 20",
+        "minimum_anchor_arm_valid_count: 18",
+        "minimum_anchor_pair_complete_count: 16",
+        "maximum_anchor_arm_valid_rate_gap: 0.10",
+        "exact_anchor_sample_index_stage_and_seed",
+    ):
+        assert phrase in preregistration
+
+
 def test_runpod_docs_match_bootstrap_watchdog_and_budget_interfaces() -> None:
     runpod = _text("RUNPOD.md")
     bootstrap = _text("scripts/bootstrap_gpu.sh")
 
-    assert 'if [[ "$#" -ne 15 ]]' in bootstrap
+    assert 'if [[ "$#" -ne 22 ]]' in bootstrap
     for value in ("USD 220", "USD 100", "USD 5", "USD 325"):
         assert value in runpod
     for argument in (
@@ -51,7 +83,8 @@ def test_runpod_docs_match_bootstrap_watchdog_and_budget_interfaces() -> None:
         "--state",
     ):
         assert argument in bootstrap
-    assert "nohup python3 scripts/runpod_watchdog.py" in bootstrap
+    assert 'with_watchdog_credentials env PYTHONPATH="$PWD/src" nohup' in bootstrap
+    assert "python3 scripts/runpod_watchdog.py" in bootstrap
     assert "v1 `costPerHr`" in runpod
     assert "`provider_evidence_unavailable`" in runpod
     assert "never turns absence into a false provider attestation" in runpod
@@ -59,6 +92,8 @@ def test_runpod_docs_match_bootstrap_watchdog_and_budget_interfaces() -> None:
     assert "config/gpu_lock.yaml" in runpod
     assert "container image digest" in runpod
     assert "wheel hash" in runpod
+    assert "semantic-stack hash" in runpod
+    assert "zero\nfabricated lens rows" in runpod
     assert "GPU_BUDGET_SESSION_ID" in runpod
     assert "scripts/gpu_budget_reserve.py" in runpod
     assert "scripts/runpod_active_session_verify.py" in runpod
@@ -181,6 +216,19 @@ def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
     assert "--input" in resample_validation
     assert "--paid-approval" not in resample_validation
 
+    reproduce_results = subprocess.run(
+        [*common, "reproduce-results"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "scripts/reproduce_results.py" in reproduce_results
+    assert "--results-dir" in reproduce_results
+    assert "--figure-dir" in reproduce_results
+    assert "model_forensics.cli analyze" not in reproduce_results
+    assert "data/raw" not in reproduce_results
+    assert "API_KEY" not in reproduce_results
+
     reserve = subprocess.run(
         [*common, "gpu-reserve", "GPU_PHASE=behavior_baseline_gpu"],
         check=True,
@@ -233,7 +281,6 @@ def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
     assert "API_KEY" not in "\n".join(
         (sample, behavior_gpu, behavior_api, anchors, resample_gpu, resample_api)
     )
-
     assert (
         "scripts/investigation_timer.py status"
         in subprocess.run(
@@ -244,6 +291,24 @@ def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
         ).stdout
     )
 
+
+def test_makefile_scopes_provider_credentials_to_paid_targets() -> None:
+    makefile = _text("Makefile")
+
+    assert re.search(
+        r"(?m)^export HF_TOKEN OPENROUTER_API_KEY RUNPOD_API_KEY$", makefile
+    ) is None
+    assert "unexport HF_TOKEN OPENROUTER_API_KEY RUNPOD_API_KEY" in makefile
+    assert "$(HF_TARGETS): export HF_TOKEN := $(LOCAL_HF)" in makefile
+    assert (
+        "$(OPENROUTER_TARGETS): export OPENROUTER_API_KEY := $(LOCAL_OPENROUTER)"
+        in makefile
+    )
+    assert "gpu-bootstrap: export RUNPOD_API_KEY := $(LOCAL_RUNPOD)" in makefile
+    release_recipe = makefile.split("release-check:", 1)[1]
+    assert "HF_TOKEN" not in release_recipe
+    assert "OPENROUTER_API_KEY" not in release_recipe
+    assert "RUNPOD_API_KEY" not in release_recipe
 
 def test_markdown_fences_and_relative_links_are_valid() -> None:
     for name in ("README.md", "RUNPOD.md", "THIRD_PARTY_NOTICES.md"):

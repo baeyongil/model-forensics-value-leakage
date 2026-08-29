@@ -153,8 +153,11 @@ make gpu-bootstrap GPU_PHASE="$GPU_PHASE"
 ```
 
 The Make target reads the exact quote and `config/gpu_lock.yaml`, then supplies the current
-15-argument interface to `scripts/bootstrap_gpu.sh`. It does not accept an image, wheel, price,
-hardware identity, cloud type, or runtime through a Make variable.
+22-argument interface to `scripts/bootstrap_gpu.sh`. The additional lock-derived fields bind
+the sentence-transformers wheel URL/hash, distribution version, complete semantic-stack hash,
+and the exact top-level bootstrap constraints/hash.
+It does not accept an image, wheel, price, hardware identity, cloud type, or runtime through a Make
+variable.
 
 Before a wheel, model, or experiment backend starts, bootstrap authenticates the receipt against
 the canonical ledger and nonce, claims `.runpod/sessions/<session-hash>/`, and starts a separate
@@ -164,13 +167,34 @@ full GPUs, MIG status, disk, live prices, price freshness, image digest, and whe
 UUIDs, watchdog state, live billing state, and preflight stay only below ignored `.runpod/`; they
 must not be copied to `data/manifests/`.
 
-On the first phase, bootstrap installs `.venv-gpu`, then runs one real pinned Qwen3.5-4B rollout
-and one exact raw-token-prefix continuation before any 122B backend can be constructed. Its passed
-manifest stays at `.runpod/setup/qwen4b_prefix_smoke.json`; the setup lock binds both the manifest's
-canonical hash and file SHA-256. On later phases using the same stopped Pod/volume, bootstrap does not reinstall or rerun the smoke: it
-requires the exact container digest, 64-character wheel SHA-256, pinned 40-character Transformers
-and Jacobian Lens Git commits, environment-manifest hash, smoke hashes, and live `pip freeze` to match. A stale
-active session, an incomplete prior stop, or an unsettled prior reservation blocks re-arm.
+Bootstrap copies credentials only into non-exported shell variables and immediately removes their
+public environment names. The exact regular/emergency watchdog receives `RUNPOD_API_KEY` plus
+`HF_TOKEN` because its live metadata gate binds the Pod's HF credential hash; the exact Qwen3.5-4B
+smoke command receives only `HF_TOKEN`. Curl, pip, build, environment-capture, setup-lock, and
+active-session verification children receive none of those credentials or private aliases.
+
+On the first phase, bootstrap installs `.venv-gpu` and authenticates the exact semantic inference
+stack: version-pinned distributions, every SHA-256-bearing installed file named by `RECORD`, the
+sentence-transformers wheel's PEP-610 archive SHA-256, and the pinned Transformers Git source.
+Bootstrap uses the container/venv pip without self-upgrade, installs exact top-level versions,
+and then installs this project editable with `--no-deps`. Transitive PyPI wheels are not fully
+hash-locked; the pinned container plus PyPI TLS is therefore an explicit first-install trust
+boundary, while observed top-level versions and semantic installed files fail closed on drift.
+Primary embedding eligibility later also requires the frozen model revision plus tokenizer/model
+runtime evidence in every semantic resampling record.
+
+Bootstrap then runs one real pinned Qwen3.5-4B rollout and exact raw-token-prefix retain/resample
+continuations before any 122B backend can be constructed. The bounded non-primary gate also checks
+a deterministic parser/trajectory fixture, exact anchor span-to-token mapping, and the complete
+5-position × 3-concept probe-design grid. There are no matched Qwen3.5-4B J/R lens artifacts or
+same-forward vLLM activation interface, so the manifest must record that transport boundary, zero
+fabricated lens rows, and a forbidden analysis handoff. Its passed manifest stays at
+`.runpod/setup/qwen4b_prefix_smoke.json`; the setup lock binds both the manifest's canonical hash
+and file SHA-256. On later phases using the same stopped Pod/volume, bootstrap does not reinstall
+or rerun the smoke: it requires the exact container digest, both 64-character wheel SHA-256 values,
+pinned 40-character Transformers and Jacobian Lens Git commits, environment/semantic-runtime
+hashes, smoke hashes, and live `pip freeze` to match. A stale active session, an incomplete prior
+stop, or an unsettled prior reservation blocks re-arm.
 
 The watchdog derives current incurred cost and two absolute deadlines from the provider's live v1
 `lastStartedAt` and `costPerHr`: the 97% safe-budget deadline and approved maximum

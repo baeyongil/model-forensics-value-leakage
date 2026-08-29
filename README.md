@@ -49,9 +49,20 @@ make test
 make smoke
 ```
 
-`make smoke` is deterministic, uses no network or model download, labels every generated row
-`synthetic_smoke: true`, and exercises the pipeline with synthetic inputs. It is not a substitute
-for the required 4B GPU compatibility gate or the 122B primary run.
+`make smoke` is deterministic, uses no network or model download, and labels every generated row
+`synthetic_smoke: true`. Every smoke analysis row is also individually content-hash authenticated;
+an unmarked, mixed, or altered row is rejected before statistics. The smoke run exercises the
+pipeline with synthetic inputs. It is not a substitute for the required 4B GPU compatibility gate
+or the 122B primary run.
+
+On the already reserved CUDA host, `make qwen4b-gpu-integration-smoke` runs the separately bounded
+real Qwen3.5-4B gate: the exact tokenizer/chat template, one rollout, exact-token retain and
+resample continuations, deterministic parser/trajectory and span fixtures, and the full 5×3
+structural probe grid. It is always labeled synthetic/non-primary. Because no matched 4B J/R lens
+artifacts exist and vLLM does not expose the required same-forward model-runtime contract, the gate
+records zero transported or fabricated lens rows and an explicit transport boundary. Normal local
+tests skip the identically scoped `integration` + `gpu` test unless
+`RUN_QWEN4B_GPU_INTEGRATION=1` is set.
 
 `make sample` and `make resample` are deliberately validation-only aliases. This validation-only mode
 authenticates completed behavioral and resampling artifacts, respectively. It exposes no
@@ -64,7 +75,8 @@ No Make target, configuration example, or paid CLI accepts an ad hoc judge model
 price. Immediately before paid execution, the following ignored inputs must be independently
 frozen and content-addressed:
 
-- `config/gpu_lock.yaml`: pinned container, vLLM wheel and hash, software commits, model and lens
+- `config/gpu_lock.yaml`: pinned container, vLLM and sentence-transformers wheels and hashes,
+  exact semantic inference-stack versions, software commits, model/tokenizer revisions, and lens
   revisions;
 - `.runpod/gpu_quote_lock.json`: exact eight-GPU provider identity, secure-cloud/data-center
   allowlist, CUDA compatibility, disk sizes, compute and running-storage rates, source, timestamp,
@@ -176,9 +188,11 @@ the 122B model, and a GPU resume cannot silently call an API.
 | `make resample-generate` | Authenticate `resample_gpu`, freeze both complete allocations, and generate all 960 exact-prefix retain/resample continuations. It creates no API client. |
 | `make resample-adjudicate` | Authenticate `resample_api`, double-judge every generated final, classify eligible replacements on both frozen routes, enforce quality gates, and publish the canonical resampling artifact. It loads no model backend. |
 | `make resample` | Validate the completed canonical resampling artifact. This is always free and validation-only. |
-| `make lens` | Validate an existing lens JSONL for free; if absent, authenticate `lens_gpu` and the active session, run the ordered 4B→122B compatibility protocol, and produce matched observational J/R rows. |
+| `make lens` | Validate an existing lens JSONL for free; if absent, freeze the causal fixed-common probe design, authenticate `lens_gpu` and the active session, run the ordered 4B→122B compatibility protocol, and produce the full matched observational J/R grid. Two bounded 122B failures produce an authenticated behavior-only failure root. |
 | `make analyze` | Run the frozen estimands, cluster inference, missingness bounds, hypothesis rules, and three core figures. |
 | `make report` | Stage `result_context.json` and `result_context.md`; it does not create a DOCX or Google Doc. |
+| `make reproduce-results` | Credential-free: authenticate the aggregate-only public result bundle, rebuild its sanitized JSONL tables, and regenerate the core figures. It never reads raw traces or creates a model/provider client. |
+| `make stage-results-release` | Maintainer step: authenticate the private analysis hash inventory, select only approved aggregate fields, and stage the content-addressed public bundle. |
 
 The split primary order is:
 
@@ -259,8 +273,20 @@ keeps unmeasurable outcomes for missingness bounds instead of selecting complete
 Lens rows are observational. They can be displayed as layer-by-position heatmaps, but they cannot
 formally support a causal or motivational conclusion unless the preregistered J/R sign,
 adjacent-band, temporal, cluster-uncertainty, and trace-level resampling-association conditions all
-hold. The 27B lens is methodology support only after both limited 122B compatibility attempts
-fail; it is not a substitute for 122B internal-state evidence.
+hold. Every concept uses one global 3+3 probe universe; a causal-prefix collision invalidates the
+whole trace × position × concept cell and produces explicit null rows rather than changing probe
+weights. The accuracy-anchor association uses paired resample-minus-retain outcomes, equal fixed
+layer-band weights, direction-stratified Kendall tau-a, exact within-direction permutations, and
+is exploratory rather than causal. The 27B lens is methodology support only after both limited
+122B compatibility attempts fail; it is not a substitute for 122B internal-state evidence.
+The compatibility attempts are bound to
+`data/manifests/lens_compatibility_prefix_manifest.json`, and both success and terminal failure
+must link `data/manifests/lens_release_authorization.json`, which authenticates the paid plan,
+receipt, approval bindings, active GPU session, and probe design. Analysis repeats pinned-tokenizer
+recomputation of lexical collisions, while report validation recomputes the exact eight-trace
+association from the linked raw inputs. Verdict-facing lens evidence requires the exact 4+4/576
+universe and strictly positive J and R tau-a; p-values and leave-one-out ranges are descriptors,
+not additional gate thresholds.
 
 ## Cost and time boundaries
 
@@ -318,6 +344,9 @@ are downloaded separately and remain subject to their own terms. See
 - `src/model_forensics/`: independent implementation.
 - `tests/`: deterministic unit, integration-contract, and smoke tests.
 - `reports/figures/`: curated figures; `reports/staging/` is ignored.
+- `reports/results/`: exact-path, aggregate-only release evidence and table hashes used by
+  `make reproduce-results`; raw reasoning, provider bodies, trace IDs, and infrastructure IDs are
+  forbidden by both the schema and release audit.
 
 Before any public commit or push, run:
 
