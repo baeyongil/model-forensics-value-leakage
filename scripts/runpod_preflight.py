@@ -36,7 +36,7 @@ CUDA_13_COMPAT_LIBRARIES = (
     "libnvidia-ptxjitcompiler.so.1",
 )
 _CONTAINER_DIGEST_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
-_MACHINE_ID_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_EXECUTION_IDENTITY_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def _command_output(command: list[str]) -> str:
@@ -201,6 +201,7 @@ def validate_watchdog_state(
     expected_gpu_family: str,
     expected_provider_gpu_id: str,
     allowed_data_center_ids: tuple[str, ...],
+    allowed_cuda_versions: tuple[str, ...],
     expected_container_image: str,
     expected_gpu_count: int,
     planned_hours: float,
@@ -245,12 +246,12 @@ def validate_watchdog_state(
         raise ValueError("watchdog live metadata must report RunPod Secure Cloud")
     if not allowed_data_center_ids or metadata.get("data_center_id") not in allowed_data_center_ids:
         raise ValueError("watchdog live data center is outside the frozen launch set")
-    machine_id_hash = metadata.get("machine_id_hash")
+    execution_identity_hash = metadata.get("execution_identity_hash")
     if (
-        not isinstance(machine_id_hash, str)
-        or _MACHINE_ID_HASH_RE.fullmatch(machine_id_hash) is None
+        not isinstance(execution_identity_hash, str)
+        or _EXECUTION_IDENTITY_HASH_RE.fullmatch(execution_identity_hash) is None
     ):
-        raise ValueError("watchdog live metadata is missing a sanitized machineId hash")
+        raise ValueError("watchdog live metadata is missing a sanitized execution identity hash")
     if _CONTAINER_DIGEST_RE.fullmatch(expected_container_image) is None:
         raise ValueError("expected container image must be pinned by SHA-256 digest")
     if metadata.get("container_image") != expected_container_image:
@@ -267,23 +268,25 @@ def validate_watchdog_state(
         is None
     ):
         raise ValueError("watchdog live GPU family does not match the local preflight profile")
-    machine_identity = metadata.get("machine_gpu_identity")
+    if metadata.get("runtime_gpu_count") != expected_gpu_count:
+        raise ValueError("watchdog v2 runtime inventory must report exactly 8 GPUs")
+    if not allowed_cuda_versions or metadata.get("cuda_version") not in allowed_cuda_versions:
+        raise ValueError("watchdog v2 CUDA version is outside the frozen launch set")
+    if metadata.get("container_disk_gb") != 50:
+        raise ValueError("watchdog v2 container disk disagrees with the frozen launch spec")
     if (
-        not isinstance(machine_identity, list)
-        or not machine_identity
-        or not all(isinstance(item, str) and item for item in machine_identity)
+        metadata.get("persistent_volume_disk_gb") != 650
+        or metadata.get("persistent_volume_mount_path") != "/workspace"
     ):
-        raise ValueError("watchdog live metadata is missing machine GPU identity")
-    recognized_machine_families = {
-        candidate
-        for item in machine_identity
-        for candidate in ("H100", "A100")
-        if re.search(rf"(?:^|[^A-Z0-9]){candidate}(?:$|[^A-Z0-9])", item, re.IGNORECASE)
-    }
-    if recognized_machine_families != {family}:
-        raise ValueError("watchdog machine GPU identity disagrees with the approved family")
-    if expected_provider_gpu_id not in machine_identity:
-        raise ValueError("watchdog machine identity omits the exact frozen provider GPU id")
+        raise ValueError("watchdog v2 persistent volume disagrees with the frozen launch spec")
+    if metadata.get("ports") != ["22/tcp"]:
+        raise ValueError("watchdog v2 ports disagree with the SSH-only launch spec")
+    if metadata.get("global_networking_enabled") is not False:
+        raise ValueError("watchdog v2 global networking must remain disabled")
+    if metadata.get("network_volume_attached") is not False:
+        raise ValueError("watchdog v2 network volume attachment is forbidden")
+    if metadata.get("ssh_ready") is not True or metadata.get("environment_verified") is not True:
+        raise ValueError("watchdog v2 SSH/environment verification is incomplete")
     live_nominal = _positive_finite(metadata.get("cost_per_hr"), field="cost_per_hr")
     live_effective = _positive_finite(
         metadata.get("adjusted_cost_per_hr"), field="adjusted_cost_per_hr"
@@ -371,7 +374,7 @@ def validate_watchdog_state(
         "global_safe_budget_usd": global_safe_budget,
         "prior_committed_gpu_usd": prior_committed,
         "provider_gpu_id": expected_provider_gpu_id,
-        "machine_id_hash": machine_id_hash,
+        "execution_identity_hash": execution_identity_hash,
         "container_image": expected_container_image,
         "data_center_id": metadata["data_center_id"],
         "approved_storage_hourly_usd": storage_hourly,
@@ -509,6 +512,7 @@ def main() -> None:
             expected_gpu_family=args.expected_gpu_family,
             expected_provider_gpu_id=args.expected_provider_gpu_id,
             allowed_data_center_ids=tuple(args.allowed_data_center_id),
+            allowed_cuda_versions=tuple(args.allowed_cuda_version),
             expected_container_image=args.container_image_digest,
             expected_gpu_count=args.required_gpus,
             planned_hours=args.planned_hours,
@@ -587,7 +591,7 @@ def main() -> None:
         },
         "container_image_digest": watchdog["container_image"],
         "provider_gpu_id": watchdog["provider_gpu_id"],
-        "machine_id_hash": watchdog["machine_id_hash"],
+        "execution_identity_hash": watchdog["execution_identity_hash"],
         "data_center_id": watchdog["data_center_id"],
         "allowed_cuda_versions": args.allowed_cuda_version,
         "vllm_wheel": {

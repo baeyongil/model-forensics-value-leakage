@@ -1,9 +1,9 @@
 """Fail-closed RunPod GPU-cost watchdog.
 
-The watchdog uses RunPod's live Pod metadata rather than a caller-supplied
-hourly rate. It runs independently from the experiment and only calls the
-non-destructive stop endpoint. Pod deletion remains an explicit post-sync
-operation.
+The watchdog uses RunPod's v2 live Pod metadata rather than a caller-supplied
+hourly rate. It runs independently from the experiment and only sends the
+non-destructive ``{"action":"stop"}`` Pod action. Pod deletion remains an
+explicit post-sync operation.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import os
 import re
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -25,9 +24,10 @@ from typing import Any
 
 from model_forensics.io import write_json
 
-RUNPOD_REST_BASE = "https://rest.runpod.io/v1"
-RUNPOD_POD_LOOKUP_DOC = "https://docs.runpod.io/api-reference/pods/GET/pods/podId"
-RUNPOD_POD_STOP_DOC = "https://docs.runpod.io/api-reference/pods/POST/pods/podId/stop"
+RUNPOD_API_BASE = "https://api.runpod.io/v2"
+RUNPOD_REST_BASE = RUNPOD_API_BASE
+RUNPOD_POD_LOOKUP_DOC = "https://api.runpod.io/v2/openapi.yaml"
+RUNPOD_POD_STOP_DOC = "https://api.runpod.io/v2/openapi.yaml"
 WATCHDOG_VERSION = "runpod-gpu-cost-watchdog-v2"
 _POD_ID_RE = re.compile(r"[A-Za-z0-9_-]{3,128}\Z")
 _GPU_FAMILY_RE = {
@@ -42,7 +42,19 @@ _EXPECTED_FAMILY_ALIASES = {
 }
 _TERMINAL_STATUSES = frozenset({"EXITED", "TERMINATED"})
 _CONTAINER_DIGEST_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
-_MACHINE_ID_RE = re.compile(r"[A-Za-z0-9_-]{3,191}\Z")
+_EXPECTED_CONTAINER_DISK_GB = 50
+_EXPECTED_VOLUME_DISK_GB = 650
+_EXPECTED_VOLUME_MOUNT_PATH = "/workspace"
+_EXPECTED_PORTS = ("22/tcp",)
+_EXPECTED_STATIC_ENV = {
+    "HF_HOME": "/workspace/.cache/huggingface",
+    "HF_HUB_CACHE": "/workspace/.cache/huggingface/hub",
+    "TRANSFORMERS_CACHE": "/workspace/.cache/huggingface/transformers",
+    "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+    "VLLM_ENABLE_CUDA_COMPATIBILITY": "1",
+}
+_EXPECTED_SECRET_ENV_KEYS = frozenset({"HF_TOKEN", "GPU_BUDGET_SESSION_ID"})
+_ALLOWED_PROVIDER_ENV_KEYS = frozenset({"PUBLIC_KEY"})
 
 
 class WatchdogError(RuntimeError):
@@ -106,17 +118,25 @@ class WatchdogLimits:
 
 @dataclass(frozen=True, slots=True)
 class PodMetadata:
-    """Sanitized subset of the authoritative RunPod Pod response."""
+    """Secret-free subset of the authoritative RunPod v2 Pod response."""
 
     pod_id: str
     gpu_count: int
     provider_gpu_id: str
     gpu_display_name: str
-    machine_gpu_identity: tuple[str, ...]
-    machine_id_hash: str
+    runtime_gpu_count: int
+    execution_identity_hash: str
     data_center_id: str
+    cuda_version: str
     secure_cloud: bool
     container_image: str
+    container_disk_gb: int
+    persistent_volume_disk_gb: int
+    persistent_volume_mount_path: str
+    ports: tuple[str, ...]
+    global_networking_enabled: bool
+    ssh_ready: bool
+    environment_verified: bool
     desired_status: str
     cost_per_hr: float
     adjusted_cost_per_hr: float
@@ -127,8 +147,8 @@ class PodMetadata:
 
     @property
     def effective_hourly_usd(self) -> float:
-        # RunPod documents adjustedCostPerHr as the effective hourly cost after
-        # Savings Plans. It is therefore the authoritative billable rate.
+        # The v2 Pod resource exposes ``cost`` as the current compute rate.  The
+        # frozen storage rate is added separately by ``run_watchdog``.
         return self.adjusted_cost_per_hr
 
     @property
@@ -150,11 +170,19 @@ class PodMetadata:
             "gpu_count": self.gpu_count,
             "provider_gpu_id": self.provider_gpu_id,
             "gpu_display_name": self.gpu_display_name,
-            "machine_gpu_identity": list(self.machine_gpu_identity),
-            "machine_id_hash": self.machine_id_hash,
+            "runtime_gpu_count": self.runtime_gpu_count,
+            "execution_identity_hash": self.execution_identity_hash,
             "data_center_id": self.data_center_id,
+            "cuda_version": self.cuda_version,
             "secure_cloud": self.secure_cloud,
             "container_image": self.container_image,
+            "container_disk_gb": self.container_disk_gb,
+            "persistent_volume_disk_gb": self.persistent_volume_disk_gb,
+            "persistent_volume_mount_path": self.persistent_volume_mount_path,
+            "ports": list(self.ports),
+            "global_networking_enabled": self.global_networking_enabled,
+            "ssh_ready": self.ssh_ready,
+            "environment_verified": self.environment_verified,
             "desired_status": self.desired_status,
             "cost_per_hr": self.cost_per_hr,
             "adjusted_cost_per_hr": self.adjusted_cost_per_hr,
@@ -183,9 +211,8 @@ class DerivedDeadline:
         return "maximum_runtime"
 
 
-HttpTransport = Callable[[str, str, float], tuple[int, str]]
-StopTransport = HttpTransport
-MetadataTransport = HttpTransport
+MetadataTransport = Callable[[str, str, float], tuple[int, str]]
+StopTransport = Callable[[str, str, float, Mapping[str, str]], tuple[int, str]]
 
 
 def _default_transport(
@@ -194,10 +221,26 @@ def _default_transport(
     timeout: float,
     *,
     method: str,
+    payload: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
+    encoded = None
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if payload is not None:
+        encoded = json.dumps(
+            dict(payload),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {api_key}"},
+        data=encoded,
+        headers=headers,
         method=method,
     )
     try:
@@ -210,8 +253,13 @@ def _default_transport(
         raise WatchdogError(f"RunPod {method} transport failed: {type(exc).__name__}") from exc
 
 
-def _default_stop_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
-    return _default_transport(url, api_key, timeout, method="POST")
+def _default_stop_transport(
+    url: str,
+    api_key: str,
+    timeout: float,
+    payload: Mapping[str, str],
+) -> tuple[int, str]:
+    return _default_transport(url, api_key, timeout, method="POST", payload=payload)
 
 
 def _default_metadata_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
@@ -248,11 +296,87 @@ def _parse_container_digest(value: Any, *, field: str) -> str:
     return value
 
 
-def _hash_machine_id(value: Any) -> str:
-    if not isinstance(value, str) or _MACHINE_ID_RE.fullmatch(value) is None:
-        raise WatchdogError("RunPod metadata machineId must be a nonempty provider identifier")
-    digest = hashlib.sha256(f"runpod-machine-id-v1:{value}".encode()).hexdigest()
+def _execution_identity_hash(
+    *,
+    pod_id: str,
+    started_at: datetime,
+    provider_gpu_id: str,
+    data_center_id: str,
+    cuda_version: str,
+) -> str:
+    canonical = json.dumps(
+        {
+            "cuda_version": cuda_version,
+            "data_center_id": data_center_id,
+            "pod_id": pod_id,
+            "provider_gpu_id": provider_gpu_id,
+            "started_at": started_at.isoformat(),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(f"runpod-v2-execution-identity-v1:{canonical}".encode()).hexdigest()
     return f"sha256:{digest}"
+
+
+def _parse_exact_positive_integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+        raise WatchdogError(f"RunPod metadata field {field} must be an integer")
+    parsed = int(value)
+    if parsed <= 0:
+        raise WatchdogError(f"RunPod metadata field {field} must be positive")
+    return parsed
+
+
+def _validate_secret_environment(value: Any) -> None:
+    """Validate approval-bound environment shape without returning secret values."""
+
+    if not isinstance(value, Mapping) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise WatchdogError("RunPod v2 environment is missing or malformed")
+    allowed = set(_EXPECTED_STATIC_ENV) | _EXPECTED_SECRET_ENV_KEYS | _ALLOWED_PROVIDER_ENV_KEYS
+    if set(value) - allowed or not (
+        set(_EXPECTED_STATIC_ENV) | _EXPECTED_SECRET_ENV_KEYS
+    ).issubset(value):
+        raise WatchdogError("RunPod v2 environment violates the approval-bound allow-list")
+    if any(not value[key] for key in _EXPECTED_SECRET_ENV_KEYS):
+        raise WatchdogError("RunPod v2 environment is missing an approval-bound secret")
+    if any(value.get(key) != expected for key, expected in _EXPECTED_STATIC_ENV.items()):
+        raise WatchdogError("RunPod v2 compatibility/cache environment drifted")
+    public_key = value.get("PUBLIC_KEY")
+    if public_key is not None and (not public_key.strip() or len(public_key) > 65536):
+        raise WatchdogError("RunPod v2 provider-managed SSH environment is malformed")
+
+
+def _ssh_ready(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        raise WatchdogError("RunPod v2 SSH metadata is missing or malformed")
+    ready = False
+    for kind in ("proxy", "direct"):
+        endpoint = value.get(kind)
+        if endpoint is None:
+            continue
+        if not isinstance(endpoint, Mapping):
+            raise WatchdogError("RunPod v2 SSH endpoint is malformed")
+        host = endpoint.get("host")
+        username = endpoint.get("username")
+        port = endpoint.get("port")
+        if (
+            not isinstance(host, str)
+            or not host.strip()
+            or not isinstance(username, str)
+            or not username.strip()
+            or isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 0 < port < 65536
+        ):
+            raise WatchdogError("RunPod v2 SSH endpoint is malformed")
+        ready = True
+    if not ready:
+        raise WatchdogError("RunPod v2 SSH endpoint is not ready")
+    return True
 
 
 def parse_pod_metadata(
@@ -261,73 +385,121 @@ def parse_pod_metadata(
     expected_pod_id: str,
     observed_at: datetime,
 ) -> PodMetadata:
-    """Parse and sanitize a live ``GET /v1/pods/{id}`` response."""
+    """Parse and sanitize a live ``GET /v2/pods/{id}`` response.
+
+    The v2 response includes ``env`` and SSH routing details.  Both are
+    validated in memory and deliberately discarded before state persistence.
+    """
 
     if payload.get("id") != expected_pod_id:
         raise WatchdogError("RunPod metadata returned a different Pod id")
     gpu = payload.get("gpu")
     if not isinstance(gpu, Mapping):
         raise WatchdogError("RunPod metadata is missing the GPU object")
-    count = gpu.get("count")
-    if isinstance(count, bool) or not isinstance(count, (int, float)) or int(count) != count:
-        raise WatchdogError("RunPod metadata gpu.count must be an integer")
+    count = _parse_exact_positive_integer(gpu.get("count"), field="gpu.count")
     provider_gpu_id = gpu.get("id")
     if not isinstance(provider_gpu_id, str) or not provider_gpu_id.strip():
         raise WatchdogError("RunPod metadata gpu.id must be nonempty")
-    display_name = gpu.get("displayName")
+    display_name = gpu.get("displayName", provider_gpu_id)
     if not isinstance(display_name, str) or not display_name.strip():
-        raise WatchdogError("RunPod metadata gpu.displayName must be nonempty")
-    machine = payload.get("machine")
-    if not isinstance(machine, Mapping):
-        raise WatchdogError("RunPod metadata is missing includeMachine output")
-    machine_labels: list[str] = []
-    for value in (machine.get("gpuTypeId"), machine.get("gpuDisplayName")):
-        if isinstance(value, str) and value.strip():
-            machine_labels.append(value.strip())
-    machine_gpu_type = machine.get("gpuType")
-    if isinstance(machine_gpu_type, Mapping):
-        for key in ("id", "displayName"):
-            value = machine_gpu_type.get(key)
-            if isinstance(value, str) and value.strip():
-                machine_labels.append(value.strip())
-    machine_labels = list(dict.fromkeys(machine_labels))
-    if not machine_labels:
-        raise WatchdogError("RunPod includeMachine output has no GPU identity")
-    secure_cloud = machine.get("secureCloud")
-    if not isinstance(secure_cloud, bool):
-        raise WatchdogError("RunPod includeMachine output has no secureCloud flag")
-    data_center_id = machine.get("dataCenterId")
+        raise WatchdogError("RunPod metadata GPU display identity must be nonempty")
+
+    cloud = payload.get("cloud")
+    if not isinstance(cloud, str) or not cloud:
+        raise WatchdogError("RunPod v2 metadata cloud must be nonempty")
+    data_center_id = payload.get("dataCenterId")
     if not isinstance(data_center_id, str) or not data_center_id.strip():
-        raise WatchdogError("RunPod includeMachine output has no dataCenterId")
-    desired_status = payload.get("desiredStatus")
+        raise WatchdogError("RunPod v2 metadata has no dataCenterId")
+    cuda_version = payload.get("cudaVersion")
+    if not isinstance(cuda_version, str) or not cuda_version.strip():
+        raise WatchdogError("RunPod v2 metadata has no cudaVersion")
+    desired_status = payload.get("status")
     if desired_status not in {"RUNNING", "EXITED", "TERMINATED"}:
-        raise WatchdogError("RunPod metadata desiredStatus is unsupported")
+        raise WatchdogError("RunPod v2 metadata status is unsupported")
     locked = payload.get("locked")
     if not isinstance(locked, bool):
         raise WatchdogError("RunPod metadata locked flag must be boolean")
+
+    container_disk_gb = _parse_exact_positive_integer(payload.get("disk"), field="disk")
+    mounts = payload.get("mounts")
+    if not isinstance(mounts, Mapping) or set(mounts) != {"persistent"}:
+        raise WatchdogError("RunPod v2 persistent mount metadata is missing or unexpected")
+    if payload.get("networkVolume") is not None:
+        raise WatchdogError("RunPod v2 Pod unexpectedly has a network volume")
+    persistent = mounts.get("persistent")
+    if not isinstance(persistent, Mapping):
+        raise WatchdogError("RunPod v2 persistent mount metadata is malformed")
+    volume_disk_gb = _parse_exact_positive_integer(
+        persistent.get("size"), field="mounts.persistent.size"
+    )
+    volume_mount_path = persistent.get("path")
+    if not isinstance(volume_mount_path, str) or not volume_mount_path:
+        raise WatchdogError("RunPod v2 persistent mount path is missing")
+    ports = payload.get("ports")
+    if not isinstance(ports, list) or not all(isinstance(item, str) for item in ports):
+        raise WatchdogError("RunPod v2 port metadata is malformed")
+    global_networking = payload.get("globalNetworking")
+    if not isinstance(global_networking, Mapping) or not isinstance(
+        global_networking.get("enabled"), bool
+    ):
+        raise WatchdogError("RunPod v2 globalNetworking metadata is malformed")
+
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise WatchdogError("RunPod v2 runtime metadata is missing")
+    runtime_gpus = runtime.get("gpus")
+    if not isinstance(runtime_gpus, list):
+        raise WatchdogError("RunPod v2 runtime.gpus metadata is missing")
+    uptime = runtime.get("uptime")
+    if isinstance(uptime, bool) or not isinstance(uptime, int) or uptime < 0:
+        raise WatchdogError("RunPod v2 runtime.uptime must be a nonnegative integer")
+
+    _validate_secret_environment(payload.get("env"))
+    ssh_ready = _ssh_ready(payload.get("ssh"))
     current = observed_at.astimezone(UTC)
-    started = _parse_timestamp(payload.get("lastStartedAt"), field="lastStartedAt")
+    created = _parse_timestamp(payload.get("createdAt"), field="createdAt")
+    started = _parse_timestamp(payload.get("startedAt"), field="startedAt")
+    if started < created - timedelta(minutes=5):
+        raise WatchdogError("RunPod startedAt predates createdAt")
     if started > current + timedelta(minutes=5):
-        raise WatchdogError("RunPod lastStartedAt is implausibly in the future")
+        raise WatchdogError("RunPod startedAt is implausibly in the future")
+    if uptime > max(0.0, (current - started).total_seconds()) + 600:
+        raise WatchdogError("RunPod runtime.uptime disagrees with startedAt")
+
+    image = _parse_container_digest(payload.get("image"), field="image")
+    cost = _parse_positive_number(payload.get("cost"), field="cost")
+    execution_hash = _execution_identity_hash(
+        pod_id=expected_pod_id,
+        started_at=started,
+        provider_gpu_id=provider_gpu_id.strip(),
+        data_center_id=data_center_id.strip(),
+        cuda_version=cuda_version.strip(),
+    )
     return PodMetadata(
         pod_id=expected_pod_id,
-        gpu_count=int(count),
+        gpu_count=count,
         provider_gpu_id=provider_gpu_id.strip(),
         gpu_display_name=display_name.strip(),
-        machine_gpu_identity=tuple(machine_labels),
-        machine_id_hash=_hash_machine_id(payload.get("machineId")),
+        runtime_gpu_count=len(runtime_gpus),
+        execution_identity_hash=execution_hash,
         data_center_id=data_center_id.strip(),
-        secure_cloud=secure_cloud,
-        container_image=_parse_container_digest(payload.get("image"), field="image"),
+        cuda_version=cuda_version.strip(),
+        secure_cloud=cloud == "SECURE",
+        container_image=image,
+        container_disk_gb=container_disk_gb,
+        persistent_volume_disk_gb=volume_disk_gb,
+        persistent_volume_mount_path=volume_mount_path,
+        ports=tuple(ports),
+        global_networking_enabled=bool(global_networking["enabled"]),
+        ssh_ready=ssh_ready,
+        environment_verified=True,
         desired_status=str(desired_status),
-        cost_per_hr=_parse_positive_number(payload.get("costPerHr"), field="costPerHr"),
-        adjusted_cost_per_hr=_parse_positive_number(
-            payload.get("adjustedCostPerHr"), field="adjustedCostPerHr"
-        ),
+        cost_per_hr=cost,
+        adjusted_cost_per_hr=cost,
         last_started_at=started,
         observed_at=current,
         locked=locked,
-        network_volume_attached=isinstance(payload.get("networkVolume"), Mapping),
+        network_volume_attached=False,
     )
 
 
@@ -345,6 +517,7 @@ def validate_live_metadata(
     expected_gpu_family: str,
     expected_provider_gpu_id: str,
     allowed_data_center_ids: tuple[str, ...],
+    allowed_cuda_versions: tuple[str, ...],
     expected_container_image: str,
     limits: WatchdogLimits,
 ) -> None:
@@ -359,7 +532,9 @@ def validate_live_metadata(
         raise WatchdogError(
             f"RunPod live metadata must report exactly 8 GPUs; observed {metadata.gpu_count}"
         )
-    if _GPU_FAMILY_RE[family].search(metadata.gpu_display_name) is None:
+    if _GPU_FAMILY_RE[family].search(metadata.gpu_display_name) is None or _GPU_FAMILY_RE[
+        family
+    ].search(metadata.provider_gpu_id) is None:
         raise WatchdogError(
             "RunPod live GPU family does not match the approved profile: "
             f"expected {family}, observed {metadata.gpu_display_name!r}"
@@ -374,21 +549,13 @@ def validate_live_metadata(
             "RunPod live data center is outside the frozen launch set: "
             f"observed {metadata.data_center_id!r}"
         )
-    recognized_machine_families = {
-        candidate
-        for label in metadata.machine_gpu_identity
-        for candidate, pattern in _GPU_FAMILY_RE.items()
-        if pattern.search(label)
-    }
-    if recognized_machine_families != {family}:
+    if not allowed_cuda_versions or metadata.cuda_version not in allowed_cuda_versions:
         raise WatchdogError(
-            "RunPod machine GPU identity disagrees with the approved homogeneous family: "
-            f"expected {family}, observed {metadata.machine_gpu_identity!r}"
+            "RunPod live CUDA host version is outside the frozen launch set: "
+            f"observed {metadata.cuda_version!r}"
         )
-    if expected_provider_gpu_id not in metadata.machine_gpu_identity:
-        raise WatchdogError(
-            "RunPod machine GPU identity does not contain the exact frozen provider GPU id"
-        )
+    if metadata.runtime_gpu_count != expected_gpu_count:
+        raise WatchdogError("RunPod runtime GPU inventory does not contain exactly 8 GPUs")
     if not metadata.secure_cloud:
         raise WatchdogError("RunPod live machine is not in Secure Cloud")
     if metadata.container_image != approved_image:
@@ -396,6 +563,21 @@ def validate_live_metadata(
             "RunPod live image does not match the approval-bound digest: "
             f"expected {approved_image!r}, observed {metadata.container_image!r}"
         )
+    if metadata.container_disk_gb != _EXPECTED_CONTAINER_DISK_GB:
+        raise WatchdogError("RunPod live container disk differs from the frozen 50 GB spec")
+    if (
+        metadata.persistent_volume_disk_gb != _EXPECTED_VOLUME_DISK_GB
+        or metadata.persistent_volume_mount_path != _EXPECTED_VOLUME_MOUNT_PATH
+    ):
+        raise WatchdogError("RunPod live persistent volume differs from the frozen 650 GB spec")
+    if metadata.ports != _EXPECTED_PORTS:
+        raise WatchdogError("RunPod live ports differ from the frozen SSH-only spec")
+    if metadata.global_networking_enabled:
+        raise WatchdogError("RunPod global networking must remain disabled")
+    if metadata.network_volume_attached:
+        raise WatchdogError("RunPod must not attach a network volume")
+    if not metadata.ssh_ready or not metadata.environment_verified:
+        raise WatchdogError("RunPod SSH or environment verification is incomplete")
     if metadata.desired_status != "RUNNING":
         raise WatchdogError(
             f"RunPod Pod must be RUNNING when watchdog is armed; got {metadata.desired_status}"
@@ -436,14 +618,14 @@ def derive_deadline(
 
 
 class RunpodStopClient:
-    """Minimal RunPod client with injectable GET and POST transports for tests."""
+    """Minimal RunPod v2 client with injectable GET and action transports."""
 
     def __init__(
         self,
         *,
         pod_id: str,
         api_key_env: str = "RUNPOD_API_KEY",
-        endpoint_base: str = RUNPOD_REST_BASE,
+        endpoint_base: str = RUNPOD_API_BASE,
         transport: StopTransport | None = None,
         metadata_transport: MetadataTransport | None = None,
         timeout_seconds: float = 30,
@@ -459,15 +641,8 @@ class RunpodStopClient:
             raise ValueError("RunPod request timeout must be in (0, 60]")
         self.pod_id = pod_id
         pod_endpoint = f"{endpoint_base.rstrip('/')}/pods/{pod_id}"
-        query = urllib.parse.urlencode(
-            {
-                "includeMachine": "true",
-                "includeNetworkVolume": "true",
-                "includeSavingsPlans": "true",
-            }
-        )
-        self._metadata_endpoint = f"{pod_endpoint}?{query}"
-        self._stop_endpoint = f"{pod_endpoint}/stop"
+        self._metadata_endpoint = pod_endpoint
+        self._stop_endpoint = f"{pod_endpoint}/action"
         self._api_key = api_key
         self._stop_transport = transport or _default_stop_transport
         self._metadata_transport = metadata_transport or _default_metadata_transport
@@ -501,9 +676,9 @@ class RunpodStopClient:
         payload = self._get_payload()
         if payload.get("id") != self.pod_id:
             raise WatchdogError("RunPod metadata returned a different Pod id")
-        status = payload.get("desiredStatus")
+        status = payload.get("status")
         if status not in {"RUNNING", "EXITED", "TERMINATED"}:
-            raise WatchdogError("RunPod metadata desiredStatus is unsupported")
+            raise WatchdogError("RunPod v2 metadata status is unsupported")
         return str(status)
 
     def stop(self) -> None:
@@ -511,6 +686,7 @@ class RunpodStopClient:
             self._stop_endpoint,
             self._api_key,
             self._timeout_seconds,
+            {"action": "stop"},
         )
         if status < 200 or status >= 300:
             raise WatchdogError(f"RunPod stop returned HTTP {status}")
@@ -669,6 +845,7 @@ def run_watchdog(
     expected_gpu_family: str,
     expected_provider_gpu_id: str,
     allowed_data_center_ids: tuple[str, ...],
+    allowed_cuda_versions: tuple[str, ...],
     expected_container_image: str,
     limits: WatchdogLimits,
     state_path: str | Path,
@@ -703,6 +880,7 @@ def run_watchdog(
             expected_gpu_family=expected_gpu_family,
             expected_provider_gpu_id=expected_provider_gpu_id,
             allowed_data_center_ids=allowed_data_center_ids,
+            allowed_cuda_versions=allowed_cuda_versions,
             expected_container_image=expected_container_image,
             limits=limits,
         )
@@ -772,7 +950,7 @@ def run_watchdog(
         ),
     )
     initial_started_at = metadata.last_started_at
-    initial_machine_id_hash = metadata.machine_id_hash
+    initial_execution_identity_hash = metadata.execution_identity_hash
     while True:
         current_time = now().astimezone(UTC)
         current_monotonic = monotonic()
@@ -815,13 +993,14 @@ def run_watchdog(
                 expected_gpu_family=expected_gpu_family,
                 expected_provider_gpu_id=expected_provider_gpu_id,
                 allowed_data_center_ids=allowed_data_center_ids,
+                allowed_cuda_versions=allowed_cuda_versions,
                 expected_container_image=expected_container_image,
                 limits=limits,
             )
             if current.last_started_at != initial_started_at:
                 raise WatchdogError("RunPod lastStartedAt changed after watchdog arming")
-            if current.machine_id_hash != initial_machine_id_hash:
-                raise WatchdogError("RunPod machineId changed after watchdog arming")
+            if current.execution_identity_hash != initial_execution_identity_hash:
+                raise WatchdogError("RunPod v2 execution identity changed after watchdog arming")
             # Never extend the deadline if RunPod later reports a lower rate.
             calculation_rate = max(
                 calculation_rate,
@@ -885,6 +1064,7 @@ def run_watchdog(
 
 
 __all__ = [
+    "RUNPOD_API_BASE",
     "RUNPOD_POD_LOOKUP_DOC",
     "RUNPOD_POD_STOP_DOC",
     "RUNPOD_REST_BASE",

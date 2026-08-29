@@ -47,6 +47,7 @@ from model_forensics.runpod_lifecycle import (
     lifecycle_state_path,
     read_lifecycle_status,
     rearm_approved_pod,
+    recover_created_pod,
     urllib_http_transport,
 )
 
@@ -259,6 +260,12 @@ def _parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status", help="read and validate status without mutation")
 
+    recover = subparsers.add_parser(
+        "recover-create",
+        help="verify a running pending create with one read-only v2 GET",
+    )
+    _add_paid_arguments(recover)
+
     rearm = subparsers.add_parser("rearm", help="re-arm and start the same stopped Pod")
     _add_paid_arguments(rearm)
     return parser
@@ -308,6 +315,14 @@ def main(
                     acknowledged_existing_pod_id_hashes=(
                         args.allow_existing_pod_id_hash
                     ),
+                )
+            elif args.operation == "recover-create":
+                result = recover_created_pod(
+                    project_root=context.root,
+                    client=client,
+                    authorization=authorization,
+                    hf_token=hf_token,
+                    session_nonce=nonce,
                 )
             else:
                 result = rearm_approved_pod(

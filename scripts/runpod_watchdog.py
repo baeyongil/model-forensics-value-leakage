@@ -22,6 +22,7 @@ def main() -> int:
     )
     parser.add_argument("--expected-provider-gpu-id", required=True)
     parser.add_argument("--allowed-data-center-id", action="append", required=True)
+    parser.add_argument("--allowed-cuda-version", action="append", required=True)
     parser.add_argument("--expected-container-image", required=True)
     parser.add_argument("--expected-gpu-count", type=int, default=8)
     parser.add_argument("--maximum-approved-hourly-per-gpu-usd", required=True, type=float)
@@ -52,6 +53,7 @@ def main() -> int:
         expected_gpu_family=args.expected_gpu_family,
         expected_provider_gpu_id=args.expected_provider_gpu_id,
         allowed_data_center_ids=tuple(args.allowed_data_center_id),
+        allowed_cuda_versions=tuple(args.allowed_cuda_version),
         expected_container_image=args.expected_container_image,
         expected_gpu_count=args.expected_gpu_count,
         limits=limits,

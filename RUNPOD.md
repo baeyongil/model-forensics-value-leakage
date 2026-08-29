@@ -69,13 +69,14 @@ Do not attach a network volume: the watchdog uses the non-destructive stop opera
 network-volume Pod may require termination. Inject `RUNPOD_API_KEY`, `HF_TOKEN`, and any other
 secret using RunPod Secrets; never serialize their values into the launch spec or its hash.
 
-RunPod currently separates creation from lifecycle observation: creation uses the approved v2
-base `https://api.runpod.io/v2`, while the watchdog uses the officially documented
-`GET https://rest.runpod.io/v1/pods/{podId}` and
-`POST https://rest.runpod.io/v1/pods/{podId}/stop`. A read-only check on 2026-08-29 confirmed that
-new `rpa_` bearer keys authenticate to the v1 Pod listing endpoint; the undocumented
-`https://api.runpod.io/v2/pods` GET returned HTTP 403, so the watchdog does not guess a v2 status
-or action schema.
+Creation and watchdog observation both use the approved v2 base
+`https://api.runpod.io/v2`. The watchdog reads the exact Pod with
+`GET /v2/pods/{podId}` and performs only the non-destructive
+`POST /v2/pods/{podId}/action` body `{"action":"stop"}`. The v2 resource is required because it
+exposes the approval-bound image, exact GPU/count, Secure cloud, data center, CUDA host version,
+disks/mounts, ports, networking state, environment shape, SSH readiness, runtime inventory, start
+time, and current compute rate in one authoritative response. Secret values and SSH routes are
+validated in memory and never persisted.
 
 ## Hard budget and hardware gate
 
@@ -96,8 +97,8 @@ Pro Preview; it does not substitute entry-tier or economy models. This does not 
 API hard stop or authorize a call before the exact paid bundle is explicitly approved.
 
 The approval input uses the provider-displayed **per-GPU hourly price**. The watchdog independently
-reads the live Pod-level `costPerHr` and `adjustedCostPerHr` from RunPod and refuses a live rate
-above the frozen all-in compute-plus-storage ceiling. The approved GPU projection includes running
+reads the live Pod-level v2 `cost` from RunPod and refuses a live compute rate above the frozen
+all-in compute-plus-storage ceiling. The approved GPU projection includes running
 storage. Under the currently reviewed USD 0.10/GB-month schedule, the frozen 50 GB container plus
 650 GB volume is encoded as `700 × 0.10 ÷ 720 ≈ 0.0972222222` USD/hour; the authenticated quote must
 record that derivation's source and timestamp.
@@ -162,8 +163,8 @@ requires the exact container digest, 64-character wheel SHA-256, pinned 40-chara
 and Jacobian Lens Git commits, environment-manifest hash, smoke hashes, and live `pip freeze` to match. A stale
 active session, an incomplete prior stop, or an unsettled prior reservation blocks re-arm.
 
-The watchdog derives current incurred cost and two absolute deadlines from the provider's live
-`lastStartedAt` and effective `adjustedCostPerHr`: the 97% safe-budget deadline and approved maximum
+The watchdog derives current incurred cost and two absolute deadlines from the provider's live v2
+`startedAt` and `cost`: the 97% safe-budget deadline and approved maximum
 runtime deadline. It uses the earlier one, never extends the deadline after a reported rate drop,
 and stops early if live metadata becomes unsafe. The private persisted state intentionally omits
 the API response's `env` object and all credentials.
@@ -255,7 +256,8 @@ the 122B model's internal state.
 - After verified sync, request an immediate non-destructive stop with
   `touch "$SESSION_DIR/runpod_stop.request"`; do not wait for the watchdog deadline.
 - Wait until `$SESSION_DIR/runpod_watchdog.json` reports `stopped_confirmed`. The watchdog calls
-  only `POST /v1/pods/{podId}/stop` and confirms `desiredStatus=EXITED`; it never calls DELETE.
+  only `POST /v2/pods/{podId}/action` with `{"action":"stop"}` and confirms `status=EXITED`; it
+  never calls DELETE.
 - Confirm in the RunPod UI that GPU billing stopped. A stopped Pod may still incur volume/storage
   charges, so remove no-longer-needed storage through the UI only after the local checksum audit.
 - Read the authoritative provider-incurred GPU charge, then reconcile the exact reservation. The
@@ -301,6 +303,6 @@ The watchdog is a last-resort stop request, not proof of provider billing. Recon
 provider invoice with the local cost ledger and report any difference without retroactively
 changing the preregistered analysis.
 
-Official API references: [find a Pod by ID](https://docs.runpod.io/api-reference/pods/GET/pods/podId),
-[stop a Pod](https://docs.runpod.io/api-reference/pods/POST/pods/podId/stop), and
+Official API references: [RunPod v2 OpenAPI](https://api.runpod.io/v2/openapi.yaml),
+[Pod API overview](https://docs.runpod.io/api-reference/pods/overview), and
 [Pod billing history](https://docs.runpod.io/api-reference/billing/GET/billing/pods).

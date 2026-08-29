@@ -26,6 +26,7 @@ if [[ "$ALLOWED_CUDA_VERSIONS_CSV" != "12.8" ]]; then
   echo "approved CUDA host version set must be exactly 12.8" >&2
   exit 2
 fi
+CUDA_ARGS=(--allowed-cuda-version "$ALLOWED_CUDA_VERSIONS_CSV")
 IFS=',' read -r -a DATA_CENTER_IDS <<< "$DATA_CENTER_IDS_CSV"
 if [[ "${#DATA_CENTER_IDS[@]}" -eq 0 ]]; then
   echo "at least one frozen RunPod data center id is required" >&2
@@ -73,6 +74,7 @@ cleanup_on_exit() {
         --expected-gpu-family "$EMERGENCY_GPU_FAMILY" \
         --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
         "${DATA_CENTER_ARGS[@]}" \
+        "${CUDA_ARGS[@]}" \
         --expected-container-image "$CONTAINER_IMAGE_DIGEST" \
         --expected-gpu-count 8 \
         --maximum-approved-hourly-per-gpu-usd 1000000 \
@@ -197,6 +199,7 @@ env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" nohup python3 scripts/runpod_
   --expected-gpu-family "$GPU_FAMILY" \
   --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
   "${DATA_CENTER_ARGS[@]}" \
+  "${CUDA_ARGS[@]}" \
   --expected-container-image "$CONTAINER_IMAGE_DIGEST" \
   --expected-gpu-count 8 \
   --maximum-approved-hourly-per-gpu-usd "$HOURLY_PER_GPU_USD" \

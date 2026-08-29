@@ -20,6 +20,7 @@ from model_forensics.runpod_watchdog import (
 GPU_ID = "NVIDIA H100 80GB HBM3"
 IMAGE = "runpod/pytorch@sha256:" + "a" * 64
 DATA_CENTERS = ("US-IL-1",)
+CUDA_VERSIONS = ("12.8",)
 
 
 def _payload(
@@ -29,34 +30,53 @@ def _payload(
     display_name: str = "NVIDIA H100 80GB HBM3",
     count: int = 8,
     cost: float | str = "82.40",
-    adjusted: float = 80.0,
+    adjusted: float | None = None,
     started_at: str = "2026-08-29T12:00:00Z",
     locked: bool = False,
     image: str = IMAGE,
-    machine_id: str = "machine_123",
     secure_cloud: bool = True,
     data_center_id: str = "US-IL-1",
 ) -> dict[str, object]:
+    live_cost = adjusted if adjusted is not None else cost
     return {
         "id": pod_id,
-        "gpu": {"id": display_name, "count": count, "displayName": display_name},
-        "machine": {
-            "gpuTypeId": display_name,
-            "gpuType": {"displayName": display_name},
-            "gpuDisplayName": display_name,
-            "secureCloud": secure_cloud,
-            "dataCenterId": data_center_id,
+        "gpu": {"id": display_name, "count": count},
+        "cloud": "SECURE" if secure_cloud else "COMMUNITY",
+        "dataCenterId": data_center_id,
+        "cudaVersion": "12.8",
+        "disk": 50,
+        "mounts": {"persistent": {"size": 650, "path": "/workspace"}},
+        "ports": ["22/tcp"],
+        "globalNetworking": {"enabled": False},
+        "runtime": {
+            "gpus": [{"memoryUtil": 0, "util": 0} for _ in range(count)],
+            "uptime": 0,
         },
-        "machineId": machine_id,
         "image": image,
-        "costPerHr": cost,
-        "adjustedCostPerHr": adjusted,
-        "desiredStatus": status,
-        "lastStartedAt": started_at,
+        "cost": live_cost,
+        "status": status,
+        "createdAt": started_at,
+        "startedAt": started_at,
         "locked": locked,
-        "networkVolume": None,
+        "ssh": {
+            "proxy": {
+                "host": "ssh.runpod.io",
+                "port": 22,
+                "username": "opaque-route",
+            },
+            "direct": None,
+        },
         # The real API can return environment variables. They must never be persisted.
-        "env": {"PRIVATE_TOKEN": "must-not-leak"},
+        "env": {
+            "HF_TOKEN": "must-not-leak",
+            "GPU_BUDGET_SESSION_ID": "session-secret",
+            "HF_HOME": "/workspace/.cache/huggingface",
+            "HF_HUB_CACHE": "/workspace/.cache/huggingface/hub",
+            "TRANSFORMERS_CACHE": "/workspace/.cache/huggingface/transformers",
+            "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+            "VLLM_ENABLE_CUDA_COMPATIBILITY": "1",
+            "PUBLIC_KEY": "ssh-ed25519 AAAATEST",
+        },
     }
 
 
@@ -106,6 +126,7 @@ def test_live_metadata_requires_exact_pod_hardware_status_quote_and_unlock() -> 
         expected_gpu_family="H100_80GB",
         expected_provider_gpu_id=GPU_ID,
         allowed_data_center_ids=DATA_CENTERS,
+        allowed_cuda_versions=CUDA_VERSIONS,
         expected_container_image=IMAGE,
         limits=limits,
     )
@@ -127,24 +148,21 @@ def test_live_metadata_requires_exact_pod_hardware_status_quote_and_unlock() -> 
                 expected_gpu_family="H100_80GB",
                 expected_provider_gpu_id=GPU_ID,
                 allowed_data_center_ids=DATA_CENTERS,
+                allowed_cuda_versions=CUDA_VERSIONS,
                 expected_container_image=IMAGE,
                 limits=limits,
             )
 
     split_brain = _payload()
-    split_brain["machine"] = {
-        "gpuTypeId": "NVIDIA A100-SXM4-80GB",
-        "gpuType": {"displayName": "NVIDIA A100-SXM4-80GB"},
-        "secureCloud": True,
-        "dataCenterId": "US-IL-1",
-    }
-    with pytest.raises(WatchdogError, match="machine GPU identity"):
+    split_brain["runtime"] = {"gpus": [{"memoryUtil": 0, "util": 0}] * 7, "uptime": 0}
+    with pytest.raises(WatchdogError, match="runtime GPU inventory"):
         validate_live_metadata(
             _metadata(split_brain, observed),
             expected_gpu_count=8,
             expected_gpu_family="H100_80GB",
             expected_provider_gpu_id=GPU_ID,
             allowed_data_center_ids=DATA_CENTERS,
+            allowed_cuda_versions=CUDA_VERSIONS,
             expected_container_image=IMAGE,
             limits=limits,
         )
@@ -155,6 +173,48 @@ def test_live_metadata_requires_exact_pod_hardware_status_quote_and_unlock() -> 
             expected_pod_id="pod_123",
             observed_at=observed,
         )
+
+
+def test_v2_metadata_rejects_launch_drift_and_never_exposes_secret_values() -> None:
+    observed = datetime(2026, 8, 29, 13, tzinfo=UTC)
+    limits = WatchdogLimits(220, 10, maximum_approved_hourly_total_usd=83)
+
+    variants: list[tuple[dict[str, object], str]] = []
+    wrong_cuda = _payload()
+    wrong_cuda["cudaVersion"] = "13.0"
+    variants.append((wrong_cuda, "CUDA host version"))
+    wrong_disk = _payload()
+    wrong_disk["disk"] = 51
+    variants.append((wrong_disk, "container disk"))
+    wrong_mount = _payload()
+    wrong_mount["mounts"] = {"persistent": {"size": 649, "path": "/workspace"}}
+    variants.append((wrong_mount, "persistent volume"))
+    wrong_networking = _payload()
+    wrong_networking["globalNetworking"] = {"enabled": True}
+    variants.append((wrong_networking, "global networking"))
+    wrong_ports = _payload()
+    wrong_ports["ports"] = ["22/tcp", "8888/http"]
+    variants.append((wrong_ports, "ports"))
+
+    for payload, match in variants:
+        with pytest.raises(WatchdogError, match=match):
+            validate_live_metadata(
+                _metadata(payload, observed),
+                expected_gpu_count=8,
+                expected_gpu_family="H100_80GB",
+                expected_provider_gpu_id=GPU_ID,
+                allowed_data_center_ids=DATA_CENTERS,
+                allowed_cuda_versions=CUDA_VERSIONS,
+                expected_container_image=IMAGE,
+                limits=limits,
+            )
+
+    secret_drift = _payload()
+    assert isinstance(secret_drift["env"], dict)
+    secret_drift["env"]["UNAPPROVED_SECRET"] = "do-not-echo-this"
+    with pytest.raises(WatchdogError, match="allow-list") as error:
+        _metadata(secret_drift, observed)
+    assert "do-not-echo-this" not in str(error.value)
 
 
 def test_watchdog_gets_live_metadata_stops_exact_pod_and_confirms_exit(
@@ -170,16 +230,21 @@ def test_watchdog_gets_live_metadata_stops_exact_pod_and_confirms_exit(
         )
     )
     get_requests: list[tuple[str, str]] = []
-    stop_requests: list[tuple[str, str]] = []
+    stop_requests: list[tuple[str, str, dict[str, str]]] = []
 
     def get_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
         del timeout
         get_requests.append((url, api_key))
         return 200, json.dumps(next(metadata_responses))
 
-    def stop_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
+    def stop_transport(
+        url: str,
+        api_key: str,
+        timeout: float,
+        payload: dict[str, str],
+    ) -> tuple[int, str]:
         del timeout
-        stop_requests.append((url, api_key))
+        stop_requests.append((url, api_key, payload))
         return 200, "{}"
 
     client = RunpodStopClient(
@@ -195,6 +260,7 @@ def test_watchdog_gets_live_metadata_stops_exact_pod_and_confirms_exit(
         expected_gpu_family="H100_80GB",
         expected_provider_gpu_id=GPU_ID,
         allowed_data_center_ids=DATA_CENTERS,
+        allowed_cuda_versions=CUDA_VERSIONS,
         expected_container_image=IMAGE,
         limits=WatchdogLimits(gpu_hard_stop_usd=220, maximum_runtime_hours=1 / 3600),
         state_path=state_path,
@@ -203,10 +269,13 @@ def test_watchdog_gets_live_metadata_stops_exact_pod_and_confirms_exit(
         sleep=lambda _: None,
     )
 
-    assert get_requests[0][0].startswith("https://rest.runpod.io/v1/pods/pod_123?")
-    assert "includeMachine=true" in get_requests[0][0]
+    assert get_requests[0][0] == "https://api.runpod.io/v2/pods/pod_123"
     assert stop_requests == [
-        ("https://rest.runpod.io/v1/pods/pod_123/stop", "rpa_do-not-persist")
+        (
+            "https://api.runpod.io/v2/pods/pod_123/action",
+            "rpa_do-not-persist",
+            {"action": "stop"},
+        )
     ]
     assert result["status"] == "stopped_confirmed"
     state_text = state_path.read_text(encoding="utf-8")
@@ -234,8 +303,13 @@ def test_live_verification_failure_requests_stop_without_deletion(
         methods.append("GET")
         return 200, json.dumps(next(responses))
 
-    def stop_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
-        del url, api_key, timeout
+    def stop_transport(
+        url: str,
+        api_key: str,
+        timeout: float,
+        payload: dict[str, str],
+    ) -> tuple[int, str]:
+        del url, api_key, timeout, payload
         methods.append("POST_STOP")
         return 200, "{}"
 
@@ -252,6 +326,7 @@ def test_live_verification_failure_requests_stop_without_deletion(
             expected_gpu_family="H100_80GB",
             expected_provider_gpu_id=GPU_ID,
             allowed_data_center_ids=DATA_CENTERS,
+            allowed_cuda_versions=CUDA_VERSIONS,
             expected_container_image=IMAGE,
             limits=WatchdogLimits(220, 10),
             state_path=state_path,
@@ -300,9 +375,14 @@ def test_monotonic_guard_stops_even_if_wall_clock_does_not_advance(
         del url, api_key, timeout
         return 200, json.dumps(next(responses))
 
-    def stop_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
+    def stop_transport(
+        url: str,
+        api_key: str,
+        timeout: float,
+        payload: dict[str, str],
+    ) -> tuple[int, str]:
         nonlocal stop_count
-        del url, api_key, timeout
+        del url, api_key, timeout, payload
         stop_count += 1
         return 200, "{}"
 
@@ -318,6 +398,7 @@ def test_monotonic_guard_stops_even_if_wall_clock_does_not_advance(
         expected_gpu_family="H100_80GB",
         expected_provider_gpu_id=GPU_ID,
         allowed_data_center_ids=DATA_CENTERS,
+        allowed_cuda_versions=CUDA_VERSIONS,
         expected_container_image=IMAGE,
         limits=WatchdogLimits(220, 1 / 3600),
         state_path=tmp_path / "state.json",

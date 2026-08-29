@@ -27,6 +27,7 @@ from model_forensics.runpod_lifecycle import (
     pod_environment,
     read_lifecycle_status,
     rearm_approved_pod,
+    recover_created_pod,
 )
 
 HF_FIXTURE_VALUE = "hf_test_token_must_never_be_persisted"
@@ -178,7 +179,7 @@ def _create_once(tmp_path: Path) -> tuple[LifecycleAuthorization, Path]:
         [
             _json_result(200, []),
             _json_result(201, _v2_pod(nonce=OLD_NONCE, status="PROVISIONING")),
-            _json_result(200, _v1_pod(nonce=OLD_NONCE, status="RUNNING")),
+            _json_result(200, _v2_pod(nonce=OLD_NONCE, status="RUNNING")),
         ]
     )
     result = create_approved_pod(
@@ -286,7 +287,7 @@ def test_create_uses_v1_duplicate_gate_and_official_v2_post_without_secret_persi
         [
             _json_result(200, [{"id": "oldterminal", "desiredStatus": "TERMINATED"}]),
             _json_result(201, _v2_pod(nonce=OLD_NONCE, status="PROVISIONING")),
-            _json_result(200, _v1_pod(nonce=OLD_NONCE, status="RUNNING")),
+            _json_result(200, _v2_pod(nonce=OLD_NONCE, status="RUNNING")),
         ]
     )
 
@@ -302,7 +303,7 @@ def test_create_uses_v1_duplicate_gate_and_official_v2_post_without_secret_persi
     assert [(call["method"], call["url"]) for call in transport.calls] == [
         ("GET", RUNPOD_V1_PODS_URL),
         ("POST", RUNPOD_V2_PODS_URL),
-        ("GET", f"{RUNPOD_V1_PODS_URL}/{POD_ID}"),
+        ("GET", f"{RUNPOD_V2_PODS_URL}/{POD_ID}"),
     ]
     create_body = json.loads(transport.calls[1]["body"])
     assert create_body["gpu"] == {
@@ -351,7 +352,7 @@ def test_create_allows_only_exact_acknowledged_nonterminal_pod_set(tmp_path: Pat
                 [{"id": UNRELATED_POD_ID, "desiredStatus": "RUNNING"}],
             ),
             _json_result(201, _v2_pod(nonce=OLD_NONCE, status="PROVISIONING")),
-            _json_result(200, _v1_pod(nonce=OLD_NONCE, status="RUNNING")),
+            _json_result(200, _v2_pod(nonce=OLD_NONCE, status="RUNNING")),
         ]
     )
 
@@ -454,16 +455,15 @@ def test_create_polls_bounded_pending_state_until_running_and_ssh_ready(tmp_path
     authorization = _authorization(
         phase="behavior_baseline_gpu", nonce=OLD_NONCE, suffix="old"
     )
-    pending = _v1_pod(nonce=OLD_NONCE, status="RUNNING")
-    pending["portMappings"] = {}
-    pending["publicIp"] = None
+    pending = _v2_pod(nonce=OLD_NONCE, status="RUNNING")
+    pending["ssh"] = {"proxy": None, "direct": None}
     transport = FakeTransport(
         [
             _json_result(200, []),
             _json_result(201, _v2_pod(nonce=OLD_NONCE, status="PROVISIONING")),
             _json_result(200, pending),
             _json_result(200, pending),
-            _json_result(200, _v1_pod(nonce=OLD_NONCE, status="RUNNING")),
+            _json_result(200, _v2_pod(nonce=OLD_NONCE, status="RUNNING")),
         ]
     )
     clock = [0.0]
@@ -494,9 +494,8 @@ def test_create_polls_bounded_pending_state_until_running_and_ssh_ready(tmp_path
 
 
 def test_create_timeout_is_fail_closed_and_instructs_status_not_retry(tmp_path: Path) -> None:
-    pending = _v1_pod(nonce=OLD_NONCE, status="RUNNING")
-    pending["portMappings"] = {}
-    pending["publicIp"] = None
+    pending = _v2_pod(nonce=OLD_NONCE, status="RUNNING")
+    pending["ssh"] = {"proxy": None, "direct": None}
     transport = FakeTransport(
         [
             _json_result(200, []),
@@ -526,16 +525,121 @@ def test_create_timeout_is_fail_closed_and_instructs_status_not_retry(tmp_path: 
     assert HF_FIXTURE_VALUE not in encoded and OLD_NONCE not in encoded
 
 
+def test_recover_create_uses_only_v2_get_and_promotes_verified_state(tmp_path: Path) -> None:
+    authorization = _authorization(
+        phase="behavior_baseline_gpu", nonce=OLD_NONCE, suffix="old"
+    )
+    pending = _v2_pod(nonce=OLD_NONCE, status="RUNNING")
+    pending["ssh"] = {"proxy": None, "direct": None}
+    with pytest.raises(RunpodLifecycleError, match="read-only status"):
+        create_approved_pod(
+            project_root=tmp_path,
+            client=RunpodLifecycleClient(
+                api_key=API_FIXTURE_VALUE,
+                transport=FakeTransport(
+                    [
+                        _json_result(200, []),
+                        _json_result(
+                            201,
+                            _v2_pod(nonce=OLD_NONCE, status="PROVISIONING"),
+                        ),
+                        _json_result(200, pending),
+                    ]
+                ),
+            ),
+            authorization=authorization,
+            name="model-forensics-behavior",
+            hf_token=HF_FIXTURE_VALUE,
+            session_nonce=OLD_NONCE,
+            maximum_wait_seconds=0,
+            sleep=lambda _seconds: pytest.fail("timeout must not sleep"),
+            monotonic=lambda: 0.0,
+        )
+
+    state_path = lifecycle_state_path(tmp_path)
+    transport = FakeTransport(
+        [_json_result(200, _v2_pod(nonce=OLD_NONCE, status="RUNNING"))]
+    )
+    summary = recover_created_pod(
+        project_root=tmp_path,
+        client=RunpodLifecycleClient(api_key=API_FIXTURE_VALUE, transport=transport),
+        authorization=authorization,
+        hf_token=HF_FIXTURE_VALUE,
+        session_nonce=OLD_NONCE,
+    )
+
+    assert [(call["method"], call["url"]) for call in transport.calls] == [
+        ("GET", f"{RUNPOD_V2_PODS_URL}/{POD_ID}")
+    ]
+    assert summary["operation"] == "created"
+    encoded = state_path.read_text(encoding="utf-8")
+    recovered = json.loads(encoded)
+    assert recovered["operation"] == "created"
+    assert recovered["pod"]["provider_binding_hash"].startswith("sha256:")
+    assert HF_FIXTURE_VALUE not in encoded
+    assert OLD_NONCE not in encoded
+    assert API_FIXTURE_VALUE not in encoded
+
+
+def test_recover_create_rejects_authorization_drift_before_provider_get(
+    tmp_path: Path,
+) -> None:
+    old = _authorization(phase="behavior_baseline_gpu", nonce=OLD_NONCE, suffix="old")
+    pending = _v2_pod(nonce=OLD_NONCE, status="RUNNING")
+    pending["ssh"] = {"proxy": None, "direct": None}
+    with pytest.raises(RunpodLifecycleError, match="read-only status"):
+        create_approved_pod(
+            project_root=tmp_path,
+            client=RunpodLifecycleClient(
+                api_key=API_FIXTURE_VALUE,
+                transport=FakeTransport(
+                    [
+                        _json_result(200, []),
+                        _json_result(
+                            201,
+                            _v2_pod(nonce=OLD_NONCE, status="PROVISIONING"),
+                        ),
+                        _json_result(200, pending),
+                    ]
+                ),
+            ),
+            authorization=old,
+            name="model-forensics-behavior",
+            hf_token=HF_FIXTURE_VALUE,
+            session_nonce=OLD_NONCE,
+            maximum_wait_seconds=0,
+            sleep=lambda _seconds: pytest.fail("timeout must not sleep"),
+            monotonic=lambda: 0.0,
+        )
+    transport = FakeTransport([])
+
+    with pytest.raises(RunpodLifecycleError, match="authorization"):
+        recover_created_pod(
+            project_root=tmp_path,
+            client=RunpodLifecycleClient(api_key=API_FIXTURE_VALUE, transport=transport),
+            authorization=_authorization(
+                phase="behavior_baseline_gpu", nonce=OLD_NONCE, suffix="different"
+            ),
+            hf_token=HF_FIXTURE_VALUE,
+            session_nonce=OLD_NONCE,
+        )
+
+    assert transport.calls == []
+    assert json.loads(lifecycle_state_path(tmp_path).read_text())["operation"] == (
+        "create_timeout"
+    )
+
+
 def test_rearm_verifies_same_stopped_pod_patches_only_nonce_and_starts(tmp_path: Path) -> None:
     old, state_path = _create_once(tmp_path)
     new = _authorization(phase="behavior_treatment_gpu", nonce=NEW_NONCE, suffix="new")
     ledger = _settled_ledger(tmp_path / "cost_ledger.yaml", prior=old)
     transport = FakeTransport(
         [
-            _json_result(200, _v1_pod(nonce=OLD_NONCE, status="EXITED")),
+            _json_result(200, _v2_pod(nonce=OLD_NONCE, status="EXITED")),
             _json_result(200, _v2_pod(nonce=NEW_NONCE, status="EXITED")),
             _json_result(200, _v2_pod(nonce=NEW_NONCE, status="STARTING")),
-            _json_result(200, _v1_pod(nonce=NEW_NONCE, status="RUNNING")),
+            _json_result(200, _v2_pod(nonce=NEW_NONCE, status="RUNNING")),
         ]
     )
 
@@ -549,10 +653,10 @@ def test_rearm_verifies_same_stopped_pod_patches_only_nonce_and_starts(tmp_path:
     )
 
     assert [(call["method"], call["url"]) for call in transport.calls] == [
-        ("GET", f"{RUNPOD_V1_PODS_URL}/{POD_ID}"),
+        ("GET", f"{RUNPOD_V2_PODS_URL}/{POD_ID}"),
         ("PATCH", f"{RUNPOD_V2_PODS_URL}/{POD_ID}"),
         ("POST", f"{RUNPOD_V2_PODS_URL}/{POD_ID}/action"),
-        ("GET", f"{RUNPOD_V1_PODS_URL}/{POD_ID}"),
+        ("GET", f"{RUNPOD_V2_PODS_URL}/{POD_ID}"),
     ]
     patch_body = json.loads(transport.calls[1]["body"])
     assert set(patch_body) == {"env"}
@@ -577,11 +681,11 @@ def test_rearm_fails_before_patch_if_machine_or_storage_drifted(tmp_path: Path) 
     old, state_path = _create_once(tmp_path)
     new = _authorization(phase="behavior_treatment_gpu", nonce=NEW_NONCE, suffix="new")
     ledger = _settled_ledger(tmp_path / "cost_ledger.yaml", prior=old)
-    drifted = _v1_pod(nonce=OLD_NONCE, status="EXITED")
-    drifted["volumeInGb"] = 649
+    drifted = _v2_pod(nonce=OLD_NONCE, status="EXITED")
+    drifted["mounts"]["persistent"]["size"] = 649
     transport = FakeTransport([_json_result(200, drifted)])
 
-    with pytest.raises(RunpodLifecycleError, match="persistent disk"):
+    with pytest.raises(RunpodLifecycleError, match="host-local storage"):
         rearm_approved_pod(
             project_root=tmp_path,
             client=RunpodLifecycleClient(api_key=API_FIXTURE_VALUE, transport=transport),
@@ -599,7 +703,7 @@ def test_status_is_read_only_and_redacts_private_identifiers(tmp_path: Path) -> 
     _, state_path = _create_once(tmp_path)
     before = state_path.read_bytes()
     transport = FakeTransport(
-        [_json_result(200, _v1_pod(nonce=OLD_NONCE, status="RUNNING"))]
+        [_json_result(200, _v2_pod(nonce=OLD_NONCE, status="RUNNING"))]
     )
 
     status = read_lifecycle_status(
@@ -612,7 +716,7 @@ def test_status_is_read_only_and_redacts_private_identifiers(tmp_path: Path) -> 
     assert status["pod_id_hash"] != POD_ID
     assert POD_ID not in json.dumps(status)
     assert [(call["method"], call["url"]) for call in transport.calls] == [
-        ("GET", f"{RUNPOD_V1_PODS_URL}/{POD_ID}")
+        ("GET", f"{RUNPOD_V2_PODS_URL}/{POD_ID}")
     ]
 
 

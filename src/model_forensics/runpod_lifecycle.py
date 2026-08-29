@@ -460,6 +460,20 @@ class RunpodLifecycleClient:
             raise RunpodLifecycleError("RunPod v1 Pod status has an unexpected schema")
         return value
 
+    def get_pod_v2(self, pod_id: str) -> Mapping[str, Any]:
+        """Fetch the exact v2 Pod representation used for lifecycle verification."""
+
+        _require_pod_id(pod_id)
+        value = self._request(
+            method="GET",
+            url=f"{RUNPOD_V2_PODS_URL}/{pod_id}",
+            payload=None,
+            expected_status=200,
+        )
+        if not isinstance(value, Mapping):
+            raise RunpodLifecycleError("RunPod v2 Pod status has an unexpected schema")
+        return value
+
     def create_pod_v2(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         value = self._request(
             method="POST",
@@ -617,12 +631,15 @@ def _validate_v2_pod(
     raw: Mapping[str, Any],
     *,
     authorization: LifecycleAuthorization,
+    expected_pod_id: str | None,
     expected_name: str | None,
     expected_environment: Mapping[str, str],
     expected_session_hash: str,
     allowed_statuses: frozenset[str],
 ) -> dict[str, Any]:
     pod_id = _require_pod_id(raw.get("id"))
+    if expected_pod_id is not None and pod_id != _require_pod_id(expected_pod_id):
+        raise RunpodLifecycleError("RunPod status returned a different Pod")
     status = raw.get("status")
     if status not in allowed_statuses:
         raise RunpodLifecycleError("RunPod v2 Pod status is unexpected")
@@ -664,7 +681,7 @@ def _validate_v2_pod(
         expected=expected_environment,
         expected_session_hash=expected_session_hash,
     )
-    return {
+    sanitized = {
         "id": pod_id,
         "name": raw.get("name"),
         "status": status,
@@ -679,6 +696,11 @@ def _validate_v2_pod(
         "global_networking": False,
         "ssh": _sanitize_ssh(raw.get("ssh")),
     }
+    if data_center is not None:
+        sanitized["provider_binding_hash"] = stable_hash(
+            {"runpod_pod_id": pod_id, "data_center_id": data_center}
+        )
+    return sanitized
 
 
 def _v1_global_networking_disabled(raw: Mapping[str, Any]) -> bool:
@@ -932,29 +954,10 @@ def _validate_existing_pod_allowlist(
     return acknowledged
 
 
-def _v1_running_metadata_ready(raw: Mapping[str, Any]) -> bool:
-    """Distinguish ordinary provisioning omissions from explicit drift."""
-
-    gpu = raw.get("gpu")
-    machine = raw.get("machine")
-    environment = raw.get("env")
-    mappings = raw.get("portMappings")
-    return bool(
-        isinstance(gpu, Mapping)
-        and gpu.get("id") is not None
-        and gpu.get("count") is not None
-        and isinstance(machine, Mapping)
-        and machine.get("secureCloud") is not None
-        and machine.get("dataCenterId") is not None
-        and isinstance(raw.get("machineId"), str)
-        and raw.get("machineId")
-        and isinstance(environment, Mapping)
-        and REQUESTED_POD_ENV_KEYS.issubset(environment)
-        and isinstance(mappings, Mapping)
-        and isinstance(mappings.get("22"), int)
-        and not isinstance(mappings.get("22"), bool)
-        and isinstance(raw.get("publicIp"), str)
-        and raw.get("publicIp")
+def _v2_ssh_ready(sanitized: Mapping[str, Any]) -> bool:
+    ssh = sanitized.get("ssh")
+    return isinstance(ssh, Mapping) and any(
+        isinstance(ssh.get(kind), Mapping) for kind in ("proxy", "direct")
     )
 
 
@@ -971,7 +974,7 @@ def _pending_state(
     }
 
 
-def _wait_for_running_v1(
+def _wait_for_running_v2(
     *,
     client: RunpodLifecycleClient,
     state_path: Path,
@@ -996,7 +999,7 @@ def _wait_for_running_v1(
     deadline = monotonic() + maximum_wait_seconds
     current_state = dict(state)
     while True:
-        live = client.get_pod_v1(pod_id)
+        live = client.get_pod_v2(pod_id)
         observed_id = _require_pod_id(live.get("id"))
         if observed_id != pod_id:
             failed = _pending_state(
@@ -1006,7 +1009,7 @@ def _wait_for_running_v1(
             )
             _replace_state(state_path, failed)
             raise RunpodLifecycleError("RunPod status returned a different Pod; create is locked")
-        status = live.get("desiredStatus")
+        status = live.get("status")
         if status in TERMINAL_POD_STATUSES or status == "ERROR":
             failed = _pending_state(
                 current_state,
@@ -1017,7 +1020,7 @@ def _wait_for_running_v1(
             raise RunpodLifecycleError(
                 "new RunPod Pod became terminal before readiness; inspect status and do not recreate"
             )
-        if status != "RUNNING":
+        if status not in {"PROVISIONING", "STARTING", "RUNNING"}:
             failed = _pending_state(
                 current_state,
                 operation="create_verification_failed",
@@ -1025,31 +1028,34 @@ def _wait_for_running_v1(
             )
             _replace_state(state_path, failed)
             raise RunpodLifecycleError("RunPod returned an unknown Pod status; create is locked")
-        if _v1_running_metadata_ready(live):
-            try:
-                details = _validate_v1_pod(
-                    live,
-                    authorization=authorization,
-                    expected_pod_id=pod_id,
-                    expected_status="RUNNING",
-                    expected_environment=expected_environment,
-                    expected_session_hash=authorization.session_hash,
-                    expected_machine_hash=None,
-                )
-            except RunpodLifecycleError:
-                failed = _pending_state(
-                    current_state,
-                    operation="create_verification_failed",
-                    now=now,
-                )
-                _replace_state(state_path, failed)
-                raise
-            return details, current_state
-        current_state = _pending_state(
-            current_state,
-            operation="create_pending",
-            now=now,
-        )
+        try:
+            sanitized = _validate_v2_pod(
+                live,
+                authorization=authorization,
+                expected_pod_id=pod_id,
+                expected_name=str(sanitized_pod["name"]),
+                expected_environment=expected_environment,
+                expected_session_hash=authorization.session_hash,
+                allowed_statuses=frozenset({"PROVISIONING", "STARTING", "RUNNING"}),
+            )
+        except RunpodLifecycleError:
+            failed = _pending_state(
+                current_state,
+                operation="create_verification_failed",
+                now=now,
+            )
+            _replace_state(state_path, failed)
+            raise
+        if status == "RUNNING" and _v2_ssh_ready(sanitized):
+            return sanitized, current_state
+        current_state = {
+            **_pending_state(
+                current_state,
+                operation="create_pending",
+                now=now,
+            ),
+            "pod": sanitized,
+        }
         _replace_state(state_path, current_state)
         remaining = deadline - monotonic()
         if remaining <= 0:
@@ -1078,6 +1084,110 @@ def _safe_summary(state: Mapping[str, Any], *, provider_status: str) -> dict[str
         "immutable_spec_verified": True,
         "passed": True,
     }
+
+
+def _verify_provider_binding(
+    *, stored_pod: Mapping[str, Any], live_pod: Mapping[str, Any]
+) -> None:
+    """Bind recovery/re-arm to one provider Pod and its host-local data center."""
+
+    stored_id = _require_pod_id(stored_pod.get("id"))
+    live_id = _require_pod_id(live_pod.get("id"))
+    if stored_id != live_id:
+        raise RunpodLifecycleError("RunPod status returned a different Pod")
+    stored_data_center = stored_pod.get("data_center_id")
+    live_data_center = live_pod.get("data_center_id")
+    if stored_data_center is not None:
+        if not isinstance(stored_data_center, str) or stored_data_center != live_data_center:
+            raise RunpodLifecycleError("RunPod Pod data center changed")
+    stored_hash = stored_pod.get("provider_binding_hash")
+    if stored_hash is not None:
+        if not isinstance(stored_hash, str) or stored_hash != live_pod.get(
+            "provider_binding_hash"
+        ):
+            raise RunpodLifecycleError("RunPod provider Pod/data-center binding changed")
+
+
+def _require_current_authorization(
+    state: Mapping[str, Any], authorization: LifecycleAuthorization
+) -> Mapping[str, Any]:
+    stored = _authorization_from_state(state)
+    if stored != authorization:
+        raise RunpodLifecycleError(
+            "recovery authorization does not exactly match the current lifecycle"
+        )
+    return _require_exact_mapping(state.get("current_authorization"), label="authorization")
+
+
+def recover_created_pod(
+    *,
+    project_root: str | Path,
+    client: RunpodLifecycleClient,
+    authorization: LifecycleAuthorization,
+    hf_token: str,
+    session_nonce: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Recover a verified running create using one provider-read-only v2 GET.
+
+    The only mutation is an atomic update to the private local lifecycle record.
+    This path never creates, patches, starts, stops, or deletes a provider Pod.
+    """
+
+    state_path = lifecycle_state_path(project_root)
+    state = _load_state(state_path)
+    if state.get("operation") not in {
+        "create_pending",
+        "create_timeout",
+        "create_response_received",
+    }:
+        raise RunpodLifecycleError("lifecycle operation is not eligible for create recovery")
+    current = _require_current_authorization(state, authorization)
+    pod = _require_exact_mapping(state.get("pod"), label="private Pod record")
+    pod_id = _require_pod_id(pod.get("id"))
+    name = pod.get("name")
+    if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
+        raise RunpodLifecycleError("private Pod name is missing or malformed")
+    expected_environment = pod_environment(
+        hf_token=hf_token,
+        session_nonce=session_nonce,
+    )
+    if stable_hash({"opaque_gpu_session_id": session_nonce}) != authorization.session_hash:
+        raise RunpodLifecycleError("recovery GPU session nonce disagrees with authorization")
+    acknowledged = current.get("acknowledged_existing_pod_id_hashes", [])
+    if not isinstance(acknowledged, list):
+        raise RunpodLifecycleError("private existing-Pod acknowledgement is malformed")
+    _, launch_hash = build_create_payload(
+        authorization=authorization,
+        name=name,
+        hf_token=hf_token,
+        session_nonce=session_nonce,
+        acknowledged_existing_pod_id_hashes=acknowledged,
+    )
+    if current.get("launch_spec_hash") != launch_hash:
+        raise RunpodLifecycleError("recovery launch intent does not match the private claim")
+
+    live = client.get_pod_v2(pod_id)
+    sanitized = _validate_v2_pod(
+        live,
+        authorization=authorization,
+        expected_pod_id=pod_id,
+        expected_name=name,
+        expected_environment=expected_environment,
+        expected_session_hash=authorization.session_hash,
+        allowed_statuses=frozenset({"RUNNING"}),
+    )
+    if not _v2_ssh_ready(sanitized):
+        raise RunpodLifecycleError("running RunPod Pod has no usable SSH endpoint")
+    _verify_provider_binding(stored_pod=pod, live_pod=sanitized)
+    completed = {
+        **state,
+        "operation": "created",
+        "updated_at": _utc_timestamp(now),
+        "pod": sanitized,
+    }
+    _replace_state(state_path, completed)
+    return _safe_summary(completed, provider_status="RUNNING")
 
 
 def create_approved_pod(
@@ -1128,6 +1238,7 @@ def create_approved_pod(
         sanitized = _validate_v2_pod(
             response,
             authorization=authorization,
+            expected_pod_id=None,
             expected_name=name,
             expected_environment=payload["env"],
             expected_session_hash=authorization.session_hash,
@@ -1146,7 +1257,7 @@ def create_approved_pod(
         "pod": sanitized,
     }
     _replace_state(state_path, received)
-    live_details, received = _wait_for_running_v1(
+    live_pod, received = _wait_for_running_v2(
         client=client,
         state_path=state_path,
         state=received,
@@ -1159,16 +1270,11 @@ def create_approved_pod(
         monotonic=monotonic,
         now=now,
     )
-    sanitized["status"] = "RUNNING"
-    sanitized["machine_id_hash"] = live_details["machine_id_hash"]
-    sanitized["data_center_id"] = live_details["data_center_id"]
-    if live_details["direct_ssh"] is not None:
-        sanitized["ssh"]["direct"] = live_details["direct_ssh"]
     completed = {
         **received,
         "operation": "created",
         "updated_at": _utc_timestamp(now),
-        "pod": sanitized,
+        "pod": live_pod,
     }
     _replace_state(state_path, completed)
     return _safe_summary(completed, provider_status="RUNNING")
@@ -1192,8 +1298,9 @@ def read_lifecycle_status(
             "passed": False,
         }
     auth = _authorization_from_state(state)
-    live = client.get_pod_v1(_require_pod_id(pod.get("id")))
-    provider_status = live.get("desiredStatus")
+    pod_id = _require_pod_id(pod.get("id"))
+    live = client.get_pod_v2(pod_id)
+    provider_status = live.get("status")
     if provider_status in {"TERMINATED", "ERROR"}:
         return {
             "schema_version": 1,
@@ -1203,7 +1310,7 @@ def read_lifecycle_status(
             "immutable_spec_verified": False,
             "passed": False,
         }
-    if provider_status not in {"RUNNING", "EXITED"}:
+    if provider_status not in {"PROVISIONING", "STARTING", "RUNNING", "EXITED"}:
         raise RunpodLifecycleError("RunPod Pod is in an unsupported lifecycle status")
     current = _require_exact_mapping(state["current_authorization"], label="authorization")
     placeholder_hf = live.get("env")
@@ -1216,18 +1323,19 @@ def read_lifecycle_status(
         SESSION_ENV_NAME: "validated-by-hash",
         **STATIC_POD_ENV,
     }
-    stored_machine_hash = pod.get("machine_id_hash")
-    if stored_machine_hash is not None and not isinstance(stored_machine_hash, str):
-        raise RunpodLifecycleError("private Pod machine binding is malformed")
-    _validate_v1_pod(
+    name = pod.get("name")
+    if not isinstance(name, str):
+        raise RunpodLifecycleError("private Pod name is missing")
+    sanitized = _validate_v2_pod(
         live,
         authorization=auth,
-        expected_pod_id=str(pod["id"]),
-        expected_status=str(provider_status),
+        expected_pod_id=pod_id,
+        expected_name=name,
         expected_environment=expected_env,
         expected_session_hash=str(current["session_hash"]),
-        expected_machine_hash=stored_machine_hash,
+        allowed_statuses=frozenset({str(provider_status)}),
     )
+    _verify_provider_binding(stored_pod=pod, live_pod=sanitized)
     return _safe_summary(state, provider_status=str(provider_status))
 
 
@@ -1288,13 +1396,7 @@ def rearm_approved_pod(
 
     state_path = lifecycle_state_path(project_root)
     state = _load_state(state_path)
-    recoverable_operations = {
-        "created",
-        "rearmed",
-        "create_pending",
-        "create_timeout",
-        "create_verification_failed",
-    }
+    recoverable_operations = {"created", "rearmed"}
     if state.get("operation") not in recoverable_operations:
         raise RunpodLifecycleError("lifecycle has an unresolved operation; re-arm refused")
     pod = _require_exact_mapping(state.get("pod"), label="private Pod record")
@@ -1321,20 +1423,22 @@ def rearm_approved_pod(
     )
     pod_id = _require_pod_id(pod.get("id"))
     new_environment = pod_environment(hf_token=hf_token, session_nonce=session_nonce)
-    live = client.get_pod_v1(pod_id)
-    stored_machine_hash = pod.get("machine_id_hash")
-    if stored_machine_hash is not None and not isinstance(stored_machine_hash, str):
-        raise RunpodLifecycleError("private Pod machine binding is malformed")
-    live_details = _validate_v1_pod(
+    live = client.get_pod_v2(pod_id)
+    sanitized_live = _validate_v2_pod(
         live,
         authorization=previous,
         expected_pod_id=pod_id,
-        expected_status="EXITED",
+        expected_name=str(pod.get("name")),
         expected_environment=new_environment,
         expected_session_hash=previous.session_hash,
-        expected_machine_hash=stored_machine_hash,
+        allowed_statuses=frozenset({"EXITED"}),
     )
-    old_environment = dict(live_details["environment"])
+    _verify_provider_binding(stored_pod=pod, live_pod=sanitized_live)
+    old_environment = _require_exact_environment(
+        live.get("env"),
+        expected=new_environment,
+        expected_session_hash=previous.session_hash,
+    )
     patch_environment = dict(old_environment)
     patch_environment[SESSION_ENV_NAME] = session_nonce
     changed_keys = {
@@ -1356,11 +1460,7 @@ def rearm_approved_pod(
         operation="rearm_intent",
         authorization=authorization,
         launch_spec_hash=launch_hash,
-        pod={
-            **dict(pod),
-            "machine_id_hash": live_details["machine_id_hash"],
-            "data_center_id": live_details["data_center_id"],
-        },
+        pod=sanitized_live,
         history=[*history, dict(previous_manifest)],
         now=now,
     )
@@ -1369,14 +1469,16 @@ def rearm_approved_pod(
         pod_id=pod_id,
         environment=patch_environment,
     )
-    _validate_v2_pod(
+    sanitized_patched = _validate_v2_pod(
         patched_raw,
         authorization=authorization,
+        expected_pod_id=pod_id,
         expected_name=str(pod.get("name")),
         expected_environment=patch_environment,
         expected_session_hash=authorization.session_hash,
         allowed_statuses=frozenset({"EXITED"}),
     )
+    _verify_provider_binding(stored_pod=pod, live_pod=sanitized_patched)
     patched_state = {
         **intent,
         "operation": "rearm_patched",
@@ -1387,6 +1489,7 @@ def rearm_approved_pod(
     sanitized_started = _validate_v2_pod(
         started_raw,
         authorization=authorization,
+        expected_pod_id=pod_id,
         expected_name=str(pod.get("name")),
         expected_environment=patch_environment,
         expected_session_hash=authorization.session_hash,
@@ -1397,28 +1500,21 @@ def rearm_approved_pod(
         "operation": "rearm_start_requested",
         "updated_at": _utc_timestamp(now),
         "pod": {
-            **dict(pod),
-            "status": sanitized_started["status"],
-            "ssh": sanitized_started["ssh"],
+            **sanitized_started,
         },
     }
     _replace_state(state_path, start_requested)
-    live_started = client.get_pod_v1(pod_id)
-    started_details = _validate_v1_pod(
+    live_started = client.get_pod_v2(pod_id)
+    completed_pod = _validate_v2_pod(
         live_started,
         authorization=authorization,
         expected_pod_id=pod_id,
-        expected_status="RUNNING",
+        expected_name=str(pod.get("name")),
         expected_environment=patch_environment,
         expected_session_hash=authorization.session_hash,
-        expected_machine_hash=str(pod.get("machine_id_hash")),
+        allowed_statuses=frozenset({"RUNNING"}),
     )
-    completed_pod = dict(start_requested["pod"])
-    completed_pod["status"] = "RUNNING"
-    completed_pod["data_center_id"] = started_details["data_center_id"]
-    completed_pod["machine_id_hash"] = started_details["machine_id_hash"]
-    if started_details["direct_ssh"] is not None:
-        completed_pod["ssh"]["direct"] = started_details["direct_ssh"]
+    _verify_provider_binding(stored_pod=pod, live_pod=completed_pod)
     completed = {
         **start_requested,
         "operation": "rearmed",
@@ -1452,5 +1548,6 @@ __all__ = [
     "pod_environment",
     "read_lifecycle_status",
     "rearm_approved_pod",
+    "recover_created_pod",
     "urllib_http_transport",
 ]
