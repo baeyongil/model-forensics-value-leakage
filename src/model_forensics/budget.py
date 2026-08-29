@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 import yaml
 
-from model_forensics.io import atomic_write_text
+from model_forensics.io import atomic_write_text, stable_hash
 
 CostKind = Literal["gpu", "api", "storage", "other"]
 
@@ -89,6 +89,19 @@ class ReservationSnapshot:
     incurred_before: dict[str, float]
     committed_before: dict[str, float]
     committed_after: dict[str, float]
+
+
+@dataclass(frozen=True)
+class BatchReservationSnapshot:
+    """One atomic reservation of an exact phase inventory."""
+
+    incurred_before: dict[str, float]
+    committed_before: dict[str, float]
+    committed_after: dict[str, float]
+    created_entry_ids: tuple[str, ...]
+    covered_entry_ids: tuple[str, ...]
+    document_before_hash: str
+    document_after_hash: str
 
 
 def estimate_gpu_cost(*, gpu_count: int, hourly_per_gpu: float, hours: float) -> float:
@@ -271,6 +284,110 @@ class CostLedger:
                 yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
             )
             return totals
+
+    def reserve_batch(
+        self,
+        reservations: Sequence[tuple[str, CostEntry]],
+        *,
+        required_existing_entry_ids: Sequence[str] = (),
+        reject_incurred_entry_ids: Sequence[str] = (),
+    ) -> BatchReservationSnapshot:
+        """Atomically reserve every missing item in one exact paid inventory.
+
+        The cap is evaluated only after constructing the complete candidate
+        ledger, and no partial prefix is written when any identity conflicts or
+        the full batch exceeds a hard stop.
+        """
+
+        normalized_by_id: dict[str, dict[str, Any]] = {}
+        ordered_ids: list[str] = []
+        for entry_id, entry in reservations:
+            if not isinstance(entry_id, str) or not entry_id:
+                raise ValueError("reservation entry_id must be a non-empty string")
+            if entry.status != "estimated":
+                raise ValueError("a batch reservation must have estimated status")
+            normalized = asdict(entry.normalized())
+            normalized["entry_id"] = entry_id
+            previous = normalized_by_id.get(entry_id)
+            if previous is not None and not self._same_entry_content(previous, normalized):
+                raise ValueError("batch contains one reservation ID with different content")
+            if previous is None:
+                normalized_by_id[entry_id] = normalized
+                ordered_ids.append(entry_id)
+        required_ids = tuple(required_existing_entry_ids)
+        if any(not isinstance(entry_id, str) or not entry_id for entry_id in required_ids):
+            raise ValueError("required reservation IDs must be non-empty strings")
+        if len(required_ids) != len(set(required_ids)):
+            raise ValueError("required reservation IDs must be unique")
+        reject_incurred_ids = tuple(reject_incurred_entry_ids)
+        if any(
+            not isinstance(entry_id, str) or not entry_id
+            for entry_id in reject_incurred_ids
+        ):
+            raise ValueError("reject-incurred reservation IDs must be non-empty strings")
+
+        with self._locked():
+            document = self._load_unlocked()
+            before_hash = stable_hash(document)
+            entries_by_id = {
+                str(item["entry_id"]): item
+                for item in document["entries"]
+                if isinstance(item.get("entry_id"), str)
+            }
+            missing_required = sorted(set(required_ids) - set(entries_by_id))
+            if missing_required:
+                raise ValueError(
+                    "authenticated paid response lacks its matching ledger reservation"
+                )
+            if any(
+                entries_by_id.get(entry_id, {}).get("status") == "incurred"
+                for entry_id in reject_incurred_ids
+            ):
+                raise ValueError(
+                    "API ledger records an incurred request whose paid-response checkpoint is absent"
+                )
+            created: list[str] = []
+            covered: list[str] = []
+            additions: list[dict[str, Any]] = []
+            for entry_id in ordered_ids:
+                normalized = normalized_by_id[entry_id]
+                existing = entries_by_id.get(entry_id)
+                if existing is None:
+                    additions.append(normalized)
+                    created.append(entry_id)
+                    continue
+                if existing.get("status") == "incurred":
+                    if existing.get("kind") != normalized["kind"]:
+                        raise ValueError(
+                            "batch reservation ID is settled under a different kind"
+                        )
+                    covered.append(entry_id)
+                    continue
+                if not self._same_entry_content(existing, normalized):
+                    raise ValueError(
+                        "batch reservation ID already exists with different content"
+                    )
+                covered.append(entry_id)
+
+            incurred_before = self.totals(document)
+            committed_before = self.totals(document, include_estimates=True)
+            candidate = {**document, "entries": [*document["entries"], *additions]}
+            committed_after = self.totals(candidate, include_estimates=True)
+            self._assert_limits(committed_after)
+            if additions:
+                atomic_write_text(
+                    self.path,
+                    yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
+                )
+            return BatchReservationSnapshot(
+                incurred_before=incurred_before,
+                committed_before=committed_before,
+                committed_after=committed_after,
+                created_entry_ids=tuple(created),
+                covered_entry_ids=tuple(covered),
+                document_before_hash=before_hash,
+                document_after_hash=stable_hash(candidate),
+            )
 
     def reserve_once(
         self,

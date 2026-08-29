@@ -24,7 +24,11 @@ from model_forensics.resampling import (
     first_generated_replacement_sentence,
 )
 from model_forensics.schemas import RolloutRecord
-from model_forensics.token_spans import token_stream_hash
+from model_forensics.token_spans import (
+    CompletionTokenMap,
+    TokenSpanMappingError,
+    token_stream_hash,
+)
 
 from .resample_runner import (
     FINAL_OUTCOME_PROTOCOL,
@@ -48,6 +52,7 @@ from .resample_runner import (
     _neutral_task_question,
     _replacement_classification_audit,
     _replacement_token_audit,
+    _semantic_embedder_provenance,
     _split_generated_continuation,
     _token_hash,
     _validate_execution_manifest,
@@ -181,6 +186,49 @@ class ResamplingGenerationRecord:
             )
         ):
             raise PrefixIdentityError("generated-completion token hash mismatch")
+        replacement_span = self.backend_result.get("replacement_token_span")
+        replacement_span_hash = self.backend_result.get("replacement_token_span_hash")
+        if self.arm == "resample" and self.generation_status == GENERATION_STATUS_VALID:
+            if not isinstance(replacement_span, Mapping):
+                raise PrefixIdentityError("valid resample omits its exact replacement token span")
+            if replacement_span_hash != stable_hash(dict(replacement_span)):
+                raise PrefixIdentityError("replacement token-span audit hash mismatch")
+            if self.generated_completion_token_ids is None:
+                raise PrefixIdentityError("valid resample omits generated completion token IDs")
+            completion_hash = token_stream_hash(
+                self.generated_completion_token_ids,
+                stream="completion",
+            )
+            backend_completion = self.backend_result.get("completion_token_ids")
+            if (
+                not isinstance(backend_completion, Sequence)
+                or isinstance(backend_completion, (str, bytes))
+                or tuple(backend_completion) != self.generated_completion_token_ids
+                or self.backend_result.get("completion_token_ids_hash") != completion_hash
+            ):
+                raise PrefixIdentityError("replacement span is not linked to backend completion IDs")
+            local_start = self.replacement_char_start - len(self.conditioning_prefix_text)
+            local_end = self.replacement_char_end - len(self.conditioning_prefix_text)
+            span_tokens = replacement_span.get("token_ids")
+            if (
+                replacement_span.get("section") != "generated_replacement"
+                or replacement_span.get("section_char_start") != local_start
+                or replacement_span.get("section_char_end") != local_end
+                or replacement_span.get("completion_char_start") != local_start
+                or replacement_span.get("completion_char_end") != local_end
+                or replacement_span.get("text") != self.replacement_sentence
+                or replacement_span.get("round_trip_verified") is not True
+                or replacement_span.get("completion_token_ids_hash") != completion_hash
+                or not isinstance(span_tokens, Sequence)
+                or isinstance(span_tokens, (str, bytes))
+                or tuple(span_tokens) != self.replacement_token_ids
+                or replacement_span.get("token_ids_hash")
+                != token_stream_hash(self.replacement_token_ids, stream="completion_span")
+                or self.raw_generated_text[local_start:local_end] != self.replacement_sentence
+            ):
+                raise PrefixIdentityError("replacement token-span audit does not reconstruct the row")
+        elif replacement_span is not None or replacement_span_hash is not None:
+            raise PrefixIdentityError("non-valid-resample row carries a replacement token span")
         if self.backend_provenance_hash != stable_hash(dict(self.backend_provenance)):
             raise ResampleExecutionError("backend provenance hash mismatch")
         if not self.backend_provenance:
@@ -317,7 +365,6 @@ class _GenerationContext:
     anchor_tokens: tuple[int, ...]
     anchor_token_source: str
     anchor_token_identity: Mapping[str, Any]
-    needs_contextual_replacement_encoding: bool
 
 
 def _frozen_anchor_tokens(
@@ -422,14 +469,9 @@ def _prepare_generation_contexts(
                 "used_without_retokenization": False,
                 "token_ids_hash": _token_hash(anchor_tokens),
             }
-            contextual_replacement = False
         else:
             anchor_tokens, trailing_envelope, token_identity = frozen
             token_source = "frozen_original_completion_span"
-            # The backend's optional contextual-append state was deliberately not
-            # consumed by re-tokenizing the anchor.  Before measuring each new
-            # replacement we therefore re-arm its exact common prefix.
-            contextual_replacement = True
 
         for allocation in allocation_by_anchor[anchor.anchor_id]:
             if allocation.base_trace_id != anchor.trace_id:
@@ -467,7 +509,6 @@ def _prepare_generation_contexts(
                 anchor_tokens=anchor_tokens,
                 anchor_token_source=token_source,
                 anchor_token_identity=token_identity,
-                needs_contextual_replacement_encoding=contextual_replacement,
             )
 
     ordered_contexts: list[_GenerationContext] = []
@@ -495,9 +536,47 @@ def _completion_tokens_from_result(result: RawPrefixGenerationResult) -> tuple[i
         raise PrefixIdentityError("backend completion token IDs are not a sequence")
     ids = _token_ids(value, name="generated completion", allow_empty=True)
     recorded_hash = result.backend_metadata.get("completion_token_ids_hash")
-    if recorded_hash is not None and recorded_hash != token_stream_hash(ids, stream="completion"):
+    if recorded_hash != token_stream_hash(ids, stream="completion"):
         raise PrefixIdentityError("backend completion-token manifest hash mismatch")
     return ids
+
+
+def _map_generated_replacement_tokens(
+    *,
+    backend: RawPrefixGenerationBackend,
+    raw_generated_text: str,
+    observed_prompt_token_ids: tuple[int, ...],
+    generated_completion_token_ids: tuple[int, ...] | None,
+    replacement_char_start: int,
+    replacement_char_end: int,
+    replacement_sentence: str,
+) -> tuple[tuple[int, ...], dict[str, Any]]:
+    """Recover a replacement only from the backend's immutable token stream."""
+
+    if generated_completion_token_ids is None:
+        raise PrefixIdentityError("backend omitted exact generated completion token IDs")
+    tokenizer = getattr(backend, "tokenizer", None)
+    if tokenizer is None:
+        raise PrefixIdentityError("backend omitted the tokenizer needed for exact span mapping")
+    try:
+        token_map = CompletionTokenMap(
+            tokenizer=tokenizer,
+            raw_text=raw_generated_text,
+            prompt_token_ids=observed_prompt_token_ids,
+            completion_token_ids=generated_completion_token_ids,
+            skip_special_tokens=True,
+        )
+        token_span = token_map.map_completion_span(
+            replacement_char_start,
+            replacement_char_end,
+            expected_text=replacement_sentence,
+            section="generated_replacement",
+            section_char_start=replacement_char_start,
+            section_char_end=replacement_char_end,
+        )
+    except TokenSpanMappingError as exc:
+        raise PrefixIdentityError(f"generated replacement token span is not recoverable: {exc}") from exc
+    return token_span.token_ids, token_span.as_dict()
 
 
 def _terminal_reason(exc: Exception) -> str:
@@ -520,7 +599,7 @@ def _intermediate_from_result(
         raise PrefixIdentityError(
             f"backend used different prompt tokens for request {request.request_id}"
         )
-    generated_completion_ids = _completion_tokens_from_result(result)
+    generated_completion_ids: tuple[int, ...] | None = None
 
     status = GENERATION_STATUS_VALID
     invalid_reason: str | None = None
@@ -530,7 +609,11 @@ def _intermediate_from_result(
     replacement_start = len(request.conditioning_text)
     replacement_end = replacement_start
     replacement_tokens: tuple[int, ...] = ()
+    replacement_token_span: dict[str, Any] | None = None
     try:
+        generated_completion_ids = _completion_tokens_from_result(result)
+        if generated_completion_ids is None:
+            raise PrefixIdentityError("backend omitted exact generated completion token IDs")
         reasoning_tail, answer = _split_generated_continuation(result.generated_text)
         if request.arm == "retain":
             replacement_sentence = context.anchor.sentence_text
@@ -544,18 +627,14 @@ def _intermediate_from_result(
             replacement_sentence = replacement.text
             replacement_start = len(request.conditioning_text) + replacement.start
             replacement_end = len(request.conditioning_text) + replacement.end
-            if context.needs_contextual_replacement_encoding:
-                checked_prefix = _token_ids(
-                    backend.encode_prefix(context.base.messages, context.common_text),
-                    name="replacement common prefix",
-                )
-                if checked_prefix != context.common_tokens:
-                    raise PrefixIdentityError(
-                        "replacement tokenization re-armed a different common prefix"
-                    )
-            replacement_tokens = _token_ids(
-                backend.encode_continuation(replacement_sentence),
-                name="replacement",
+            replacement_tokens, replacement_token_span = _map_generated_replacement_tokens(
+                backend=backend,
+                raw_generated_text=result.generated_text,
+                observed_prompt_token_ids=observed_prompt,
+                generated_completion_token_ids=generated_completion_ids,
+                replacement_char_start=replacement.start,
+                replacement_char_end=replacement.end,
+                replacement_sentence=replacement_sentence,
             )
     except ResampleExecutionError as exc:
         status = GENERATION_STATUS_TERMINAL_INVALID
@@ -573,6 +652,10 @@ def _intermediate_from_result(
         raise ResampleExecutionError("replacement span does not reconstruct its sentence")
     allocation_hash = stable_hash(context.allocation.as_dict())
     backend_result = dict(result.backend_metadata)
+    backend_result["replacement_token_span"] = replacement_token_span
+    backend_result["replacement_token_span_hash"] = (
+        None if replacement_token_span is None else stable_hash(replacement_token_span)
+    )
     return ResamplingGenerationRecord(
         resample_id=request.request_id,
         anchor_id=context.anchor.anchor_id,
@@ -869,6 +952,10 @@ def adjudicate_sentence_resampling_intermediates(
 
     if type(primary_inference) is not bool:
         raise TypeError("primary_inference must be an explicit bool")
+    semantic_embedder_provenance = _semantic_embedder_provenance(
+        embedder,
+        primary_inference=primary_inference,
+    )
     if primary_inference and outcome_caller.not_for_primary_inference:
         raise OutcomeAdjudicationError(
             "primary resampling refuses a caller marked not_for_primary_inference"
@@ -1099,6 +1186,7 @@ def adjudicate_sentence_resampling_intermediates(
             "generation_intermediate_hash": intermediate.record_hash,
             "generation_intermediate_schema_version": intermediate.schema_version,
             "anchor_token_identity": dict(intermediate.anchor_token_identity),
+            "semantic_embedder": semantic_embedder_provenance,
         }
         record = ResamplingArtifactRecord(
             resample_id=intermediate.resample_id,

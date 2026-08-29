@@ -307,6 +307,7 @@ def attach_frozen_selection_strata(
             "token_span": token_span.as_dict(),
             "classifier_provenance_hash": stable_hash(provenance_rows),
             "classifier_judgments_hash": stable_hash(judgments),
+            "classification_candidate_id": record.candidate_id,
             "classification_lock_hash": locked.lock_hash,
             "prefilter_manifest_hash": locked.prefilter_manifest_hash,
         }

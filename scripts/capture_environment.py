@@ -13,6 +13,13 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from model_forensics.bootstrap_environment import (
+    BOOTSTRAP_CONSTRAINTS_PATH,
+    BOOTSTRAP_CONSTRAINTS_SHA256,
+    capture_bootstrap_distribution_provenance,
+)
+from model_forensics.semantic_backend import capture_semantic_runtime_provenance
+
 
 def _output(command: list[str]) -> str:
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -38,9 +45,19 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--vllm-wheel", type=Path, required=True)
+    parser.add_argument("--semantic-wheel", type=Path, required=True)
+    parser.add_argument("--bootstrap-constraints", type=Path, required=True)
     args = parser.parse_args()
     if not args.vllm_wheel.is_file():
         raise SystemExit("verified vLLM wheel is absent")
+    if not args.semantic_wheel.is_file():
+        raise SystemExit("verified sentence-transformers wheel is absent")
+    if args.bootstrap_constraints.as_posix() != BOOTSTRAP_CONSTRAINTS_PATH:
+        raise SystemExit("GPU bootstrap constraints must use the frozen repository path")
+    if not args.bootstrap_constraints.is_file() or _sha256(
+        args.bootstrap_constraints
+    ) != BOOTSTRAP_CONSTRAINTS_SHA256:
+        raise SystemExit("GPU bootstrap constraints hash drifted")
 
     packages = {
         name: _version(name)
@@ -57,7 +74,7 @@ def main() -> None:
         )
     }
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_at_utc": datetime.now(UTC).isoformat(),
         "python": sys.version,
         "platform": platform.platform(),
@@ -71,6 +88,13 @@ def main() -> None:
             "size_bytes": args.vllm_wheel.stat().st_size,
             "sha256": _sha256(args.vllm_wheel),
         },
+        "semantic_wheel": {
+            "filename": args.semantic_wheel.name,
+            "size_bytes": args.semantic_wheel.stat().st_size,
+            "sha256": _sha256(args.semantic_wheel),
+        },
+        "semantic_runtime": capture_semantic_runtime_provenance(),
+        "bootstrap_environment": capture_bootstrap_distribution_provenance(),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     payload["manifest_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()

@@ -25,6 +25,7 @@ from model_forensics.lens import (
 from model_forensics.lens_runner import (
     FROZEN_PROBE_TOKEN_IDS,
     JLENS_REVISION,
+    POSITION_ORDER,
     PRIMARY_MODEL_PIN,
     SMOKE_D_MODEL,
     SMOKE_MODEL_ID,
@@ -34,8 +35,10 @@ from model_forensics.lens_runner import (
     LensArtifactPin,
     LensTraceInput,
     PrimaryCompatibilityFailure,
+    causal_probe_collisions,
     download_and_load_lens_pair,
     execute_lens_traces,
+    freeze_causal_probe_design,
     freeze_prefix_absent_probes,
     load_pinned_text_runtime,
     run_4b_compatibility_smoke,
@@ -43,7 +46,7 @@ from model_forensics.lens_runner import (
     run_ordered_compatibility_gate,
     verify_software_revisions,
 )
-from model_forensics.token_spans import token_stream_manifest
+from model_forensics.token_spans import token_stream_hash, token_stream_manifest
 
 
 def _probe_encoding() -> dict[str, list[int]]:
@@ -182,6 +185,19 @@ def _trace(*, direction: int = -1) -> LensTraceInput:
     )
 
 
+def _probe_design(trace: LensTraceInput, *, tokenizer: Any | None = None):
+    return freeze_causal_probe_design(
+        tokenizer or _Tokenizer(),
+        traces=(trace,),
+        candidate_probe_manifest_hash="sha256:" + "1" * 64,
+        candidate_probe_manifest_sha256="2" * 64,
+        anchor_manifest_hash="sha256:" + "3" * 64,
+        anchor_selection_hash="sha256:" + "4" * 64,
+        rollout_manifest_hash="sha256:" + "5" * 64,
+        position_manifest_hash="sha256:" + "6" * 64,
+    )
+
+
 def test_exact_generation_tokens_are_forwarded_once_to_both_lenses(tmp_path: Path) -> None:
     handles = (
         LoadedLens("J", _Lens("j"), _provenance("a")),
@@ -196,6 +212,7 @@ def test_exact_generation_tokens_are_forwarded_once_to_both_lenses(tmp_path: Pat
         runtime=_runtime(),
         lenses=handles,
         backend=backend,
+        probe_design=_probe_design(trace),
         output_path=output,
         layers=(4, 19),
     )
@@ -234,6 +251,122 @@ def test_frozen_probe_ids_are_verified_then_exact_prefix_collisions_are_filtered
     tokenizer.encodings[" upward"] = [999]
     with pytest.raises(ProvenanceError, match="token ID changed"):
         freeze_prefix_absent_probes(tokenizer, exact_prefix_token_ids=(1, 2))
+
+
+def test_causal_probe_design_keeps_fixed_universe_and_never_looks_past_a_cell() -> None:
+    collision = FROZEN_PROBE_TOKEN_IDS["direction"]["positive"][0]
+    streams = token_stream_manifest(
+        prompt_token_ids=(10, 11),
+        completion_token_ids=(12, 13, collision, 15, collision),
+    )
+    trace = LensTraceInput.from_token_stream_manifest(
+        trace_id="trace-causal",
+        token_streams=streams,
+        position_indices={
+            "prompt_end": 1,
+            "first_estimate_pre": 2,
+            "anchor_pre": 3,
+            "anchor_post": 4,
+            "final_answer_pre": 5,
+        },
+        good_side_direction=1,
+    )
+
+    design = freeze_causal_probe_design(
+        _Tokenizer(),
+        traces=(trace,),
+        candidate_probe_manifest_hash="sha256:" + "1" * 64,
+        candidate_probe_manifest_sha256="2" * 64,
+        anchor_manifest_hash="sha256:" + "3" * 64,
+        anchor_selection_hash="sha256:" + "4" * 64,
+        rollout_manifest_hash="sha256:" + "5" * 64,
+        position_manifest_hash="sha256:" + "6" * 64,
+    )
+
+    before = design.cell_for("trace-causal", "anchor_pre", "direction")
+    after = design.cell_for("trace-causal", "anchor_post", "direction")
+    assert before.probe_eligible is True
+    assert before.collisions == ()
+    assert after.probe_eligible is False
+    assert after.probe_ineligibility_reason == "causal_prefix_probe_collision"
+    assert design.concepts["direction"].positive_ids == (
+        FROZEN_PROBE_TOKEN_IDS["direction"]["positive"]
+    )
+    assert len(design.cells) == len(POSITION_ORDER) * len(DEFAULT_CONCEPT_WORDS)
+
+
+def test_shared_collision_recomputation_detects_lexical_copy_without_probe_token() -> None:
+    tokenizer = _Tokenizer(decoded="neutral reasoning moves upward carefully")
+    trace = _trace(direction=1)
+    design = _probe_design(trace, tokenizer=tokenizer)
+    collisions = causal_probe_collisions(
+        tokenizer,
+        causal_token_ids=(10, 11),
+        probes=design.concepts["direction"],
+    )
+    upward = next(item for item in collisions if item.word.strip() == "upward")
+    assert upward.exact_token_id_present is False
+    assert upward.lexical_word_present is True
+
+
+def test_fixed_probe_execution_emits_null_collision_rows_and_truncates_future_suffix() -> None:
+    collision = FROZEN_PROBE_TOKEN_IDS["direction"]["positive"][0]
+    streams = token_stream_manifest(
+        prompt_token_ids=(10, 11),
+        completion_token_ids=(12, 13, collision, 15, 16),
+    )
+    trace = LensTraceInput.from_token_stream_manifest(
+        trace_id="trace-grid",
+        token_streams=streams,
+        position_indices={
+            "prompt_end": 1,
+            "first_estimate_pre": 2,
+            "anchor_pre": 3,
+            "anchor_post": 4,
+            "final_answer_pre": 5,
+        },
+        good_side_direction=1,
+    )
+    design = freeze_causal_probe_design(
+        _Tokenizer(),
+        traces=(trace,),
+        candidate_probe_manifest_hash="sha256:" + "1" * 64,
+        candidate_probe_manifest_sha256="2" * 64,
+        anchor_manifest_hash="sha256:" + "3" * 64,
+        anchor_selection_hash="sha256:" + "4" * 64,
+        rollout_manifest_hash="sha256:" + "5" * 64,
+        position_manifest_hash="sha256:" + "6" * 64,
+    )
+    handles = (
+        LoadedLens("J", _Lens("j"), _provenance("a")),
+        LoadedLens("R", _Lens("r"), _provenance("b")),
+    )
+    backend = _SameForwardFake()
+
+    records = execute_lens_traces(
+        (trace,),
+        runtime=_runtime(),
+        lenses=handles,
+        backend=backend,
+        probe_design=design,
+        layers=(4,),
+    )
+
+    assert backend.capture_calls[0][0] == trace.sequence_token_ids[:6]
+    assert len(records) == 2 * 1 * 5 * 3
+    collided = [
+        record
+        for record in records
+        if record.position_name == "anchor_post" and record.contrast == "direction"
+    ]
+    assert len(collided) == 2
+    assert all(record.probe_eligible is False for record in collided)
+    assert all(record.raw_mean_logit_contrast is None for record in collided)
+    assert all(record.signed_mean_logit_contrast is None for record in collided)
+    assert all(
+        record.positive_token_ids == FROZEN_PROBE_TOKEN_IDS["direction"]["positive"]
+        for record in collided
+    )
 
 
 class _CheckpointLens:
@@ -486,6 +619,11 @@ def test_gate_orders_4b_then_two_limited_primary_attempts_without_fallback() -> 
     assert manifest.primary_ready is True
     assert manifest.fallback_model_used is False
     assert [attempt.status for attempt in manifest.attempts] == ["passed", "failed", "passed"]
+    assert [attempt.prefix_token_ids_hash for attempt in manifest.attempts] == [
+        token_stream_hash((1,), stream="lens_compatibility_attempt_prefix"),
+        token_stream_hash((1, 2, 3), stream="lens_compatibility_attempt_prefix"),
+        token_stream_hash((1, 2), stream="lens_compatibility_attempt_prefix"),
+    ]
 
     def always_fail(ids: Any) -> dict[str, Any]:
         raise RuntimeError(f"failed {len(ids)}")
@@ -502,6 +640,10 @@ def test_gate_orders_4b_then_two_limited_primary_attempts_without_fallback() -> 
     primary_attempts = [item for item in failed.attempts if item.stage == "122b_preflight"]
     assert len(primary_attempts) == 2
     assert all(item.status == "failed" for item in primary_attempts)
+    assert [item.prefix_token_ids_hash for item in primary_attempts] == [
+        token_stream_hash((1, 2, 3), stream="lens_compatibility_attempt_prefix"),
+        token_stream_hash((1, 2), stream="lens_compatibility_attempt_prefix"),
+    ]
     assert failed.primary_ready is False
     assert failed.fallback_model_used is False
 

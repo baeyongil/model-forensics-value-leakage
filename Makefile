@@ -26,12 +26,17 @@ BEHAVIOR_TREATMENT_ADJUDICATION_CHECKPOINT ?= data/interim/qwen35_122b/checkpoin
 ANCHOR_CANDIDATES ?= data/interim/qwen35_122b/anchor_candidates.jsonl
 ANCHOR_MANIFEST ?= data/manifests/anchor_manifest.json
 LENS_POSITIONS ?= data/manifests/lens_positions.jsonl
+LENS_PROBE_CANDIDATES ?= data/manifests/lens_probe_token_verification.json
+LENS_PROBE_DESIGN ?= data/manifests/lens_probe_design_manifest.json
 RESAMPLE_GENERATION_CHECKPOINT ?= data/interim/qwen35_122b/checkpoints/resampling/gpu
 RESAMPLE_ADJUDICATION_CHECKPOINT ?= data/interim/qwen35_122b/checkpoints/resampling/adjudication
 RESAMPLE_INPUT ?= data/interim/qwen35_122b/resampling.jsonl
 LENS_INPUT ?= data/interim/qwen35_122b/lens.jsonl
 LENS_CACHE_DIR ?= data/cache/lenses
 PER_GPU_MEMORY_GIB ?= 76
+PUBLIC_RESULTS_DIR ?= reports/results
+PUBLIC_RESULTS_FIGURE_DIR ?= reports/figures
+QWEN4B_SMOKE_OUTPUT ?= data/manifests/qwen4b_prefix_gpu_smoke.json
 
 # GPU_PHASE must be one exact canonical phase. The quote lock supplies the GPU
 # family, rate, timestamp, source, and this phase's approved runtime. Each phase
@@ -45,10 +50,13 @@ TIME_CATEGORY ?=
 TIME_DESCRIPTION ?=
 TIME_STATUS ?=
 
-# Optional local credentials. This file is gitignored. Values are exported to
-# child processes but never interpolated into command lines or Make output.
+# Optional local credentials. This file is gitignored. Provider credentials are
+# unexported by default and exposed only to the exact paid targets below.
 -include .env.local
-export HF_TOKEN OPENROUTER_API_KEY RUNPOD_API_KEY
+LOCAL_HF := $(HF_TOKEN)
+LOCAL_OPENROUTER := $(OPENROUTER_API_KEY)
+LOCAL_RUNPOD := $(RUNPOD_API_KEY)
+unexport HF_TOKEN OPENROUTER_API_KEY RUNPOD_API_KEY
 
 export PYTHONPATH := $(CURDIR)/src
 
@@ -75,13 +83,22 @@ define derive-session-directory
 session_dir="$$( $(PYTHON_BOOTSTRAP) -c 'import json, sys; from pathlib import Path; receipt = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")); value = str(receipt["session_hash"]); prefix = "sha256:"; assert value.startswith(prefix) and len(value) == len(prefix) + 64; print((Path.cwd() / ".runpod" / "sessions" / value.removeprefix(prefix)).resolve())' "$(GPU_RESERVATION_RECEIPT)" )"
 endef
 
-.PHONY: setup test lint format reproduce \
+.PHONY: setup test lint format reproduce reproduce-results stage-results-release \
 	behavior-baseline-generate behavior-baseline-adjudicate \
 	behavior-treatment-generate behavior-treatment-adjudicate sample \
 	anchors positions resample-generate resample-adjudicate resample lens \
-	analyze report smoke clean \
+	analyze report smoke qwen4b-gpu-integration-smoke clean \
 	gpu-reserve gpu-bootstrap gpu-active-verify gpu-settle \
 	time-start time-stop time-status release-check
+
+HF_TARGETS := behavior-baseline-generate behavior-treatment-generate \
+	resample-generate lens qwen4b-gpu-integration-smoke gpu-bootstrap
+OPENROUTER_TARGETS := behavior-baseline-adjudicate behavior-treatment-adjudicate \
+	anchors positions resample-adjudicate
+
+$(HF_TARGETS): export HF_TOKEN := $(LOCAL_HF)
+$(OPENROUTER_TARGETS): export OPENROUTER_API_KEY := $(LOCAL_OPENROUTER)
+gpu-bootstrap: export RUNPOD_API_KEY := $(LOCAL_RUNPOD)
 
 setup:
 	$(PYTHON_BOOTSTRAP) -m venv .venv
@@ -99,6 +116,21 @@ format:
 
 reproduce:
 	$(PYTHON) -m model_forensics.cli reproduce --config "$(CONFIG)"
+
+# Public, credential-free reproduction from the aggregate-only released
+# evidence. This never invokes a model backend, provider, or raw-data command.
+reproduce-results:
+	$(PYTHON) scripts/reproduce_results.py \
+		--results-dir "$(PUBLIC_RESULTS_DIR)" \
+		--figure-dir "$(PUBLIC_RESULTS_FIGURE_DIR)"
+
+# Maintainer-only release staging. The source analysis summary and every
+# linked artifact are authenticated before field-level aggregation.
+stage-results-release:
+	$(PYTHON) scripts/prepare_results_release.py \
+		--config "$(CONFIG)" \
+		--results-dir "$(PUBLIC_RESULTS_DIR)" \
+		--figure-dir "$(PUBLIC_RESULTS_FIGURE_DIR)"
 
 behavior-baseline-generate: override GPU_PHASE := behavior_baseline_gpu
 behavior-baseline-generate:
@@ -196,7 +228,9 @@ lens:
 	@if [[ -f "$(LENS_INPUT)" ]]; then \
 		$(PYTHON) -m model_forensics.cli lens \
 			--config "$(CONFIG)" \
-			--input "$(LENS_INPUT)"; \
+			--input "$(LENS_INPUT)" \
+			--probe-candidates "$(LENS_PROBE_CANDIDATES)" \
+			--probe-design "$(LENS_PROBE_DESIGN)"; \
 	else \
 		$(derive-session-directory); \
 		$(GPU_PYTHON) -m model_forensics.cli lens \
@@ -207,6 +241,8 @@ lens:
 			--rollouts "$(ROLLOUTS)" \
 			--anchors "$(ANCHOR_MANIFEST)" \
 			--positions "$(LENS_POSITIONS)" \
+			--probe-candidates "$(LENS_PROBE_CANDIDATES)" \
+			--probe-design "$(LENS_PROBE_DESIGN)" \
 			--cache-dir "$(LENS_CACHE_DIR)" \
 			--per-gpu-memory-gib "$(PER_GPU_MEMORY_GIB)"; \
 	fi
@@ -220,6 +256,16 @@ report:
 
 smoke:
 	$(PYTHON) -m model_forensics.cli smoke --config config/smoke.yaml
+
+# Bounded real-model integration only. It is non-primary, calls no paid API,
+# and records the explicit no-matched-4B-lens transport boundary.
+qwen4b-gpu-integration-smoke:
+	$(GPU_PYTHON) scripts/qwen4b_prefix_smoke.py \
+		--output "$(QWEN4B_SMOKE_OUTPUT)" \
+		--tensor-parallel-size 1 \
+		--max-model-len 4096 \
+		--rollout-max-tokens 1024 \
+		--continuation-max-tokens 256
 
 clean:
 	$(PYTHON) -m model_forensics.cli clean --config "$(CONFIG)"
@@ -254,7 +300,7 @@ gpu-reserve:
 gpu-bootstrap:
 	$(call require-var,GPU_PHASE)
 	@bootstrap_values="$$( $(PYTHON_BOOTSTRAP) scripts/extract_gpu_bootstrap_inputs.py --gpu-quote-lock "$(GPU_QUOTE_LOCK)" --gpu-lock "$(GPU_LOCK)" --phase "$(GPU_PHASE)" )"; \
-	IFS=$$'\t' read -r gpu_family provider_gpu_id allowed_cuda_versions data_center_ids storage_rate per_gpu_rate runtime_hours price_source price_checked_at container_digest wheel_url wheel_sha256 <<< "$$bootstrap_values"; \
+	IFS=$$'\t' read -r gpu_family provider_gpu_id allowed_cuda_versions data_center_ids storage_rate per_gpu_rate runtime_hours price_source price_checked_at container_digest wheel_url wheel_sha256 semantic_wheel_url semantic_wheel_sha256 semantic_version semantic_stack_lock_hash bootstrap_constraints_path bootstrap_constraints_sha256 bootstrap_distribution_lock_hash <<< "$$bootstrap_values"; \
 	bash scripts/bootstrap_gpu.sh \
 		"$$gpu_family" \
 		"$$provider_gpu_id" \
@@ -268,6 +314,13 @@ gpu-bootstrap:
 		"$$container_digest" \
 		"$$wheel_url" \
 		"$$wheel_sha256" \
+		"$$semantic_wheel_url" \
+		"$$semantic_wheel_sha256" \
+		"$$semantic_version" \
+		"$$semantic_stack_lock_hash" \
+		"$$bootstrap_constraints_path" \
+		"$$bootstrap_constraints_sha256" \
+		"$$bootstrap_distribution_lock_hash" \
 		"$(GPU_PHASE)" \
 		"$(GPU_RESERVATION_RECEIPT)" \
 		"$(COST_LEDGER)"

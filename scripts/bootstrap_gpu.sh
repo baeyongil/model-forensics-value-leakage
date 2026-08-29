@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" -ne 15 ]]; then
-  echo "usage: $0 GPU_FAMILY PROVIDER_GPU_ID ALLOWED_CUDA_VERSIONS_CSV DATA_CENTER_IDS_CSV RUNNING_STORAGE_USD_PER_HOUR HOURLY_PER_GPU_USD APPROVED_PHASE_RUNTIME_HOURS PRICE_SOURCE PRICE_CHECKED_AT CONTAINER_IMAGE_DIGEST VLLM_WHEEL_URL VLLM_WHEEL_SHA256 GPU_PHASE GPU_RESERVATION_RECEIPT COST_LEDGER" >&2
+if [[ "$#" -ne 22 ]]; then
+  echo "usage: $0 GPU_FAMILY PROVIDER_GPU_ID ALLOWED_CUDA_VERSIONS_CSV DATA_CENTER_IDS_CSV RUNNING_STORAGE_USD_PER_HOUR HOURLY_PER_GPU_USD APPROVED_PHASE_RUNTIME_HOURS PRICE_SOURCE PRICE_CHECKED_AT CONTAINER_IMAGE_DIGEST VLLM_WHEEL_URL VLLM_WHEEL_SHA256 SEMANTIC_WHEEL_URL SEMANTIC_WHEEL_SHA256 SEMANTIC_DISTRIBUTION_VERSION SEMANTIC_STACK_LOCK_HASH BOOTSTRAP_CONSTRAINTS_PATH BOOTSTRAP_CONSTRAINTS_SHA256 BOOTSTRAP_DISTRIBUTION_LOCK_HASH GPU_PHASE GPU_RESERVATION_RECEIPT COST_LEDGER" >&2
   exit 2
 fi
 
@@ -18,9 +18,16 @@ PRICE_CHECKED_AT="$9"
 CONTAINER_IMAGE_DIGEST="${10}"
 VLLM_WHEEL_URL="${11}"
 VLLM_WHEEL_SHA256="${12}"
-GPU_PHASE="${13}"
-GPU_RESERVATION_RECEIPT="${14}"
-COST_LEDGER="${15}"
+SEMANTIC_WHEEL_URL="${13}"
+SEMANTIC_WHEEL_SHA256="${14}"
+SEMANTIC_DISTRIBUTION_VERSION="${15}"
+SEMANTIC_STACK_LOCK_HASH="${16}"
+BOOTSTRAP_CONSTRAINTS_PATH="${17}"
+BOOTSTRAP_CONSTRAINTS_SHA256="${18}"
+BOOTSTRAP_DISTRIBUTION_LOCK_HASH="${19}"
+GPU_PHASE="${20}"
+GPU_RESERVATION_RECEIPT="${21}"
+COST_LEDGER="${22}"
 
 if [[ "$ALLOWED_CUDA_VERSIONS_CSV" != "12.8" ]]; then
   echo "approved CUDA host version set must be exactly 12.8" >&2
@@ -54,7 +61,49 @@ EXPECTED_SESSION_HASH=""
 GPU_BOOTSTRAP_TMP=""
 BOOTSTRAP_SUCCEEDED=0
 WATCHDOG_PID=""
+# Inherited environment variables retain Bash's export attribute after a plain
+# assignment.  Remove any caller-provided private aliases before recreating
+# them so the in-memory credential copies can never become child environment
+# variables accidentally.
+unset GPU_BUDGET_SESSION_ID_PRIVATE RUNPOD_API_KEY_PRIVATE HF_TOKEN_PRIVATE || true
 GPU_BUDGET_SESSION_ID_PRIVATE=""
+RUNPOD_API_KEY_PRIVATE=""
+HF_TOKEN_PRIVATE=""
+
+secret_free() {
+  env -u RUNPOD_API_KEY -u HF_TOKEN -u GPU_BUDGET_SESSION_ID \
+    -u GPU_BUDGET_SESSION_ID_PRIVATE -u RUNPOD_API_KEY_PRIVATE \
+    -u HF_TOKEN_PRIVATE "$@"
+}
+
+with_hf_token() (
+  printf -v HF_TOKEN '%s' "$HF_TOKEN_PRIVATE"
+  export HF_TOKEN
+  unset RUNPOD_API_KEY GPU_BUDGET_SESSION_ID GPU_BUDGET_SESSION_ID_PRIVATE \
+    RUNPOD_API_KEY_PRIVATE HF_TOKEN_PRIVATE
+  exec "$@"
+)
+
+with_gpu_session_id() (
+  printf -v GPU_BUDGET_SESSION_ID '%s' "$GPU_BUDGET_SESSION_ID_PRIVATE"
+  export GPU_BUDGET_SESSION_ID
+  unset RUNPOD_API_KEY HF_TOKEN GPU_BUDGET_SESSION_ID_PRIVATE \
+    RUNPOD_API_KEY_PRIVATE HF_TOKEN_PRIVATE
+  exec "$@"
+)
+
+# The exact regular/emergency watchdog is the sole non-model exception that
+# receives both provider credentials: it binds the live Pod's HF credential
+# hash while retaining stop capability.  No setup, download, or build child
+# uses this wrapper.
+with_watchdog_credentials() (
+  printf -v RUNPOD_API_KEY '%s' "$RUNPOD_API_KEY_PRIVATE"
+  printf -v HF_TOKEN '%s' "$HF_TOKEN_PRIVATE"
+  export RUNPOD_API_KEY HF_TOKEN
+  unset GPU_BUDGET_SESSION_ID GPU_BUDGET_SESSION_ID_PRIVATE \
+    RUNPOD_API_KEY_PRIVATE HF_TOKEN_PRIVATE
+  exec "$@"
+)
 case "$GPU_FAMILY" in
   H100 | H100_80GB | A100 | A100_80GB) EMERGENCY_GPU_FAMILY="$GPU_FAMILY" ;;
   *) EMERGENCY_GPU_FAMILY="H100_80GB" ;;
@@ -67,13 +116,15 @@ cleanup_on_exit() {
     local watchdog_identity_live=0
     if [[ -n "$WATCHDOG_PID" && -f "$WATCHDOG_PID_FILE" ]] \
       && [[ -f scripts/runpod_process_identity.py ]] \
-      && PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py verify \
+      && secret_free env PYTHONPATH="$PWD/src" \
+        python3 scripts/runpod_process_identity.py verify \
         --identity "$WATCHDOG_PID_FILE" >/dev/null 2>&1; then
       watchdog_identity_live=1
     fi
     if [[ "$watchdog_identity_live" != "1" ]] \
       && [[ -n "${RUNPOD_POD_ID:-}" ]] \
-      && [[ -n "${RUNPOD_API_KEY:-}" ]] \
+      && [[ -n "$RUNPOD_API_KEY_PRIVATE" ]] \
+      && [[ -n "$HF_TOKEN_PRIVATE" ]] \
       && [[ -n "$EXPECTED_SESSION_HASH" ]] \
       && [[ -f "$LIFECYCLE_STATE" ]] \
       && [[ -f scripts/runpod_watchdog.py ]]; then
@@ -81,7 +132,8 @@ cleanup_on_exit() {
       # If it fails, arm an immediate one-shot watchdog so this exact Pod does
       # not continue billing. Hardware/rate mismatch also takes the tested stop
       # path in run_watchdog.
-      env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" python3 scripts/runpod_watchdog.py \
+      with_watchdog_credentials env PYTHONPATH="$PWD/src" \
+        python3 scripts/runpod_watchdog.py \
         --pod-id "$RUNPOD_POD_ID" \
         --lifecycle-state "$LIFECYCLE_STATE" \
         --expected-session-hash "$EXPECTED_SESSION_HASH" \
@@ -104,6 +156,7 @@ cleanup_on_exit() {
   fi
   unset GPU_BUDGET_SESSION_ID || true
   unset GPU_BUDGET_SESSION_ID_PRIVATE || true
+  unset RUNPOD_API_KEY RUNPOD_API_KEY_PRIVATE HF_TOKEN HF_TOKEN_PRIVATE || true
   if [[ -n "$GPU_BOOTSTRAP_TMP" && -d "$GPU_BOOTSTRAP_TMP" ]]; then
     rm -rf -- "$GPU_BOOTSTRAP_TMP" || true
   fi
@@ -131,12 +184,15 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
   echo "HF_TOKEN is required for in-memory provider credential binding" >&2
   exit 2
 fi
-EXPECTED_SESSION_HASH="$(PYTHONPATH="$PWD/src" python3 -c 'import os; from model_forensics.io import stable_hash; print(stable_hash({"opaque_gpu_session_id": os.environ["GPU_BUDGET_SESSION_ID"]}))')"
+GPU_BUDGET_SESSION_ID_PRIVATE="$GPU_BUDGET_SESSION_ID"
+RUNPOD_API_KEY_PRIVATE="$RUNPOD_API_KEY"
+HF_TOKEN_PRIVATE="$HF_TOKEN"
+unset GPU_BUDGET_SESSION_ID RUNPOD_API_KEY HF_TOKEN
+EXPECTED_SESSION_HASH="$(with_gpu_session_id env PYTHONPATH="$PWD/src" python3 -c 'import os; from model_forensics.io import stable_hash; print(stable_hash({"opaque_gpu_session_id": os.environ["GPU_BUDGET_SESSION_ID"]}))')"
 if [[ ! "$EXPECTED_SESSION_HASH" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "could not derive a safe GPU session identity hash" >&2
   exit 2
 fi
-GPU_BUDGET_SESSION_ID_PRIVATE="$GPU_BUDGET_SESSION_ID"
 if [[ ! -f "$GPU_RESERVATION_RECEIPT" || ! -f "$COST_LEDGER" ]]; then
   echo "authenticated GPU reservation receipt and canonical cost ledger must be synced" >&2
   exit 2
@@ -155,20 +211,20 @@ done
 # Authenticate the locally created one-use reservation before the watchdog,
 # downloads, model load, or experiment backend. The opaque session nonce is
 # read from the environment and never placed in a process command line.
-PYTHONPATH="$PWD/src" python3 scripts/gpu_budget_preflight.py \
+with_gpu_session_id env PYTHONPATH="$PWD/src" python3 scripts/gpu_budget_preflight.py \
   --reservation-receipt "$GPU_RESERVATION_RECEIPT" \
   --cost-ledger "$COST_LEDGER" \
   --phase "$GPU_PHASE" \
   --session-id-env GPU_BUDGET_SESSION_ID \
   --expected-approved-runtime-hours "$APPROVED_PHASE_RUNTIME_HOURS" \
-  --expected-live-hourly-total-usd "$(python3 -c 'import sys; print(8 * float(sys.argv[1]) + float(sys.argv[2]))' "$HOURLY_PER_GPU_USD" "$RUNNING_STORAGE_USD_PER_HOUR")" \
+  --expected-live-hourly-total-usd "$(secret_free python3 -c 'import sys; print(8 * float(sys.argv[1]) + float(sys.argv[2]))' "$HOURLY_PER_GPU_USD" "$RUNNING_STORAGE_USD_PER_HOUR")" \
   --gpu-hard-stop-usd 220 \
   --api-hard-stop-usd 100 \
   --total-hard-stop-usd 325 \
   --output "$GPU_BUDGET_BOOTSTRAP_STATE"
 
 IFS=$'\t' read -r GPU_HARD_STOP_USD MAXIMUM_SAFE_RUNTIME_HOURS SAFETY_MARGIN_FRACTION PRIOR_COMMITTED_GPU_USD < <(
-  python3 - "$GPU_BUDGET_BOOTSTRAP_STATE" <<'PY'
+  secret_free python3 - "$GPU_BUDGET_BOOTSTRAP_STATE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -192,7 +248,7 @@ fi
 # stopped_confirmed watchdog state and an exact settlement in the canonical
 # ledger. The pending bootstrap receipt is atomically moved into that private
 # directory, so the same phase/session identity cannot be re-armed.
-SESSION_DIR="$(PYTHONPATH="$PWD/src" python3 scripts/runpod_session_prepare.py \
+SESSION_DIR="$(secret_free env PYTHONPATH="$PWD/src" python3 scripts/runpod_session_prepare.py \
   --sessions-root "$RUNPOD_SESSIONS_ROOT" \
   --pending-budget-bootstrap "$GPU_BUDGET_BOOTSTRAP_STATE" \
   --cost-ledger "$COST_LEDGER" \
@@ -225,7 +281,8 @@ TRANSFORMERS_COMMIT="42ca97014c85d71a88ad60d55f08cb9fb4d26e2c"
 JLENS_COMMIT="581d398613e5602a5af361e1c34d3a92ea82ba8e"
 
 # Arm a separate, nohup-protected process before any wheel or model download.
-env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" nohup python3 scripts/runpod_watchdog.py \
+with_watchdog_credentials env PYTHONPATH="$PWD/src" nohup \
+  python3 scripts/runpod_watchdog.py \
   --pod-id "$RUNPOD_POD_ID" \
   --lifecycle-state "$LIFECYCLE_STATE" \
   --expected-session-hash "$EXPECTED_SESSION_HASH" \
@@ -247,7 +304,7 @@ env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" nohup python3 scripts/runpod_
   --stop-request "$STOP_REQUEST_PATH" \
   > "$WATCHDOG_LOG" 2>&1 &
 WATCHDOG_PID="$!"
-PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py record \
+secret_free env PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py record \
   --pid "$WATCHDOG_PID" \
   --output "$WATCHDOG_PID_FILE" \
   --required-cmdline-token scripts/runpod_watchdog.py \
@@ -256,12 +313,12 @@ PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py record \
   >/dev/null
 
 watchdog_process_is_live() {
-  PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py verify \
+  secret_free env PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py verify \
     --identity "$WATCHDOG_PID_FILE" >/dev/null 2>&1
 }
 
 watchdog_is_armed() {
-  python3 - "$WATCHDOG_STATE" <<'PY'
+  secret_free python3 - "$WATCHDOG_STATE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -313,7 +370,7 @@ if [[ "$WATCHDOG_READY" != "1" ]]; then
   exit 2
 fi
 
-PYTHONPATH="$PWD/src" python3 scripts/runpod_preflight.py \
+with_gpu_session_id env PYTHONPATH="$PWD/src" python3 scripts/runpod_preflight.py \
   --required-gpus 8 \
   --minimum-memory-gib 79 \
   --minimum-free-disk-gib 520 \
@@ -343,9 +400,9 @@ PYTHONPATH="$PWD/src" python3 scripts/runpod_preflight.py \
   --vllm-wheel-sha256 "$VLLM_WHEEL_SHA256" \
   --output "$GPU_PREFLIGHT_STATE"
 
-# The raw nonce is no longer needed and must not leak into download/model child
-# process environments.
-unset GPU_BUDGET_SESSION_ID
+# Raw credentials were copied into non-exported shell variables before any
+# watchdog or setup child.  Keep the public names absent for defense in depth.
+unset GPU_BUDGET_SESSION_ID RUNPOD_API_KEY HF_TOKEN
 
 mkdir -p "$GPU_SETUP_DIR"
 if [[ -e .venv-gpu ]]; then
@@ -353,7 +410,7 @@ if [[ -e .venv-gpu ]]; then
     echo "existing GPU environment is incomplete and cannot be re-armed" >&2
     exit 2
   fi
-  PYTHONPATH="$PWD/src" python3 scripts/gpu_setup_lock.py validate \
+  secret_free env PYTHONPATH="$PWD/src" python3 scripts/gpu_setup_lock.py validate \
     --lock "$GPU_SETUP_LOCK" \
     --environment-manifest "$GPU_ENVIRONMENT_MANIFEST" \
     --qwen4b-smoke-manifest "$QWEN4B_SMOKE_MANIFEST" \
@@ -363,6 +420,12 @@ if [[ -e .venv-gpu ]]; then
     --vllm-wheel-sha256 "$VLLM_WHEEL_SHA256" \
     --transformers-commit "$TRANSFORMERS_COMMIT" \
     --jlens-commit "$JLENS_COMMIT" \
+    --semantic-wheel-url "$SEMANTIC_WHEEL_URL" \
+    --semantic-wheel-sha256 "$SEMANTIC_WHEEL_SHA256" \
+    --semantic-distribution-version "$SEMANTIC_DISTRIBUTION_VERSION" \
+    --semantic-stack-lock-hash "$SEMANTIC_STACK_LOCK_HASH" \
+    --bootstrap-constraints-sha256 "$BOOTSTRAP_CONSTRAINTS_SHA256" \
+    --bootstrap-distribution-lock-hash "$BOOTSTRAP_DISTRIBUTION_LOCK_HASH" \
     > "$GPU_SETUP_VALIDATION"
 else
   if [[ -e "$GPU_SETUP_LOCK" || -e "$GPU_ENVIRONMENT_MANIFEST" || -e "$QWEN4B_SMOKE_MANIFEST" ]]; then
@@ -370,6 +433,16 @@ else
     exit 2
   fi
   GPU_BOOTSTRAP_TMP="$(mktemp -d)"
+  if [[ "$BOOTSTRAP_CONSTRAINTS_PATH" != "config/gpu_bootstrap_constraints.txt" ]] \
+    || [[ ! -f "$BOOTSTRAP_CONSTRAINTS_PATH" ]]; then
+    echo "frozen GPU bootstrap constraints are absent" >&2
+    exit 2
+  fi
+  ACTUAL_CONSTRAINTS_SHA256="$(secret_free shasum -a 256 "$BOOTSTRAP_CONSTRAINTS_PATH" | awk '{print $1}')"
+  if [[ "$ACTUAL_CONSTRAINTS_SHA256" != "$BOOTSTRAP_CONSTRAINTS_SHA256" ]]; then
+    echo "GPU bootstrap constraints SHA-256 mismatch" >&2
+    exit 2
+  fi
   VLLM_WHEEL_NAME="${VLLM_WHEEL_URL%%\?*}"
   VLLM_WHEEL_NAME="${VLLM_WHEEL_NAME##*/}"
   if [[ "$VLLM_WHEEL_NAME" != *.whl ]]; then
@@ -377,32 +450,56 @@ else
     exit 2
   fi
   VLLM_WHEEL_PATH="$GPU_BOOTSTRAP_TMP/$VLLM_WHEEL_NAME"
-  curl --fail --location --retry 3 --output "$VLLM_WHEEL_PATH" "$VLLM_WHEEL_URL"
-  ACTUAL_VLLM_SHA256="$(shasum -a 256 "$VLLM_WHEEL_PATH" | awk '{print $1}')"
+  secret_free curl --fail --location --retry 3 --output "$VLLM_WHEEL_PATH" "$VLLM_WHEEL_URL"
+  ACTUAL_VLLM_SHA256="$(secret_free shasum -a 256 "$VLLM_WHEEL_PATH" | awk '{print $1}')"
   if [[ "$ACTUAL_VLLM_SHA256" != "$VLLM_WHEEL_SHA256" ]]; then
     echo "vLLM wheel SHA-256 mismatch" >&2
     exit 2
   fi
+  SEMANTIC_WHEEL_NAME="${SEMANTIC_WHEEL_URL%%\?*}"
+  SEMANTIC_WHEEL_NAME="${SEMANTIC_WHEEL_NAME##*/}"
+  if [[ "$SEMANTIC_WHEEL_NAME" != *.whl ]]; then
+    echo "semantic runtime URL must resolve to a named .whl file" >&2
+    exit 2
+  fi
+  SEMANTIC_WHEEL_PATH="$GPU_BOOTSTRAP_TMP/$SEMANTIC_WHEEL_NAME"
+  secret_free curl --fail --location --retry 3 --output "$SEMANTIC_WHEEL_PATH" "$SEMANTIC_WHEEL_URL"
+  ACTUAL_SEMANTIC_SHA256="$(secret_free shasum -a 256 "$SEMANTIC_WHEEL_PATH" | awk '{print $1}')"
+  if [[ "$ACTUAL_SEMANTIC_SHA256" != "$SEMANTIC_WHEEL_SHA256" ]]; then
+    echo "sentence-transformers wheel SHA-256 mismatch" >&2
+    exit 2
+  fi
 
-  python3 -m venv .venv-gpu
-  .venv-gpu/bin/python -m pip install --upgrade pip setuptools wheel
-  .venv-gpu/bin/python -m pip install uv
-  .venv-gpu/bin/uv pip install --python .venv-gpu/bin/python "$VLLM_WHEEL_PATH" --torch-backend=auto
-  .venv-gpu/bin/python -m pip install \
+  secret_free python3 -m venv .venv-gpu
+  secret_free .venv-gpu/bin/python -m pip install \
+    --constraint "$BOOTSTRAP_CONSTRAINTS_PATH" \
+    "setuptools==80.9.0" "wheel==0.46.3"
+  secret_free .venv-gpu/bin/python -m pip install --no-build-isolation \
+    --constraint "$BOOTSTRAP_CONSTRAINTS_PATH" \
+    "$VLLM_WHEEL_PATH" "$SEMANTIC_WHEEL_PATH" \
     "transformers @ git+https://github.com/huggingface/transformers.git@$TRANSFORMERS_COMMIT" \
     "jlens @ git+https://github.com/anthropics/jacobian-lens.git@$JLENS_COMMIT" \
-    accelerate huggingface-hub safetensors sentence-transformers
-  .venv-gpu/bin/python -m pip install -e '.[analysis]'
-  .venv-gpu/bin/python scripts/capture_environment.py \
+    "accelerate==1.12.0" "safetensors==0.7.0" \
+    "pandas==3.0.3" "pydantic==2.12.5" "PyYAML==6.0.3" "matplotlib==3.10.8" \
+    "huggingface-hub==1.29.0" \
+    "numpy==2.5.2" \
+    "scikit-learn==1.9.0" \
+    "scipy==1.18.1" \
+    "tokenizers==0.23.1" \
+    "torch==2.13.0"
+  secret_free .venv-gpu/bin/python -m pip install --no-build-isolation -e . --no-deps
+  secret_free .venv-gpu/bin/python scripts/capture_environment.py \
     --output "$GPU_ENVIRONMENT_MANIFEST" \
-    --vllm-wheel "$VLLM_WHEEL_PATH"
-  .venv-gpu/bin/python scripts/qwen4b_prefix_smoke.py \
+    --vllm-wheel "$VLLM_WHEEL_PATH" \
+    --semantic-wheel "$SEMANTIC_WHEEL_PATH" \
+    --bootstrap-constraints "$BOOTSTRAP_CONSTRAINTS_PATH"
+  with_hf_token .venv-gpu/bin/python scripts/qwen4b_prefix_smoke.py \
     --output "$QWEN4B_SMOKE_MANIFEST" \
     --tensor-parallel-size 1 \
     --max-model-len 4096 \
     --rollout-max-tokens 1024 \
     --continuation-max-tokens 256
-  PYTHONPATH="$PWD/src" python3 scripts/gpu_setup_lock.py create \
+  secret_free env PYTHONPATH="$PWD/src" python3 scripts/gpu_setup_lock.py create \
     --lock "$GPU_SETUP_LOCK" \
     --environment-manifest "$GPU_ENVIRONMENT_MANIFEST" \
     --qwen4b-smoke-manifest "$QWEN4B_SMOKE_MANIFEST" \
@@ -412,6 +509,12 @@ else
     --vllm-wheel-sha256 "$VLLM_WHEEL_SHA256" \
     --transformers-commit "$TRANSFORMERS_COMMIT" \
     --jlens-commit "$JLENS_COMMIT" \
+    --semantic-wheel-url "$SEMANTIC_WHEEL_URL" \
+    --semantic-wheel-sha256 "$SEMANTIC_WHEEL_SHA256" \
+    --semantic-distribution-version "$SEMANTIC_DISTRIBUTION_VERSION" \
+    --semantic-stack-lock-hash "$SEMANTIC_STACK_LOCK_HASH" \
+    --bootstrap-constraints-sha256 "$BOOTSTRAP_CONSTRAINTS_SHA256" \
+    --bootstrap-distribution-lock-hash "$BOOTSTRAP_DISTRIBUTION_LOCK_HASH" \
     > "$GPU_SETUP_VALIDATION"
 fi
 
@@ -419,8 +522,8 @@ fi
 # setup and smoke work.  A live PID plus an `armed` string is not sufficient:
 # the PID may have been recycled and any one of the bound artifacts may have
 # changed during the long installation window.
-env GPU_BUDGET_SESSION_ID="$GPU_BUDGET_SESSION_ID_PRIVATE" \
-  PYTHONPATH="$PWD/src" python3 scripts/runpod_active_session_verify.py \
+with_gpu_session_id env PYTHONPATH="$PWD/src" \
+  python3 scripts/runpod_active_session_verify.py \
   --session-directory "$SESSION_DIR" \
   --reservation-receipt "$GPU_RESERVATION_RECEIPT" \
   --cost-ledger "$COST_LEDGER" \
@@ -430,4 +533,5 @@ env GPU_BUDGET_SESSION_ID="$GPU_BUDGET_SESSION_ID_PRIVATE" \
   --total-hard-stop-usd 325 \
   > "$POST_SETUP_ACTIVE_SESSION"
 unset GPU_BUDGET_SESSION_ID_PRIVATE
+unset RUNPOD_API_KEY_PRIVATE HF_TOKEN_PRIVATE
 BOOTSTRAP_SUCCEEDED=1

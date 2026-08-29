@@ -18,7 +18,9 @@ from model_forensics.lens_runner import (
     PRIMARY_MODEL_PIN,
     SMOKE_MODEL_PIN,
     JlensTorchSameForwardBackend,
+    LensProbeDesign,
     download_and_load_lens_pair,
+    freeze_causal_probe_design,
     load_pinned_text_runtime,
     verify_software_revisions,
 )
@@ -102,7 +104,7 @@ def freeze_production_compatibility_prefixes(
     if not validated.traces:
         raise ValueError("validated lens inputs contain no selected traces")
     source = validated.traces[0]
-    full = source.sequence_token_ids
+    full = source.sequence_token_ids[: max(source.position_indices.values()) + 1]
     if len(full) < 2:
         raise ValueError("primary compatibility stream is too short to shorten")
     short_length = min(shortened_primary_limit, max(1, len(full) // 2))
@@ -113,6 +115,39 @@ def freeze_production_compatibility_prefixes(
         primary_trace_id=source.trace_id,
         primary_full_token_ids=full,
         primary_short_token_ids=full[:short_length],
+    )
+
+
+def freeze_production_probe_design(
+    validated: ValidatedLensInputs,
+    *,
+    candidate_probe_manifest_hash: str,
+    candidate_probe_manifest_sha256: str,
+    tokenizer_factory: Callable[..., Any] | None = None,
+) -> LensProbeDesign:
+    """Freeze the causal cell mask with the pinned tokenizer and no model load."""
+
+    if tokenizer_factory is None:
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError("Transformers is required for the probe design") from exc
+        tokenizer_factory = AutoTokenizer.from_pretrained
+    tokenizer = tokenizer_factory(
+        PRIMARY_MODEL_PIN.model_id,
+        revision=PRIMARY_MODEL_PIN.revision,
+        trust_remote_code=False,
+        use_fast=True,
+    )
+    return freeze_causal_probe_design(
+        tokenizer,
+        traces=validated.traces,
+        candidate_probe_manifest_hash=candidate_probe_manifest_hash,
+        candidate_probe_manifest_sha256=candidate_probe_manifest_sha256,
+        anchor_manifest_hash=validated.anchor_manifest_hash,
+        anchor_selection_hash=validated.anchor_selection_hash,
+        rollout_manifest_hash=validated.rollout_manifest_hash,
+        position_manifest_hash=validated.position_manifest_hash,
     )
 
 
@@ -177,5 +212,6 @@ __all__ = [
     "assert_primary_lens_config",
     "encode_frozen_4b_compatibility_prefix",
     "freeze_production_compatibility_prefixes",
+    "freeze_production_probe_design",
     "production_runtime_factories",
 ]

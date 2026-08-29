@@ -63,6 +63,7 @@ SMOKE_MODEL_ID = "Qwen/Qwen3.5-4B"
 SMOKE_MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 SMOKE_D_MODEL = 2560
 SMOKE_N_LAYERS = 32
+COMPATIBILITY_ATTEMPT_PREFIX_STREAM = "lens_compatibility_attempt_prefix"
 
 POSITION_ORDER = (
     "prompt_end",
@@ -98,6 +99,168 @@ class CompatibilityGateError(LensExecutionError):
 
 class PrimaryCompatibilityFailure(CompatibilityGateError):
     """The two explicitly limited 122B attempts both failed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeCollision(CanonicalRecord):
+    """One frozen probe found in a cell's exact causal prefix."""
+
+    polarity: Literal["positive", "negative"]
+    word: str
+    token_id: int
+    exact_token_id_present: bool
+    lexical_word_present: bool
+
+    def __post_init__(self) -> None:
+        if self.polarity not in {"positive", "negative"}:
+            raise ValueError("probe collision polarity must be positive or negative")
+        if not self.word or self.token_id < 0:
+            raise ValueError("probe collision word/token ID is invalid")
+        if not (self.exact_token_id_present or self.lexical_word_present):
+            raise ValueError("a probe collision needs token-ID or lexical evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeCellEligibility(CanonicalRecord):
+    """Outcome-blind eligibility of one trace x position x concept cell."""
+
+    trace_id: str
+    position_name: str
+    concept: str
+    token_index: int
+    causal_prefix_token_count: int
+    causal_prefix_token_ids_hash: str
+    probe_eligible: bool
+    probe_ineligibility_reason: str | None
+    collisions: tuple[ProbeCollision, ...]
+    collision_evidence_hash: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "collisions", tuple(self.collisions))
+        if not self.trace_id or self.position_name not in POSITION_ORDER or not self.concept:
+            raise ValueError("probe cell identity is invalid")
+        if self.token_index < 0 or self.causal_prefix_token_count != self.token_index + 1:
+            raise ValueError("probe cell causal-prefix boundary is invalid")
+        if self.probe_eligible:
+            if self.collisions or self.probe_ineligibility_reason is not None:
+                raise ValueError("eligible probe cells may not contain collision evidence")
+            if self.collision_evidence_hash is not None:
+                raise ValueError("eligible probe cells may not have a collision hash")
+        else:
+            if self.probe_ineligibility_reason != "causal_prefix_probe_collision":
+                raise ValueError("ineligible probe cells require the frozen collision reason")
+            if not self.collisions or self.collision_evidence_hash is None:
+                raise ValueError("ineligible probe cells require collision evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class LensProbeDesign:
+    """One fixed probe universe plus a causal, cell-level eligibility mask."""
+
+    model_id: str
+    tokenizer_id: str
+    tokenizer_revision: str
+    candidate_probe_manifest_hash: str
+    candidate_probe_manifest_sha256: str
+    anchor_manifest_hash: str
+    anchor_selection_hash: str
+    rollout_manifest_hash: str
+    position_manifest_hash: str
+    concepts: Mapping[str, ConceptTokenIds]
+    cells: tuple[ProbeCellEligibility, ...]
+    schema_version: int = 1
+    protocol_version: str = "fixed-common-probes-causal-cell-eligibility-v1"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "concepts", dict(self.concepts))
+        object.__setattr__(self, "cells", tuple(self.cells))
+        if set(self.concepts) != set(DEFAULT_CONCEPT_WORDS):
+            raise ValueError("probe design concepts disagree with the frozen universe")
+        for concept, probes in self.concepts.items():
+            if not probes.positive_ids or not probes.negative_ids:
+                raise ConceptValidationError(
+                    f"concept {concept!r} has empty polarity coverage"
+                )
+        identities = [
+            (cell.trace_id, cell.position_name, cell.concept) for cell in self.cells
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("probe design contains duplicate cells")
+
+    def cell_for(self, trace_id: str, position_name: str, concept: str) -> ProbeCellEligibility:
+        matches = [
+            cell
+            for cell in self.cells
+            if (cell.trace_id, cell.position_name, cell.concept)
+            == (trace_id, position_name, concept)
+        ]
+        if len(matches) != 1:
+            raise ProvenanceError(
+                f"probe design has {len(matches)} cells for {trace_id}/{position_name}/{concept}"
+            )
+        return matches[0]
+
+    def to_manifest(self, *, include_hash: bool = True) -> dict[str, Any]:
+        concepts = {
+            concept: {
+                "positive_words": list(probes.positive_words),
+                "positive_token_ids": list(probes.positive_ids),
+                "negative_words": list(probes.negative_words),
+                "negative_token_ids": list(probes.negative_ids),
+            }
+            for concept, probes in self.concepts.items()
+        }
+        cells = [cell.to_dict(include_hash=True) for cell in self.cells]
+        eligible = sum(cell.probe_eligible for cell in self.cells)
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "protocol_version": self.protocol_version,
+            "model_id": self.model_id,
+            "tokenizer_id": self.tokenizer_id,
+            "tokenizer_revision": self.tokenizer_revision,
+            "trust_remote_code": False,
+            "candidate_probe_manifest_hash": self.candidate_probe_manifest_hash,
+            "candidate_probe_manifest_sha256": self.candidate_probe_manifest_sha256,
+            "anchor_manifest_hash": self.anchor_manifest_hash,
+            "anchor_selection_hash": self.anchor_selection_hash,
+            "rollout_manifest_hash": self.rollout_manifest_hash,
+            "position_manifest_hash": self.position_manifest_hash,
+            "position_order": list(POSITION_ORDER),
+            "causal_prefix_rule": "combined_token_ids_zero_through_position_inclusive",
+            "collision_checks": [
+                "exact_token_id",
+                "decoded_casefolded_lexical_word_boundary",
+            ],
+            "collision_action": "whole_trace_position_concept_cell_ineligible",
+            "individual_probe_filtering": False,
+            "empty_polarity_policy": "abort_before_any_model_forward",
+            "forward_input_rule": (
+                "combined_token_ids_zero_through_max_authenticated_position_inclusive"
+            ),
+            "selection_inputs": [
+                "frozen_probe_candidates",
+                "exact_combined_token_ids",
+                "authenticated_position_indices",
+            ],
+            "forbidden_selection_inputs": [
+                "final_estimate",
+                "final_good_side",
+                "resampling_outcomes",
+                "lens_logits",
+            ],
+            "concepts": concepts,
+            "cells": cells,
+            "cell_count": len(cells),
+            "eligible_cell_count": eligible,
+            "ineligible_cell_count": len(cells) - eligible,
+        }
+        if include_hash:
+            payload["manifest_hash"] = stable_hash(payload)
+        return payload
+
+    @property
+    def manifest_hash(self) -> str:
+        return str(self.to_manifest(include_hash=True)["manifest_hash"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +472,7 @@ class CompatibilityAttempt(CanonicalRecord):
     model_id: str
     model_revision: str
     prefix_token_count: int
+    prefix_token_ids_hash: str
     status: Literal["passed", "failed"]
     details: Mapping[str, Any] = field(default_factory=dict)
     error_type: str | None = None
@@ -317,6 +481,12 @@ class CompatibilityAttempt(CanonicalRecord):
     def __post_init__(self) -> None:
         if self.ordinal <= 0 or self.prefix_token_count <= 0:
             raise ValueError("attempt ordinal and prefix length must be positive")
+        if not (
+            isinstance(self.prefix_token_ids_hash, str)
+            and self.prefix_token_ids_hash.startswith("sha256:")
+            and len(self.prefix_token_ids_hash) == len("sha256:") + 64
+        ):
+            raise ValueError("attempt prefix_token_ids_hash must be a namespaced SHA-256")
         object.__setattr__(self, "details", dict(self.details))
 
 
@@ -498,6 +668,168 @@ def _contains_lexical_word(text: str, word: str) -> bool:
         if before_word and after_word:
             return True
         start += 1
+
+
+def causal_probe_collisions(
+    tokenizer: Any,
+    *,
+    causal_token_ids: Sequence[int],
+    probes: ConceptTokenIds,
+) -> tuple[ProbeCollision, ...]:
+    """Recompute exact-ID and lexical collisions from one causal prefix."""
+
+    causal_ids = tuple(int(value) for value in causal_token_ids)
+    prefix_set = set(causal_ids)
+    decoded_folded = _decode_exact_tokens(tokenizer, causal_ids).casefold()
+    collisions: list[ProbeCollision] = []
+    for polarity, words, token_ids in (
+        ("positive", probes.positive_words, probes.positive_ids),
+        ("negative", probes.negative_words, probes.negative_ids),
+    ):
+        for word, token_id in zip(words, token_ids, strict=True):
+            lexical = word.strip().casefold()
+            exact_present = token_id in prefix_set
+            lexical_present = bool(lexical) and _contains_lexical_word(
+                decoded_folded, lexical
+            )
+            if exact_present or lexical_present:
+                collisions.append(
+                    ProbeCollision(
+                        polarity=polarity,  # type: ignore[arg-type]
+                        word=word,
+                        token_id=token_id,
+                        exact_token_id_present=exact_present,
+                        lexical_word_present=lexical_present,
+                    )
+                )
+    return tuple(collisions)
+
+
+def _fixed_probe_universe(
+    tokenizer: Any,
+    *,
+    concept_words: Mapping[str, Mapping[str, Sequence[str]]],
+    frozen_token_ids: Mapping[str, Mapping[str, Sequence[int]]],
+) -> dict[str, ConceptTokenIds]:
+    """Verify the complete candidate universe without adapting it to any trace."""
+
+    if set(concept_words) != set(frozen_token_ids):
+        raise ProvenanceError("concept names disagree with the frozen probe-ID manifest")
+    seen_ids: set[int] = set()
+    concepts: dict[str, ConceptTokenIds] = {}
+    for concept, polarities in concept_words.items():
+        words_by_polarity: dict[str, tuple[str, ...]] = {}
+        ids_by_polarity: dict[str, tuple[int, ...]] = {}
+        for polarity in ("positive", "negative"):
+            words = tuple(polarities.get(polarity, ()))
+            declared = tuple(frozen_token_ids[concept].get(polarity, ()))
+            if not words or len(words) != len(declared):
+                raise ConceptValidationError(
+                    f"concept {concept!r} has empty or mismatched {polarity} coverage"
+                )
+            verified: list[int] = []
+            for word, expected_id in zip(words, declared, strict=True):
+                observed = _encode_probe(tokenizer, word)
+                if len(observed) != 1:
+                    raise ConceptValidationError(
+                        f"probe {word!r} must be one token; observed {len(observed)}"
+                    )
+                token_id = observed[0]
+                if token_id != expected_id:
+                    raise ProvenanceError(
+                        f"probe {word!r} token ID changed: expected {expected_id}, observed {token_id}"
+                    )
+                if token_id in seen_ids:
+                    raise ConceptValidationError(f"frozen probe token ID {token_id} is reused")
+                seen_ids.add(token_id)
+                verified.append(token_id)
+            words_by_polarity[polarity] = words
+            ids_by_polarity[polarity] = tuple(verified)
+        concepts[concept] = ConceptTokenIds(
+            positive_ids=ids_by_polarity["positive"],
+            negative_ids=ids_by_polarity["negative"],
+            positive_words=words_by_polarity["positive"],
+            negative_words=words_by_polarity["negative"],
+        )
+    return concepts
+
+
+def freeze_causal_probe_design(
+    tokenizer: Any,
+    *,
+    traces: Sequence[LensTraceInput],
+    candidate_probe_manifest_hash: str,
+    candidate_probe_manifest_sha256: str,
+    anchor_manifest_hash: str,
+    anchor_selection_hash: str,
+    rollout_manifest_hash: str,
+    position_manifest_hash: str,
+    concept_words: Mapping[str, Mapping[str, Sequence[str]]] = DEFAULT_CONCEPT_WORDS,
+    frozen_token_ids: Mapping[str, Mapping[str, Sequence[int]]] = FROZEN_PROBE_TOKEN_IDS,
+    model_id: str = EXPECTED_MODEL_ID,
+    tokenizer_revision: str = PRIMARY_MODEL_REVISION,
+) -> LensProbeDesign:
+    """Freeze one common universe and a prefix-local collision mask.
+
+    Eligibility for a cell sees exactly the activation's causal prefix.  A
+    collision invalidates the entire concept cell; individual probes are never
+    removed or reweighted.
+    """
+
+    if not traces:
+        raise ValueError("at least one frozen trace is required for the probe design")
+    if len({trace.trace_id for trace in traces}) != len(traces):
+        raise ValueError("probe-design trace IDs must be unique")
+    concepts = _fixed_probe_universe(
+        tokenizer,
+        concept_words=concept_words,
+        frozen_token_ids=frozen_token_ids,
+    )
+    cells: list[ProbeCellEligibility] = []
+    for trace in traces:
+        sequence_ids = trace.sequence_token_ids
+        for position_name in POSITION_ORDER:
+            token_index = trace.position_indices[position_name]
+            causal_ids = sequence_ids[: token_index + 1]
+            causal_hash = token_stream_hash(causal_ids, stream="lens_causal_prefix")
+            for concept, probes in concepts.items():
+                collisions = causal_probe_collisions(
+                    tokenizer,
+                    causal_token_ids=causal_ids,
+                    probes=probes,
+                )
+                collision_hash = None
+                if collisions:
+                    collision_hash = stable_hash([item.to_dict() for item in collisions])
+                cells.append(
+                    ProbeCellEligibility(
+                        trace_id=trace.trace_id,
+                        position_name=position_name,
+                        concept=concept,
+                        token_index=token_index,
+                        causal_prefix_token_count=len(causal_ids),
+                        causal_prefix_token_ids_hash=causal_hash,
+                        probe_eligible=not collisions,
+                        probe_ineligibility_reason=(
+                            None if not collisions else "causal_prefix_probe_collision"
+                        ),
+                        collisions=collisions,
+                        collision_evidence_hash=collision_hash,
+                    )
+                )
+    return LensProbeDesign(
+        model_id=model_id,
+        tokenizer_id=model_id,
+        tokenizer_revision=tokenizer_revision,
+        candidate_probe_manifest_hash=candidate_probe_manifest_hash,
+        candidate_probe_manifest_sha256=candidate_probe_manifest_sha256,
+        anchor_manifest_hash=anchor_manifest_hash,
+        anchor_selection_hash=anchor_selection_hash,
+        rollout_manifest_hash=rollout_manifest_hash,
+        position_manifest_hash=position_manifest_hash,
+        concepts=concepts,
+        cells=tuple(cells),
+    )
 
 
 def _model_geometry(hf_model: Any) -> tuple[int | None, int | None]:
@@ -874,8 +1206,7 @@ def analyze_trace_same_forward(
     runtime: ModelRuntime,
     lenses: Sequence[LoadedLens],
     backend: SameForwardBackend,
-    concept_words: Mapping[str, Mapping[str, Sequence[str]]] = DEFAULT_CONCEPT_WORDS,
-    frozen_token_ids: Mapping[str, Mapping[str, Sequence[int]]] = FROZEN_PROBE_TOKEN_IDS,
+    probe_design: LensProbeDesign,
     layers: Sequence[int] = FITTED_LAYERS,
 ) -> list[LensRecord]:
     """Read both lenses from one exact-token forward and emit long-form rows."""
@@ -889,18 +1220,17 @@ def analyze_trace_same_forward(
         or not set(normalized_layers).issubset(FITTED_LAYERS)
     ):
         raise LensExecutionError("layers must be unique, sorted, and within fitted layers 4..46")
-    exact_ids = trace.sequence_token_ids
+    if probe_design.model_id != runtime.model_id:
+        raise ProvenanceError("probe design model disagrees with the primary runtime")
+    full_ids = trace.sequence_token_ids
+    forward_end = max(trace.position_indices.values()) + 1
+    exact_ids = full_ids[:forward_end]
     if len(exact_ids) > PRIMARY_MAX_SEQUENCE_TOKENS:
         raise LensExecutionError(
             f"trace has {len(exact_ids)} tokens; primary cap is {PRIMARY_MAX_SEQUENCE_TOKENS}"
         )
     _validate_named_positions(trace.position_indices, len(exact_ids))
-    concepts = freeze_prefix_absent_probes(
-        runtime.tokenizer,
-        exact_prefix_token_ids=exact_ids,
-        concept_words=concept_words,
-        frozen_token_ids=frozen_token_ids,
-    )
+    concepts = probe_design.concepts
     ordered_positions = tuple(trace.position_indices[name] for name in POSITION_ORDER)
     captured = backend.capture_once(
         runtime,
@@ -919,6 +1249,15 @@ def analyze_trace_same_forward(
 
     records: list[LensRecord] = []
     prefix_digest = _token_prefix_sha256(exact_ids)
+    forward_hash = token_stream_hash(exact_ids, stream="lens_forward_input")
+    probe_design_hash = probe_design.manifest_hash
+    eligibility_by_cell = {
+        (cell.position_name, cell.concept): cell
+        for cell in probe_design.cells
+        if cell.trace_id == trace.trace_id
+    }
+    if len(eligibility_by_cell) != len(POSITION_ORDER) * len(concepts):
+        raise ProvenanceError("probe design lacks the complete trace cell inventory")
     for lens_type in ("J", "R"):
         handle = by_type[lens_type]
         for layer in normalized_layers:
@@ -935,15 +1274,33 @@ def analyze_trace_same_forward(
                     raise LensExecutionError(
                         f"{lens_type}-lens layer {layer} omitted position row {offset}"
                     ) from exc
-                for contrast, raw_value in signed_mean_logit_contrasts(logits, concepts).items():
-                    if not math.isfinite(raw_value):
-                        raise LensExecutionError("lens contrast is non-finite")
-                    token_ids = concepts[contrast]
-                    signed_value = (
-                        raw_value * trace.good_side_direction
-                        if contrast == "direction"
-                        else raw_value
+                for contrast, token_ids in concepts.items():
+                    eligibility = eligibility_by_cell[(position_name, contrast)]
+                    expected_prefix = full_ids[: trace.position_indices[position_name] + 1]
+                    expected_prefix_hash = token_stream_hash(
+                        expected_prefix, stream="lens_causal_prefix"
                     )
+                    if (
+                        eligibility.token_index != trace.position_indices[position_name]
+                        or eligibility.causal_prefix_token_count != len(expected_prefix)
+                        or eligibility.causal_prefix_token_ids_hash != expected_prefix_hash
+                    ):
+                        raise ProvenanceError(
+                            "probe eligibility disagrees with the authenticated causal prefix"
+                        )
+                    raw_value: float | None = None
+                    signed_value: float | None = None
+                    if eligibility.probe_eligible:
+                        raw_value = signed_mean_logit_contrasts(
+                            logits, {contrast: token_ids}
+                        )[contrast]
+                        if not math.isfinite(raw_value):
+                            raise LensExecutionError("lens contrast is non-finite")
+                        signed_value = (
+                            raw_value * trace.good_side_direction
+                            if contrast == "direction"
+                            else raw_value
+                        )
                     records.append(
                         LensRecord(
                             trace_id=trace.trace_id,
@@ -962,6 +1319,15 @@ def analyze_trace_same_forward(
                             good_side_direction=trace.good_side_direction,
                             positive_token_ids=token_ids.positive_ids,
                             negative_token_ids=token_ids.negative_ids,
+                            probe_design_hash=probe_design_hash,
+                            probe_eligibility_record_hash=eligibility.record_hash,
+                            probe_eligible=eligibility.probe_eligible,
+                            probe_ineligibility_reason=eligibility.probe_ineligibility_reason,
+                            collision_evidence_hash=eligibility.collision_evidence_hash,
+                            causal_prefix_token_ids_hash=expected_prefix_hash,
+                            causal_prefix_token_count=len(expected_prefix),
+                            forward_input_token_ids_hash=forward_hash,
+                            forward_input_token_count=len(exact_ids),
                         )
                     )
     return records
@@ -971,7 +1337,7 @@ def canonical_lens_record(record: LensRecord) -> dict[str, Any]:
     """Serialize a ``LensRecord`` with an explicit schema and content hash."""
 
     payload = asdict(record)
-    payload["schema_version"] = 1
+    payload["schema_version"] = 2
     payload["record_hash"] = stable_hash(payload)
     return payload
 
@@ -982,6 +1348,7 @@ def execute_lens_traces(
     runtime: ModelRuntime,
     lenses: Sequence[LoadedLens],
     backend: SameForwardBackend,
+    probe_design: LensProbeDesign,
     output_path: str | Path | None = None,
     layers: Sequence[int] = FITTED_LAYERS,
 ) -> list[LensRecord]:
@@ -999,6 +1366,7 @@ def execute_lens_traces(
                 runtime=runtime,
                 lenses=lenses,
                 backend=backend,
+                probe_design=probe_design,
                 layers=layers,
             )
         )
@@ -1049,6 +1417,7 @@ def run_122b_preflight(
     *,
     token_ids: Sequence[int],
     backend: SameForwardBackend,
+    probe_design: LensProbeDesign | None = None,
 ) -> Mapping[str, Any]:
     """One exact-prefix forward followed by both transports at two layers."""
 
@@ -1060,9 +1429,13 @@ def run_122b_preflight(
             f"122B preflight prefix must contain 1..{PRIMARY_MAX_SEQUENCE_TOKENS} tokens"
         )
     layers = (FITTED_LAYERS[0], FITTED_LAYERS[-1])
-    concepts = freeze_prefix_absent_probes(
-        runtime.tokenizer,
-        exact_prefix_token_ids=ids,
+    concepts = (
+        probe_design.concepts
+        if probe_design is not None
+        else freeze_prefix_absent_probes(
+            runtime.tokenizer,
+            exact_prefix_token_ids=ids,
+        )
     )
     captured = backend.capture_once(
         runtime,
@@ -1145,6 +1518,9 @@ def run_ordered_compatibility_gate(
                 model_id=SMOKE_MODEL_ID,
                 model_revision=SMOKE_MODEL_REVISION,
                 prefix_token_count=len(smoke_ids),
+                prefix_token_ids_hash=token_stream_hash(
+                    smoke_ids, stream=COMPATIBILITY_ATTEMPT_PREFIX_STREAM
+                ),
                 status="failed",
                 error_type=type(exc).__name__,
                 error_message=str(exc),
@@ -1160,6 +1536,9 @@ def run_ordered_compatibility_gate(
             model_id=SMOKE_MODEL_ID,
             model_revision=SMOKE_MODEL_REVISION,
             prefix_token_count=len(smoke_ids),
+            prefix_token_ids_hash=token_stream_hash(
+                smoke_ids, stream=COMPATIBILITY_ATTEMPT_PREFIX_STREAM
+            ),
             status="passed",
             details=details,
         )
@@ -1181,6 +1560,9 @@ def run_ordered_compatibility_gate(
                     model_id=EXPECTED_MODEL_ID,
                     model_revision=PRIMARY_MODEL_REVISION,
                     prefix_token_count=len(ids),
+                    prefix_token_ids_hash=token_stream_hash(
+                        ids, stream=COMPATIBILITY_ATTEMPT_PREFIX_STREAM
+                    ),
                     status="failed",
                     error_type=type(exc).__name__,
                     error_message=str(exc),
@@ -1195,6 +1577,9 @@ def run_ordered_compatibility_gate(
                 model_id=EXPECTED_MODEL_ID,
                 model_revision=PRIMARY_MODEL_REVISION,
                 prefix_token_count=len(ids),
+                prefix_token_ids_hash=token_stream_hash(
+                    ids, stream=COMPATIBILITY_ATTEMPT_PREFIX_STREAM
+                ),
                 status="passed",
                 details=details,
             )
@@ -1218,6 +1603,7 @@ def write_compatibility_manifest(
 
 
 __all__ = [
+    "COMPATIBILITY_ATTEMPT_PREFIX_STREAM",
     "FROZEN_PROBE_TOKEN_IDS",
     "JLENS_REVISION",
     "POSITION_ORDER",
@@ -1237,16 +1623,21 @@ __all__ = [
     "JlensTorchSameForwardBackend",
     "LensArtifactPin",
     "LensCompatibilityManifest",
+    "LensProbeDesign",
     "LensTraceInput",
     "ModelPin",
     "PinnedModelRuntime",
     "PrimaryCompatibilityFailure",
+    "ProbeCellEligibility",
+    "ProbeCollision",
     "SameForwardBackend",
     "VerifiedLensPair",
     "analyze_trace_same_forward",
     "canonical_lens_record",
+    "causal_probe_collisions",
     "download_and_load_lens_pair",
     "execute_lens_traces",
+    "freeze_causal_probe_design",
     "freeze_prefix_absent_probes",
     "installed_vcs_revision",
     "load_pinned_text_runtime",

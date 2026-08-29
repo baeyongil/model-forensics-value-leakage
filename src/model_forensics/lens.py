@@ -122,11 +122,20 @@ class LensRecord:
     position_name: str
     token_index: int
     contrast: str
-    raw_mean_logit_contrast: float
-    signed_mean_logit_contrast: float
+    raw_mean_logit_contrast: float | None
+    signed_mean_logit_contrast: float | None
     good_side_direction: Literal[-1, 1]
     positive_token_ids: tuple[int, ...]
     negative_token_ids: tuple[int, ...]
+    probe_design_hash: str | None = None
+    probe_eligibility_record_hash: str | None = None
+    probe_eligible: bool = True
+    probe_ineligibility_reason: str | None = None
+    collision_evidence_hash: str | None = None
+    causal_prefix_token_ids_hash: str | None = None
+    causal_prefix_token_count: int | None = None
+    forward_input_token_ids_hash: str | None = None
+    forward_input_token_count: int | None = None
     evidence_scope: str = field(default="observational_readout", init=False)
     causal_claim: bool = field(default=False, init=False)
 

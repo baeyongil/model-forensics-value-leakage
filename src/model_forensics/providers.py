@@ -14,24 +14,35 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal
+from pathlib import Path
 from typing import Any
 
 from model_forensics.adjudication import (
     AdjudicationRequest,
     JudgeProvenance,
 )
-from model_forensics.budget import CostEntry, CostLedger
+from model_forensics.budget import BudgetExceeded, CostEntry, CostLedger
 from model_forensics.classification import ModelProvenance
 from model_forensics.io import canonical_json, stable_hash
 from model_forensics.paid_response_store import PaidResponseStore
 
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 _MESSAGE_OVERHEAD_TOKEN_BOUND = 64
+
+
+def _ceil_usd_six(value: float) -> float:
+    """Match ledger precision without rounding a conservative amount downward."""
+
+    return float(Decimal(str(value)).quantize(Decimal("0.000001"), rounding=ROUND_CEILING))
 
 
 class ProviderError(RuntimeError):
@@ -80,6 +91,529 @@ class HTTPResult:
 
 
 Transport = Callable[[str, Mapping[str, str], Mapping[str, Any], float], HTTPResult]
+PaidResponseStoreIdentity = tuple[str, int, int, int, int, int, int]
+
+
+def _api_reservation_id(
+    *,
+    store_key: str,
+    store_identity: PaidResponseStoreIdentity | None,
+) -> str:
+    return stable_hash(
+        {
+            "protocol": "openrouter-api-reservation-v2",
+            "store_key": store_key,
+            "paid_response_store_identity": (
+                list(store_identity) if store_identity is not None else None
+            ),
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRouterRequestSpec:
+    """One exact, secret-free OpenRouter request used for phase budgeting.
+
+    The object contains the actual system and user strings so the phase gate and
+    :class:`OpenRouterJSONClient` price precisely the same payload.  Only hashes
+    of those strings enter the public-ish paid plan.
+    """
+
+    route: str
+    model_id: str
+    price: TokenPrice
+    request_id: str
+    purpose: str
+    user_content: str
+    paid_response_store: PaidResponseStore
+    system_prompt: str | None = None
+    model_revision: str | None = None
+    endpoint: str = OPENROUTER_ENDPOINT
+    max_output_tokens: int = 512
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.route, str) or not self.route:
+            raise ValueError("request route must be non-empty")
+        if not isinstance(self.model_id, str) or not self.model_id:
+            raise ValueError("request model_id must be non-empty")
+        if not isinstance(self.request_id, str) or not self.request_id:
+            raise ValueError("request_id must be a non-empty opaque string")
+        if not isinstance(self.user_content, str) or not self.user_content:
+            raise ValueError("user_content must be non-empty")
+        if self.system_prompt is not None and not isinstance(self.system_prompt, str):
+            raise TypeError("system_prompt must be a string or None")
+        if not isinstance(self.purpose, str) or _PURPOSE_RE.fullmatch(self.purpose) is None:
+            raise ValueError("purpose must be a short lowercase identifier")
+        if (
+            isinstance(self.max_output_tokens, bool)
+            or not isinstance(self.max_output_tokens, int)
+            or self.max_output_tokens <= 0
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
+
+    @property
+    def decoding(self) -> dict[str, Any]:
+        return _openrouter_decoding(self.max_output_tokens)
+
+    @property
+    def store_key(self) -> str:
+        return PaidResponseStore.key(
+            request_id=self.request_id,
+            model_id=self.model_id,
+            purpose=self.purpose,
+        )
+
+    @property
+    def request_fingerprint(self) -> str:
+        return PaidResponseStore.fingerprint(
+            endpoint=self.endpoint,
+            model_id=self.model_id,
+            purpose=self.purpose,
+            system_prompt=self.system_prompt,
+            user_content=self.user_content,
+            decoding=self.decoding,
+        )
+
+    @property
+    def reservation_id(self) -> str:
+        return _api_reservation_id(
+            store_key=self.store_key,
+            store_identity=self.paid_response_store.identity(),
+        )
+
+    @property
+    def input_token_upper_bound(self) -> int:
+        return _openrouter_input_token_upper_bound(
+            system_prompt=self.system_prompt,
+            user_content=self.user_content,
+        )
+
+    @property
+    def conservative_cost_usd(self) -> float:
+        # CostLedger normalizes each individual reservation to six decimals.
+        # Summing those exact normalized amounts makes the phase boundary agree
+        # with the later per-call budget gates, including equality at the cap.
+        return _ceil_usd_six(self.price.cost(self.input_token_upper_bound, self.max_output_tokens))
+
+    @property
+    def request_manifest(self) -> dict[str, Any]:
+        return {
+            "route": self.route,
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "purpose": self.purpose,
+            "logical_request_hash": stable_hash(self.request_id),
+            "store_key": self.store_key,
+            "request_fingerprint": self.request_fingerprint,
+            "payload_hash": stable_hash(
+                {
+                    "system_prompt": self.system_prompt,
+                    "user_content": self.user_content,
+                }
+            ),
+            "decoding": self.decoding,
+            "pricing_usd_per_million_tokens": {
+                "input": float(self.price.input_per_million),
+                "output": float(self.price.output_per_million),
+            },
+            "input_token_upper_bound": self.input_token_upper_bound,
+            "max_output_tokens": self.max_output_tokens,
+            "conservative_cost_usd": self.conservative_cost_usd,
+            "reservation_id": self.reservation_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRouterPhasePreflight:
+    """Authenticated cost-to-completion result for one whole paid API phase."""
+
+    phase: str
+    requests: tuple[OpenRouterRequestSpec, ...]
+    paid_response_store_identities: tuple[PaidResponseStoreIdentity, ...]
+    manifest: Mapping[str, Any]
+
+    @property
+    def manifest_hash(self) -> str:
+        value = self.manifest.get("manifest_hash")
+        if not isinstance(value, str):  # pragma: no cover - constructor invariant
+            raise ProviderError("API completion preflight lacks a manifest hash")
+        return value
+
+    def assert_manifest(self, expected: Mapping[str, Any]) -> None:
+        """Reject a modified or substituted inventory before any provider call."""
+
+        observed = dict(expected)
+        supplied_hash = observed.pop("manifest_hash", None)
+        if supplied_hash != stable_hash(observed) or dict(expected) != dict(self.manifest):
+            raise ProviderError("API completion inventory manifest mismatch")
+
+
+def _request_identity(spec: OpenRouterRequestSpec) -> str:
+    return stable_hash(
+        {
+            "protocol": "openrouter-exact-dispatch-identity-v1",
+            "request_manifest": spec.request_manifest,
+        }
+    )
+
+
+def _paid_response_store_identity(store: PaidResponseStore) -> PaidResponseStoreIdentity:
+    try:
+        return store.identity()
+    except (OSError, RuntimeError) as exc:
+        raise ProviderError("paid-response store identity is unavailable") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRouterDispatchAuthorization:
+    request_identity: str
+    frozen_status: str
+    paid_response_store_identity: PaidResponseStoreIdentity
+
+
+class OpenRouterDispatchGuard:
+    """Consume only exact logical calls frozen by a whole-phase preflight."""
+
+    def __init__(self, preflight: OpenRouterPhasePreflight) -> None:
+        preflight.assert_manifest(preflight.manifest)
+        request_rows = [spec.request_manifest for spec in preflight.requests]
+        if preflight.manifest.get("full_inventory_hash") != stable_hash(
+            {"phase": preflight.phase, "logical_request_manifests": request_rows}
+        ):
+            raise ProviderError("dispatch guard request inventory disagrees with preflight")
+        self.phase = preflight.phase
+        cached = preflight.manifest.get("authenticated_cached_request_identities")
+        pending = preflight.manifest.get("pending_request_identities")
+        if not isinstance(cached, list) or not isinstance(pending, list):
+            raise ProviderError("dispatch guard preflight statuses are absent")
+        cached_set = set(cached)
+        pending_set = set(pending)
+        if cached_set & pending_set:
+            raise ProviderError("dispatch guard preflight statuses overlap")
+        expected_identities = {_request_identity(spec) for spec in preflight.requests}
+        if cached_set | pending_set != expected_identities:
+            raise ProviderError("dispatch guard preflight statuses are incomplete")
+        if len(preflight.paid_response_store_identities) != len(preflight.requests):
+            raise ProviderError("dispatch guard store inventory is incomplete")
+        store_identity_hashes = [
+            stable_hash(
+                {
+                    "protocol": "paid-response-store-identity-v2",
+                    "identity": list(identity),
+                }
+            )
+            for identity in preflight.paid_response_store_identities
+        ]
+        if preflight.manifest.get("paid_response_store_identities_hash") != stable_hash(
+            store_identity_hashes
+        ):
+            raise ProviderError("dispatch guard store inventory disagrees with preflight")
+        self._remaining: dict[str, list[OpenRouterDispatchAuthorization]] = {}
+        for spec, store_identity in zip(
+            preflight.requests,
+            preflight.paid_response_store_identities,
+            strict=True,
+        ):
+            identity = _request_identity(spec)
+            if identity in cached_set:
+                status = "authenticated_paid_response"
+            elif identity in pending_set:
+                status = "pending"
+            else:
+                raise ProviderError("dispatch guard request lacks a frozen preflight status")
+            self._remaining.setdefault(identity, []).append(
+                OpenRouterDispatchAuthorization(
+                    request_identity=identity,
+                    frozen_status=status,
+                    paid_response_store_identity=store_identity,
+                )
+            )
+        self._lock = threading.Lock()
+
+    def authorize(self, spec: OpenRouterRequestSpec) -> OpenRouterDispatchAuthorization:
+        identity = _request_identity(spec)
+        with self._lock:
+            remaining = self._remaining.get(identity)
+            if not remaining:
+                raise ProviderError(
+                    "provider request is not present in the authorized phase inventory"
+                )
+            authorization = remaining[-1]
+            if (
+                _paid_response_store_identity(spec.paid_response_store)
+                != authorization.paid_response_store_identity
+            ):
+                raise ProviderError(
+                    "provider request paid-response store identity changed after preflight"
+                )
+            remaining.pop()
+        return authorization
+
+
+def _openrouter_decoding(max_output_tokens: int) -> dict[str, Any]:
+    return {
+        "temperature": 0,
+        "max_tokens": max_output_tokens,
+        "response_format": "json_object",
+        "preflight_input_bound": "one_token_per_utf8_byte_plus_64_per_message",
+    }
+
+
+def _openrouter_input_token_upper_bound(
+    *,
+    system_prompt: str | None,
+    user_content: str,
+) -> int:
+    message_count = 1 + int(bool(system_prompt))
+    return (
+        len((system_prompt or "").encode("utf-8"))
+        + len(user_content.encode("utf-8"))
+        + _MESSAGE_OVERHEAD_TOKEN_BOUND * message_count
+    )
+
+
+def _reservation_description(spec: OpenRouterRequestSpec) -> str:
+    return f"preflight OpenRouter {spec.purpose} {stable_hash(spec.request_id)}"
+
+
+def preflight_openrouter_phase(
+    *,
+    phase: str,
+    requests: Sequence[OpenRouterRequestSpec],
+    ledger: CostLedger,
+) -> OpenRouterPhasePreflight:
+    """Gate the complete remaining phase before its first provider request.
+
+    Every exact request is fingerprinted first.  Only a checkpoint that passes
+    :meth:`PaidResponseStore.load` for that exact fingerprint is excluded.  An
+    exact duplicate invocation within the same route/store is counted once as a
+    future paid transport because the first response will durably satisfy all
+    later identical invocations.
+    """
+
+    if not isinstance(phase, str) or not phase:
+        raise ValueError("API phase must be non-empty")
+    frozen = tuple(requests)
+    paid_response_store_identities = tuple(
+        _paid_response_store_identity(spec.paid_response_store) for spec in frozen
+    )
+    reservation_store_identities: dict[str, PaidResponseStoreIdentity] = {}
+    for spec, store_identity in zip(
+        frozen,
+        paid_response_store_identities,
+        strict=True,
+    ):
+        previous = reservation_store_identities.setdefault(
+            spec.reservation_id,
+            store_identity,
+        )
+        if previous != store_identity:
+            raise ProviderError(
+                "one API reservation identity maps to multiple paid-response stores"
+            )
+    paid_response_store_identity_hashes = [
+        stable_hash(
+            {
+                "protocol": "paid-response-store-identity-v2",
+                "identity": list(identity),
+            }
+        )
+        for identity in paid_response_store_identities
+    ]
+    request_rows = [spec.request_manifest for spec in frozen]
+    full_inventory_hash = stable_hash({"phase": phase, "logical_request_manifests": request_rows})
+
+    unique: dict[tuple[str, str], OpenRouterRequestSpec] = {}
+    invocation_counts: Counter[tuple[str, str]] = Counter()
+    route_store_directories: dict[str, Path] = {}
+    for spec in frozen:
+        directory = Path(_paid_response_store_identity(spec.paid_response_store)[0])
+        previous_directory = route_store_directories.setdefault(spec.route, directory)
+        if previous_directory != directory:
+            raise ProviderError("one API inventory route maps to multiple response stores")
+        key = (spec.route, spec.store_key)
+        previous = unique.get(key)
+        if previous is not None and previous.request_manifest != spec.request_manifest:
+            raise ProviderError("API inventory store-key collision has different exact payloads")
+        unique.setdefault(key, spec)
+        invocation_counts[key] += 1
+
+    cached_rows: list[dict[str, Any]] = []
+    pending_specs: list[OpenRouterRequestSpec] = []
+    unique_rows: list[dict[str, Any]] = []
+    for key, spec in unique.items():
+        cached = spec.paid_response_store.load(
+            key=spec.store_key,
+            request_fingerprint=spec.request_fingerprint,
+        )
+        row = {
+            **spec.request_manifest,
+            "logical_invocation_count": invocation_counts[key],
+            "status": "authenticated_paid_response" if cached is not None else "pending",
+            "paid_response_checkpoint_hash": (
+                str(cached["record_hash"]) if cached is not None else None
+            ),
+        }
+        unique_rows.append(row)
+        if cached is None:
+            pending_specs.append(spec)
+        else:
+            cached_rows.append(row)
+
+    pending_bound = round(sum(spec.conservative_cost_usd for spec in pending_specs), 6)
+    reservations = tuple(
+        (
+            spec.reservation_id,
+            CostEntry(
+                kind="api",
+                amount_usd=spec.conservative_cost_usd,
+                description=_reservation_description(spec),
+                status="estimated",
+            ),
+        )
+        for spec in pending_specs
+    )
+    try:
+        reservation = ledger.reserve_batch(
+            reservations,
+            required_existing_entry_ids=tuple(
+                spec.reservation_id for spec in unique.values() if spec not in pending_specs
+            ),
+            reject_incurred_entry_ids=tuple(spec.reservation_id for spec in pending_specs),
+        )
+    except BudgetExceeded as exc:
+        raise BudgetExceeded(f"whole API phase cannot be reserved atomically: {exc}") from exc
+    except ValueError as exc:
+        raise ProviderError(str(exc)) from exc
+
+    document = ledger.document()
+    entries_by_id = {
+        str(entry["entry_id"]): entry
+        for entry in document["entries"]
+        if isinstance(entry.get("entry_id"), str)
+    }
+    pending_ids = {spec.reservation_id for spec in pending_specs}
+    for spec in unique.values():
+        entry = entries_by_id.get(spec.reservation_id)
+        if entry is None:  # pragma: no cover - atomic reservation invariant
+            raise ProviderError("API request lacks its matching ledger reservation")
+        if spec.reservation_id in pending_ids:
+            if (
+                entry.get("status") != "estimated"
+                or entry.get("kind") != "api"
+                or float(entry.get("amount_usd", -1)) != spec.conservative_cost_usd
+                or entry.get("description") != _reservation_description(spec)
+            ):
+                raise ProviderError(
+                    "existing API reservation differs from the exact pending request"
+                )
+            continue
+        request_hash = stable_hash(spec.request_id)
+        estimated_matches = bool(
+            entry.get("status") == "estimated"
+            and entry.get("kind") == "api"
+            and float(entry.get("amount_usd", -1)) == spec.conservative_cost_usd
+            and entry.get("description") == _reservation_description(spec)
+        )
+        incurred_matches = bool(
+            entry.get("status") == "incurred"
+            and entry.get("kind") == "api"
+            and entry.get("description") == f"OpenRouter {spec.purpose} {request_hash}"
+        )
+        if not (estimated_matches or incurred_matches):
+            raise ProviderError("authenticated paid response has a mismatched ledger reservation")
+
+    created_ids = set(reservation.created_entry_ids)
+    additional = round(
+        sum(
+            spec.conservative_cost_usd
+            for spec in pending_specs
+            if spec.reservation_id in created_ids
+        ),
+        6,
+    )
+    covered = round(pending_bound - additional, 6)
+    projected_api = reservation.committed_after["api"]
+    projected_total = reservation.committed_after["total"]
+
+    route_names = sorted({spec.route for spec in frozen})
+    per_route: dict[str, Any] = {}
+    for route in route_names:
+        route_invocations = [spec for spec in frozen if spec.route == route]
+        route_unique = [row for row in unique_rows if row["route"] == route]
+        route_pending = [row for row in route_unique if row["status"] == "pending"]
+        per_route[route] = {
+            "logical_invocation_count": len(route_invocations),
+            "unique_request_count": len(route_unique),
+            "authenticated_cached_count": len(route_unique) - len(route_pending),
+            "pending_request_count": len(route_pending),
+            "pending_conservative_usd": round(
+                sum(float(row["conservative_cost_usd"]) for row in route_pending), 6
+            ),
+        }
+
+    pending_rows = [row for row in unique_rows if row["status"] == "pending"]
+    unique_request_identities = sorted(_request_identity(spec) for spec in unique.values())
+    pending_request_identities = sorted(_request_identity(spec) for spec in pending_specs)
+    cached_request_identities = sorted(
+        set(unique_request_identities) - set(pending_request_identities)
+    )
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol_version": "openrouter-phase-cost-to-completion-v1",
+        "phase": phase,
+        "logical_invocation_count": len(frozen),
+        "unique_request_count": len(unique_rows),
+        "authenticated_cached_count": len(cached_rows),
+        "pending_request_count": len(pending_rows),
+        "full_inventory_hash": full_inventory_hash,
+        "unique_inventory_hash": stable_hash(unique_rows),
+        "pending_inventory_hash": stable_hash(pending_rows),
+        "paid_response_store_identities_hash": stable_hash(paid_response_store_identity_hashes),
+        "unique_request_identities": unique_request_identities,
+        "pending_request_identities": pending_request_identities,
+        "authenticated_cached_request_identities": cached_request_identities,
+        "per_route": per_route,
+        "conservative_pending_usd": pending_bound,
+        "covered_by_existing_reservations_usd": covered,
+        "additional_commitment_required_usd": additional,
+        "ledger": {
+            "document_hash": stable_hash(document),
+            "document_before_hash": reservation.document_before_hash,
+            "document_after_hash": reservation.document_after_hash,
+            "incurred_before_usd": reservation.incurred_before,
+            "committed_before_usd": reservation.committed_before,
+            "committed_after_reservation_usd": reservation.committed_after,
+            "created_reservation_ids_hash": stable_hash(sorted(reservation.created_entry_ids)),
+            "covered_reservation_ids_hash": stable_hash(sorted(reservation.covered_entry_ids)),
+            "hard_stops_usd": {
+                "api": float(ledger.limits.api),
+                "total": float(ledger.limits.total),
+            },
+            "remaining_before_usd": {
+                "api": round(float(ledger.limits.api) - reservation.committed_before["api"], 6),
+                "total": round(
+                    float(ledger.limits.total) - reservation.committed_before["total"], 6
+                ),
+            },
+            "projected_after_completion_usd": {
+                "api": projected_api,
+                "total": projected_total,
+            },
+        },
+    }
+    payload["manifest_hash"] = stable_hash(payload)
+    if (
+        tuple(_paid_response_store_identity(spec.paid_response_store) for spec in frozen)
+        != paid_response_store_identities
+    ):
+        raise ProviderError("paid-response store identity changed during API preflight")
+    return OpenRouterPhasePreflight(
+        phase=phase,
+        requests=frozen,
+        paid_response_store_identities=paid_response_store_identities,
+        manifest=payload,
+    )
 
 
 def _default_transport(
@@ -167,15 +701,25 @@ class OpenRouterJSONClient:
         endpoint: str = OPENROUTER_ENDPOINT,
         max_output_tokens: int = 512,
         timeout_seconds: float = 120.0,
-        max_attempts: int = 3,
+        max_attempts: int = 1,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         paid_response_store: PaidResponseStore | None = None,
+        dispatch_guard: OpenRouterDispatchGuard | None = None,
+        dispatch_route: str | None = None,
     ) -> None:
         if not model_id:
             raise ValueError("model_id must not be empty")
         if max_output_tokens <= 0 or max_attempts <= 0 or timeout_seconds <= 0:
             raise ValueError("output limit, attempts, and timeout must be positive")
+        if max_attempts != 1:
+            raise ValueError("automatic paid-provider retries are disabled; max_attempts must be 1")
+        if (dispatch_guard is None) != (dispatch_route is None):
+            raise ValueError("dispatch guard and route must be supplied together")
+        if dispatch_route is not None and not dispatch_route:
+            raise ValueError("dispatch route must be non-empty")
+        if dispatch_guard is not None and paid_response_store is None:
+            raise ValueError("guarded production dispatch requires a paid-response store")
         api_key = os.environ.get(api_key_env)
         if not api_key:
             raise RuntimeError(f"required secret environment variable is unset: {api_key_env}")
@@ -191,6 +735,8 @@ class OpenRouterJSONClient:
         self._transport = transport or _default_transport
         self._sleep = sleep
         self._paid_response_store = paid_response_store
+        self._dispatch_guard = dispatch_guard
+        self._dispatch_route = dispatch_route
         self._last_metadata: dict[str, Any] = {"calls_completed": 0}
         self._audit_records: list[dict[str, Any]] = []
 
@@ -204,12 +750,7 @@ class OpenRouterJSONClient:
 
     @property
     def decoding(self) -> dict[str, Any]:
-        return {
-            "temperature": 0,
-            "max_tokens": self._max_output_tokens,
-            "response_format": "json_object",
-            "preflight_input_bound": "one_token_per_character_plus_64_per_message",
-        }
+        return _openrouter_decoding(self._max_output_tokens)
 
     @property
     def pricing(self) -> dict[str, float]:
@@ -296,15 +837,13 @@ class OpenRouterJSONClient:
         user_content: str,
         reservation_id: str,
     ) -> float:
-        # One UTF-8 character per token is deliberately conservative for these
-        # English-only instruments and protects the cap before the request leaves.
-        message_count = 1 + int(bool(system_prompt))
-        input_upper_bound = (
-            len(system_prompt or "")
-            + len(user_content)
-            + _MESSAGE_OVERHEAD_TOKEN_BOUND * message_count
+        # One token per UTF-8 byte is a tokenizer-independent upper bound for
+        # arbitrary Unicode payloads under byte-fallback vocabularies.
+        input_upper_bound = _openrouter_input_token_upper_bound(
+            system_prompt=system_prompt,
+            user_content=user_content,
         )
-        predicted = self._price.cost(input_upper_bound, self._max_output_tokens)
+        predicted = _ceil_usd_six(self._price.cost(input_upper_bound, self._max_output_tokens))
         request_hash = stable_hash(request_id)
         self._ledger.reserve(
             reservation_id,
@@ -361,23 +900,13 @@ class OpenRouterJSONClient:
             user_content=user_content,
             decoding=self.decoding,
         )
-        reservation_id = stable_hash(
-            {"protocol": "openrouter-api-reservation-v1", "store_key": store_key}
-        )
-        cached = (
-            self._paid_response_store.load(
-                key=store_key,
-                request_fingerprint=request_fingerprint,
-            )
-            if self._paid_response_store is not None
-            else None
-        )
-        predicted = self._preflight_cost(
-            request_id=request_id,
-            purpose=purpose,
-            system_prompt=system_prompt,
-            user_content=user_content,
-            reservation_id=reservation_id,
+        reservation_id = _api_reservation_id(
+            store_key=store_key,
+            store_identity=(
+                self._paid_response_store.identity()
+                if self._paid_response_store is not None
+                else None
+            ),
         )
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -385,51 +914,130 @@ class OpenRouterJSONClient:
             "HTTP-Referer": "https://github.com/baeyongil/model-forensics-value-leakage",
             "X-Title": "Model Forensics Value Leakage",
         }
-        result: HTTPResult | None = None
-        attempts_used = 0
-        replayed_from_checkpoint = cached is not None
-        checkpoint_record_hash: str | None = None
-        if cached is not None:
-            result = HTTPResult(
-                status=int(cached["http_status"]),
-                body=cached["response_body"],
+        dispatch_authorization: OpenRouterDispatchAuthorization | None = None
+        if self._dispatch_guard is not None:
+            assert self._dispatch_route is not None
+            assert self._paid_response_store is not None
+            dispatch_authorization = self._dispatch_guard.authorize(
+                OpenRouterRequestSpec(
+                    route=self._dispatch_route,
+                    model_id=self._model_id,
+                    model_revision=self._model_revision,
+                    price=self._price,
+                    request_id=request_id,
+                    purpose=purpose,
+                    system_prompt=system_prompt,
+                    user_content=user_content,
+                    endpoint=self._endpoint,
+                    max_output_tokens=self._max_output_tokens,
+                    paid_response_store=self._paid_response_store,
+                )
             )
-            checkpoint_record_hash = str(cached["record_hash"])
-        else:
-            for attempt in range(1, self._max_attempts + 1):
-                attempts_used = attempt
-                try:
-                    result = self._transport(
-                        self._endpoint,
-                        headers,
-                        payload,
-                        self._timeout_seconds,
-                    )
-                except (ConnectionError, TimeoutError, urllib.error.URLError):
-                    if attempt >= self._max_attempts:
-                        raise ProviderError(
-                            f"provider transport failed after {attempt} attempts"
-                        ) from None
-                    self._sleep(min(2 ** (attempt - 1), 4))
-                    continue
-                if result.status not in {408, 409, 425, 429} and result.status < 500:
-                    break
-                if attempt < self._max_attempts:
-                    self._sleep(min(2 ** (attempt - 1), 4))
-        if result is None:  # pragma: no cover - loop invariant
-            raise ProviderError("provider transport produced no response")
-        if result.status < 200 or result.status >= 300:
-            error = result.body.get("error")
-            error_type = error.get("type") if isinstance(error, Mapping) else None
-            raise ProviderError(
-                f"provider HTTP {result.status}; error_type={error_type or 'unknown'}"
+        claim = (
+            self._paid_response_store.request_claim(
+                key=store_key, request_fingerprint=request_fingerprint
+            )
+            if self._paid_response_store is not None
+            else nullcontext()
+        )
+        with claim:
+            return self._complete_json_claimed(
+                request_id=request_id,
+                user_content=user_content,
+                purpose=purpose,
+                system_prompt=system_prompt,
+                payload=payload,
+                headers=headers,
+                store_key=store_key,
+                request_fingerprint=request_fingerprint,
+                reservation_id=reservation_id,
+                dispatch_authorization=dispatch_authorization,
             )
 
-        # Persist the complete paid body before usage/content parsing.  A
-        # malformed paid response therefore remains a terminal, replayable
-        # artifact rather than triggering an accidental second charge.
-        if cached is None and self._paid_response_store is not None:
-            committed = self._paid_response_store.commit(
+    def _complete_json_claimed(
+        self,
+        *,
+        request_id: str,
+        user_content: str,
+        purpose: str,
+        system_prompt: str | None,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+        store_key: str,
+        request_fingerprint: str,
+        reservation_id: str,
+        dispatch_authorization: OpenRouterDispatchAuthorization | None,
+    ) -> str:
+        store = self._paid_response_store
+        if (
+            dispatch_authorization is not None
+            and store is not None
+            and _paid_response_store_identity(store)
+            != dispatch_authorization.paid_response_store_identity
+        ):
+            raise ProviderError(
+                "provider request paid-response store identity changed after authorization"
+            )
+        cached = (
+            store.load(key=store_key, request_fingerprint=request_fingerprint)
+            if store is not None
+            else None
+        )
+        if (
+            dispatch_authorization is not None
+            and dispatch_authorization.frozen_status == "authenticated_paid_response"
+            and cached is None
+        ):
+            raise ProviderError(
+                "provider request was frozen as cached but its checkpoint disappeared"
+            )
+        uncertain = (
+            store.load_uncertain_attempt(key=store_key, request_fingerprint=request_fingerprint)
+            if store is not None
+            else None
+        )
+        if cached is None and uncertain is not None:
+            raise ProviderError("uncertain paid attempt requires reconciliation before resume")
+        if cached is not None and uncertain is not None and store is not None:
+            store.resolve_uncertain_attempt(
+                key=store_key,
+                request_fingerprint=request_fingerprint,
+                expected_record_hash=str(uncertain["record_hash"]),
+            )
+        predicted = self._preflight_cost(
+            request_id=request_id,
+            purpose=purpose,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            reservation_id=reservation_id,
+        )
+        attempts_used = 0
+        checkpoint_record_hash: str | None = None
+        if cached is not None:
+            result = HTTPResult(status=int(cached["http_status"]), body=cached["response_body"])
+            checkpoint_record_hash = str(cached["record_hash"])
+        else:
+            attempts_used = 1
+            marker = (
+                store.mark_uncertain_attempt(
+                    key=store_key,
+                    request_fingerprint=request_fingerprint,
+                    logical_request_hash=stable_hash(request_id),
+                    model_id=self._model_id,
+                    purpose=purpose,
+                    reservation_id=reservation_id,
+                )
+                if store is not None
+                else None
+            )
+            try:
+                result = self._transport(self._endpoint, headers, payload, self._timeout_seconds)
+            except Exception:
+                raise ProviderError(
+                    "provider transport left an uncertain paid attempt; reconcile before resume"
+                ) from None
+        if cached is None and store is not None:
+            committed = store.commit(
                 key=store_key,
                 request_fingerprint=request_fingerprint,
                 logical_request_hash=stable_hash(request_id),
@@ -439,10 +1047,24 @@ class OpenRouterJSONClient:
                 response_body=result.body,
             )
             checkpoint_record_hash = str(committed["record_hash"])
+            assert marker is not None
+            store.resolve_uncertain_attempt(
+                key=store_key,
+                request_fingerprint=request_fingerprint,
+                expected_record_hash=str(marker["record_hash"]),
+            )
+        if result.status < 200 or result.status >= 300:
+            error = result.body.get("error")
+            error_type = error.get("type") if isinstance(error, Mapping) else None
+            raise ProviderError(
+                f"provider HTTP {result.status}; error_type={error_type or 'unknown'}"
+            )
 
         input_tokens, output_tokens, reported_cost = self._usage(result.body)
         computed_cost = self._price.cost(input_tokens, output_tokens)
-        incurred = reported_cost if reported_cost is not None else computed_cost
+        incurred = _ceil_usd_six(
+            max(reported_cost, computed_cost) if reported_cost is not None else computed_cost
+        )
         request_hash = stable_hash(request_id)
         totals = self._ledger.settle_reservation(
             reservation_id,
@@ -457,8 +1079,7 @@ class OpenRouterJSONClient:
             "calls_completed": int(self._last_metadata["calls_completed"]) + 1,
             "purpose": purpose,
             "logical_request_hash": request_hash,
-            "provider_response_id_hash": (stable_hash(str(response_id)) if response_id else None),
-            # Backward-compatible name used by the original adjudication adapter.
+            "provider_response_id_hash": stable_hash(str(response_id)) if response_id else None,
             "request_id_hash": stable_hash(str(response_id)) if response_id else None,
             "response_model": (
                 result.body.get("model") if isinstance(result.body.get("model"), str) else None
@@ -469,7 +1090,7 @@ class OpenRouterJSONClient:
                 else None
             ),
             "attempts_used": attempts_used,
-            "replayed_from_checkpoint": replayed_from_checkpoint,
+            "replayed_from_checkpoint": cached is not None,
             "paid_response_checkpoint_hash": checkpoint_record_hash,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -480,7 +1101,6 @@ class OpenRouterJSONClient:
             "api_total_usd": totals["api"],
         }
         self._audit_records.append(dict(self._last_metadata))
-
         choices = result.body.get("choices")
         try:
             content = choices[0]["message"]["content"]
@@ -509,10 +1129,12 @@ class OpenRouterAdjudicationCaller:
         endpoint: str = OPENROUTER_ENDPOINT,
         max_output_tokens: int = 512,
         timeout_seconds: float = 120.0,
-        max_attempts: int = 3,
+        max_attempts: int = 1,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         paid_response_store: PaidResponseStore | None = None,
+        dispatch_guard: OpenRouterDispatchGuard | None = None,
+        dispatch_route: str | None = None,
     ) -> None:
         self._client = OpenRouterJSONClient(
             model_id=model_id,
@@ -527,6 +1149,8 @@ class OpenRouterAdjudicationCaller:
             transport=transport,
             sleep=sleep,
             paid_response_store=paid_response_store,
+            dispatch_guard=dispatch_guard,
+            dispatch_route=dispatch_route,
         )
 
     @property
@@ -568,10 +1192,12 @@ class OpenRouterClassificationCaller:
         endpoint: str = OPENROUTER_ENDPOINT,
         max_output_tokens: int = 256,
         timeout_seconds: float = 120.0,
-        max_attempts: int = 3,
+        max_attempts: int = 1,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         paid_response_store: PaidResponseStore | None = None,
+        dispatch_guard: OpenRouterDispatchGuard | None = None,
+        dispatch_route: str | None = None,
     ) -> None:
         self._client = OpenRouterJSONClient(
             model_id=model_id,
@@ -586,6 +1212,8 @@ class OpenRouterClassificationCaller:
             transport=transport,
             sleep=sleep,
             paid_response_store=paid_response_store,
+            dispatch_guard=dispatch_guard,
+            dispatch_route=dispatch_route,
         )
         self._last_audit_metadata: dict[str, Any] = {}
         self._audit_records: list[dict[str, Any]] = []
@@ -672,7 +1300,11 @@ __all__ = [
     "HTTPResult",
     "OpenRouterAdjudicationCaller",
     "OpenRouterClassificationCaller",
+    "OpenRouterDispatchGuard",
     "OpenRouterJSONClient",
+    "OpenRouterPhasePreflight",
+    "OpenRouterRequestSpec",
     "ProviderError",
     "TokenPrice",
+    "preflight_openrouter_phase",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from model_forensics.estimate_spans import (
     FirstEstimateSpanRecord,
     SpanStatus,
 )
-from model_forensics.io import read_json, read_jsonl, stable_hash
+from model_forensics.io import read_json, read_jsonl, sha256_file, stable_hash
 from model_forensics.lens import (
     ARTIFACT_SOURCE_LAYERS,
     DEFAULT_CONCEPT_WORDS,
@@ -34,6 +35,7 @@ from model_forensics.lens_command import (
     required_position_record_schema,
     run_frozen_lens_command,
     validate_frozen_lens_inputs,
+    validate_lens_failure_manifest,
 )
 from model_forensics.lens_positions import build_lens_position_row
 from model_forensics.lens_runner import (
@@ -43,6 +45,7 @@ from model_forensics.lens_runner import (
     SMOKE_MODEL_ID,
     SMOKE_N_LAYERS,
     CapturedActivations,
+    freeze_causal_probe_design,
 )
 from model_forensics.token_spans import CompletionTokenMap, token_stream_manifest
 
@@ -318,10 +321,14 @@ def _runtime_bundles(
     return smoke, primary
 
 
-def _prefixes(rollouts: list[dict[str, Any]], trace_id: str) -> CompatibilityPrefixes:
+def _prefixes(
+    rollouts: list[dict[str, Any]], trace_id: str, positions: list[dict[str, Any]]
+) -> CompatibilityPrefixes:
     row = next(item for item in rollouts if item["run_id"] == trace_id)
     streams = row["token_streams"]
-    full = (*streams["prompt_token_ids"], *streams["completion_token_ids"])
+    combined = (*streams["prompt_token_ids"], *streams["completion_token_ids"])
+    position = next(item for item in positions if item["trace_id"] == trace_id)
+    full = combined[: max(position["position_indices"].values()) + 1]
     return CompatibilityPrefixes.freeze(
         four_b_token_ids=(1, 2),
         primary_trace_id=trace_id,
@@ -330,10 +337,30 @@ def _prefixes(rollouts: list[dict[str, Any]], trace_id: str) -> CompatibilityPre
     )
 
 
+def _probe_design(
+    rollouts: list[dict[str, Any]], anchors: dict[str, Any], positions: list[dict[str, Any]]
+):
+    validated = validate_frozen_lens_inputs(
+        rollouts=rollouts,
+        anchor_manifest=anchors,
+        position_records=positions,
+    )
+    return freeze_causal_probe_design(
+        ProbeTokenizer(),
+        traces=validated.traces,
+        candidate_probe_manifest_hash="sha256:" + "1" * 64,
+        candidate_probe_manifest_sha256="2" * 64,
+        anchor_manifest_hash=validated.anchor_manifest_hash,
+        anchor_selection_hash=validated.anchor_selection_hash,
+        rollout_manifest_hash=validated.rollout_manifest_hash,
+        position_manifest_hash=validated.position_manifest_hash,
+    )
+
+
 def test_command_consumes_official_position_rows_and_runs_ordered_gate(tmp_path: Path) -> None:
     rollouts, anchors, positions = _frozen_inputs()
     trace_id = anchors["anchors"][0]["trace_id"]
-    prefixes = _prefixes(rollouts, trace_id)
+    prefixes = _prefixes(rollouts, trace_id, positions)
     smoke, primary = _runtime_bundles()
     factory_order: list[str] = []
 
@@ -342,11 +369,14 @@ def test_command_consumes_official_position_rows_and_runs_ordered_gate(tmp_path:
         anchor_manifest=anchors,
         position_records=positions,
         compatibility_prefixes=prefixes,
+        probe_design=_probe_design(rollouts, anchors, positions),
         smoke_runtime_factory=lambda: factory_order.append("4b") or smoke,
         primary_runtime_factory=lambda: factory_order.append("122b") or primary,
         lens_records_path=tmp_path / "lens.jsonl",
         compatibility_manifest_path=tmp_path / "compatibility.json",
         execution_manifest_path=tmp_path / "execution.json",
+        release_authorization_manifest_hash="sha256:" + "e" * 64,
+        release_authorization_manifest_sha256="f" * 64,
         layers=(4,),
     )
 
@@ -354,10 +384,23 @@ def test_command_consumes_official_position_rows_and_runs_ordered_gate(tmp_path:
     assert result.traces_analyzed == 24
     assert result.records_written == 24 * 2 * 5 * 3
     assert len(read_jsonl(tmp_path / "lens.jsonl")) == result.records_written
-    assert read_json(tmp_path / "compatibility.json")["primary_ready"] is True
+    compatibility = read_json(tmp_path / "compatibility.json")
+    assert compatibility["primary_ready"] is True
+    prefix_manifest_path = tmp_path / "lens_compatibility_prefix_manifest.json"
+    prefix_manifest = read_json(prefix_manifest_path)
+    assert prefix_manifest["primary_trace_id"] == trace_id
+    assert prefix_manifest["record_hash"].startswith("sha256:")
+    assert [row["prefix_token_ids_hash"] for row in compatibility["attempts"]] == [
+        prefix_manifest["four_b"]["token_ids_hash"],
+        prefix_manifest["primary_full"]["token_ids_hash"],
+    ]
     execution = read_json(tmp_path / "execution.json")
     assert execution["record_count"] == result.records_written
     assert execution["causal_claim"] is False
+    assert execution["compatibility_prefix_manifest_hash"] == prefix_manifest["record_hash"]
+    assert execution["compatibility_prefix_manifest_sha256"] == sha256_file(prefix_manifest_path)
+    assert execution["release_authorization_manifest_hash"] == "sha256:" + "e" * 64
+    assert execution["release_authorization_manifest_sha256"] == "f" * 64
     assert required_position_record_schema()["first_estimate_span_primary_inference"] is True
 
 
@@ -378,7 +421,10 @@ def test_missing_external_first_estimate_evidence_fails_before_runtime_loading(
             rollouts=rollouts,
             anchor_manifest=anchors,
             position_records=positions,
-            compatibility_prefixes=_prefixes(rollouts, anchors["anchors"][0]["trace_id"]),
+            compatibility_prefixes=_prefixes(
+                rollouts, anchors["anchors"][0]["trace_id"], positions
+            ),
+            probe_design=_probe_design(rollouts, anchors, positions),
             smoke_runtime_factory=lambda: calls.append("4b"),  # type: ignore[arg-type,return-value]
             primary_runtime_factory=lambda: calls.append("122b"),  # type: ignore[arg-type,return-value]
             lens_records_path=tmp_path / "lens.jsonl",
@@ -411,18 +457,25 @@ def test_authenticated_position_indices_cannot_be_changed() -> None:
 def test_two_primary_gate_failures_write_audit_but_no_lens_rows(tmp_path: Path) -> None:
     rollouts, anchors, positions = _frozen_inputs()
     smoke, primary = _runtime_bundles(fail_primary=True)
+    design = _probe_design(rollouts, anchors, positions)
 
     with pytest.raises(LensCommandGateError) as error:
         run_frozen_lens_command(
             rollouts=rollouts,
             anchor_manifest=anchors,
             position_records=positions,
-            compatibility_prefixes=_prefixes(rollouts, anchors["anchors"][0]["trace_id"]),
+            compatibility_prefixes=_prefixes(
+                rollouts, anchors["anchors"][0]["trace_id"], positions
+            ),
+            probe_design=design,
             smoke_runtime_factory=lambda: smoke,
             primary_runtime_factory=lambda: primary,
             lens_records_path=tmp_path / "lens.jsonl",
             compatibility_manifest_path=tmp_path / "compatibility.json",
             execution_manifest_path=tmp_path / "execution.json",
+            failure_manifest_path=tmp_path / "lens_failure_manifest.json",
+            release_authorization_manifest_hash="sha256:" + "e" * 64,
+            release_authorization_manifest_sha256="f" * 64,
             layers=(4,),
         )
     primary_attempts = [
@@ -433,5 +486,72 @@ def test_two_primary_gate_failures_write_audit_but_no_lens_rows(tmp_path: Path) 
     assert len(primary_attempts) == 2
     assert all(attempt.status == "failed" for attempt in primary_attempts)
     assert read_json(tmp_path / "compatibility.json")["fallback_model_used"] is False
+    failure = read_json(tmp_path / "lens_failure_manifest.json")
+    prefix_manifest_path = tmp_path / "lens_compatibility_prefix_manifest.json"
+    prefix_manifest = read_json(prefix_manifest_path)
+    assert failure["status"] == "primary_122b_lens_unavailable"
+    assert failure["attempt_count_122b"] == 2
+    assert failure["analysis_mode"] == "behavior_only"
+    assert failure["lens_evidence_status"] == "unavailable_not_zero"
+    assert failure["fallback_27b_used_as_primary"] is False
+    assert failure["compatibility_manifest_sha256"] == sha256_file(
+        tmp_path / "compatibility.json"
+    )
+    assert failure["compatibility_prefix_manifest_hash"] == prefix_manifest["record_hash"]
+    assert failure["compatibility_prefix_manifest_sha256"] == sha256_file(prefix_manifest_path)
+    assert failure["release_authorization_manifest_hash"] == "sha256:" + "e" * 64
+    assert failure["release_authorization_manifest_sha256"] == "f" * 64
     assert not (tmp_path / "lens.jsonl").exists()
     assert not (tmp_path / "execution.json").exists()
+    validated = validate_frozen_lens_inputs(
+        rollouts=rollouts,
+        anchor_manifest=anchors,
+        position_records=positions,
+    )
+    design_prefix_manifest = _prefixes(
+        rollouts, anchors["anchors"][0]["trace_id"], positions
+    ).to_manifest()
+    validated_failure = validate_lens_failure_manifest(
+        failure,
+        compatibility_manifest=error.value.compatibility_manifest,
+        compatibility_manifest_sha256=sha256_file(tmp_path / "compatibility.json"),
+        compatibility_prefix_manifest=design_prefix_manifest,
+        compatibility_prefix_manifest_sha256=sha256_file(prefix_manifest_path),
+        release_authorization_manifest_hash="sha256:" + "e" * 64,
+        release_authorization_manifest_sha256="f" * 64,
+        validated=validated,
+        probe_design=design,
+        probe_design_manifest_sha256=design.manifest_hash.removeprefix("sha256:"),
+        lens_records_path=tmp_path / "lens.jsonl",
+        execution_manifest_path=tmp_path / "execution.json",
+    )
+    assert design_prefix_manifest.record_hash == prefix_manifest["record_hash"]
+    assert validated_failure.record_hash == failure["record_hash"]
+
+
+def test_probe_design_linkage_fails_before_any_runtime_factory(tmp_path: Path) -> None:
+    rollouts, anchors, positions = _frozen_inputs()
+    design = replace(
+        _probe_design(rollouts, anchors, positions),
+        rollout_manifest_hash="sha256:" + "f" * 64,
+    )
+    calls: list[str] = []
+
+    with pytest.raises(LensCommandInputError, match=r"probe design.*frozen inputs"):
+        run_frozen_lens_command(
+            rollouts=rollouts,
+            anchor_manifest=anchors,
+            position_records=positions,
+            compatibility_prefixes=_prefixes(
+                rollouts, anchors["anchors"][0]["trace_id"], positions
+            ),
+            probe_design=design,
+            smoke_runtime_factory=lambda: calls.append("4b"),  # type: ignore[arg-type,return-value]
+            primary_runtime_factory=lambda: calls.append("122b"),  # type: ignore[arg-type,return-value]
+            lens_records_path=tmp_path / "lens.jsonl",
+            compatibility_manifest_path=tmp_path / "compatibility.json",
+            execution_manifest_path=tmp_path / "execution.json",
+            failure_manifest_path=tmp_path / "lens_failure_manifest.json",
+            layers=(4,),
+        )
+    assert calls == []

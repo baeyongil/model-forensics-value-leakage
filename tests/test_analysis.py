@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from model_forensics.analysis import (
+    accuracy_anchor_lens_resampling_association,
     accuracy_neutral_movement_assessment,
     adjudicate_hypotheses,
     anchoring_assessments,
@@ -207,6 +208,61 @@ def test_sentence_table_has_one_confirmatory_contrast_and_exploratory_metadata()
     assert exploratory["p_value_adjusted"].notna().all()
     assert (effects["worst_case_bound"] <= effects["best_case_bound"]).all()
     assert effects["signed_log_ratio_estimate"].notna().all()
+
+
+@pytest.mark.parametrize(
+    ("retain_value", "resample_value", "complete_conclusion", "expected_bound"),
+    [
+        (1, 0, "positive", (0.10, 1.0)),
+        (0, 1, "negative", (-1.0, -0.10)),
+        (0, 0, "practically_null", (-0.90, 0.0)),
+    ],
+)
+def test_sentence_conclusion_is_blocked_when_missing_bounds_touch_or_cross_rope(
+    retain_value: int,
+    resample_value: int,
+    complete_conclusion: str,
+    expected_bound: tuple[float, float],
+) -> None:
+    rows = []
+    for cluster_index in range(20):
+        cluster = f"missing-bound-{cluster_index:02d}"
+        rows.extend(
+            [
+                {
+                    "sentence_class": "value_threshold_planning",
+                    "condition": "above_good",
+                    "base_trace_id": cluster,
+                    "arm": "retain",
+                    "final_good_side": retain_value,
+                },
+                {
+                    "sentence_class": "value_threshold_planning",
+                    "condition": "above_good",
+                    "base_trace_id": cluster,
+                    "arm": "resample",
+                    "final_good_side": (
+                        resample_value if cluster_index < 2 else None
+                    ),
+                },
+            ]
+        )
+
+    effects = sentence_effect_table(
+        rows,
+        bootstrap_replicates=100,
+        permutation_replicates=100,
+        confirmatory_contrast=None,
+    )
+    pooled = effects[effects["direction"] == "pooled"].iloc[0]
+
+    assert pooled["conclusion_before_missing_bounds_gate"] == complete_conclusion
+    assert pooled["conclusion"] == "inconclusive"
+    assert pooled["worst_case_bound"] == pytest.approx(expected_bound[0])
+    assert pooled["best_case_bound"] == pytest.approx(expected_bound[1])
+    assert not bool(pooled["missing_bounds_gate_passed"])
+    assert pooled["missing_bounds_gate_state"] == "blocked_not_robust"
+    assert pooled["missing_bounds_gate_audit"]["gated_conclusion"] == "inconclusive"
 
 
 def test_divergent_coverage_gate_preserves_estimate_but_forces_inconclusive() -> None:
@@ -421,6 +477,76 @@ def test_lens_signal_requires_jr_uncertainty_and_adjacent_layer_bands() -> None:
     )
     assert contrary.value is False
     assert contrary.details["adjacent_negative_pairs"]
+
+
+def _accuracy_association_rows(*, missing: bool = False) -> tuple[list[dict], list[dict]]:
+    resampling: list[dict] = []
+    lens: list[dict] = []
+    layers = range(4, 47)
+    for direction in ("above_good", "below_good"):
+        for trace_index, resample_good_count in enumerate((0, 2, 4, 6)):
+            trace_id = f"{direction}-{trace_index}"
+            for sample_index in range(8):
+                for arm in ("retain", "resample"):
+                    outcome: int | None = int(
+                        arm == "resample" and sample_index < resample_good_count
+                    )
+                    if missing and trace_index == 0 and sample_index == 0 and arm == "resample":
+                        outcome = None
+                    resampling.append(
+                        {
+                            "anchor_id": trace_id,
+                            "base_trace_id": trace_id,
+                            "sentence_class": "accuracy_commitment",
+                            "condition": direction,
+                            "sample_index": sample_index,
+                            "seed": sample_index,
+                            "stage": "initial",
+                            "arm": arm,
+                            "intervention_eligible": True,
+                            "divergent": arm == "resample",
+                            "final_good_side": outcome,
+                        }
+                    )
+            change = resample_good_count / 8
+            for lens_type, scale in (("J", 1.0), ("R", 0.8)):
+                for layer in layers:
+                    for position, value in (("anchor_pre", 0.0), ("anchor_post", change)):
+                        lens.append(
+                            {
+                                "trace_id": trace_id,
+                                "lens_type": lens_type,
+                                "layer": layer,
+                                "position_name": position,
+                                "contrast": "epistemic",
+                                "signed_mean_logit_contrast": value * scale,
+                                "probe_eligible": True,
+                            }
+                        )
+    return resampling, lens
+
+
+def test_accuracy_lens_association_uses_exact_stratified_permutations_and_equal_bands() -> None:
+    resampling, lens = _accuracy_association_rows()
+    result = accuracy_anchor_lens_resampling_association(resampling, lens)
+    assert result["status"] == "available"
+    assert result["common_trace_count"] == 8
+    assert result["permutation_count"] == 576
+    assert result["permutation_resolution"] == pytest.approx(1 / 576)
+    assert result["per_lens"]["J"]["tau_a"] == 1
+    assert result["per_lens"]["R"]["tau_a"] == 1
+    assert result["causal_claim"] is False
+    assert result["lens_weights"] == {"early": 1 / 3, "middle": 1 / 3, "late": 1 / 3}
+
+
+def test_accuracy_lens_association_fails_closed_on_an_eligible_missing_outcome() -> None:
+    resampling, lens = _accuracy_association_rows(missing=True)
+    result = accuracy_anchor_lens_resampling_association(resampling, lens)
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "eligible paired resampling outcomes are missing"
+    affected = next(row for row in result["trace_effects"] if row["trace_id"].endswith("-0"))
+    assert affected["d_i"] is None
+    assert affected["d_i_lower"] < affected["d_i_upper"]
 
 
 def test_accuracy_movement_uses_direction_matched_threshold_only_comparator() -> None:

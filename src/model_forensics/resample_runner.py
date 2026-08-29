@@ -66,6 +66,43 @@ class OutcomeAdjudicationError(ResampleExecutionError):
     """Raised when a final-outcome judgment breaks the blind primary contract."""
 
 
+def _semantic_embedder_provenance(
+    embedder: TextEmbedder,
+    *,
+    primary_inference: bool,
+) -> dict[str, Any]:
+    """Authenticate the semantic runtime before any row can be primary eligible."""
+
+    raw = getattr(embedder, "provenance", None)
+    if callable(raw):
+        raw = raw()
+    if isinstance(raw, Mapping) and raw:
+        payload = dict(raw)
+    else:
+        payload = {
+            "runtime_kind": "unattributed_embedder",
+            "embedder_class": f"{type(embedder).__module__}.{type(embedder).__qualname__}",
+            "primary_eligible": False,
+            "primary_ineligibility_reason": "missing_semantic_runtime_provenance",
+        }
+        payload["provenance_hash"] = stable_hash(payload)
+
+    claimed_hash = payload.get("provenance_hash")
+    unsigned = {key: value for key, value in payload.items() if key != "provenance_hash"}
+    if not isinstance(claimed_hash, str) or claimed_hash != stable_hash(unsigned):
+        raise ResampleExecutionError("semantic embedder provenance hash is absent or invalid")
+    if primary_inference:
+        eligibility_check = getattr(embedder, "assert_primary_eligible", None)
+        if not callable(eligibility_check):
+            raise ResampleExecutionError(
+                "primary resampling requires an authenticated semantic eligibility check"
+            )
+        eligibility_check()
+        if payload.get("primary_eligible") is not True:
+            raise ResampleExecutionError("semantic embedder is not primary eligible")
+    return payload
+
+
 @dataclass(frozen=True, slots=True)
 class BaseTrace:
     """The minimum base-rollout state required to execute one intervention."""
@@ -536,6 +573,9 @@ class RawPrefixGenerationBackend(Protocol):
 
     @property
     def provenance(self) -> Mapping[str, Any]: ...
+
+    @property
+    def tokenizer(self) -> Any: ...
 
     def encode_prefix(
         self,
@@ -1222,6 +1262,10 @@ def _run_sentence_resampling_legacy(
 
     if type(primary_inference) is not bool:
         raise TypeError("primary_inference must be an explicit bool")
+    semantic_embedder_provenance = _semantic_embedder_provenance(
+        embedder,
+        primary_inference=primary_inference,
+    )
     backend_provenance = dict(backend.provenance)
     synthetic_smoke = bool(backend_provenance.get("synthetic_smoke", False))
     if primary_inference and synthetic_smoke:
@@ -1451,6 +1495,7 @@ def _run_sentence_resampling_legacy(
             "backend_result": dict(result.backend_metadata),
             "base_trace": dict(base.provenance),
             "allocation_manifest_hash": allocation_manifest.manifest_hash,
+            "semantic_embedder": semantic_embedder_provenance,
         }
         record = ResamplingArtifactRecord(
             resample_id=request.request_id,

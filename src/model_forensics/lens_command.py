@@ -38,15 +38,17 @@ from model_forensics.io import (
     stable_hash,
     write_json,
 )
-from model_forensics.lens import FITTED_LAYERS, LoadedLens, ModelRuntime
+from model_forensics.lens import EXPECTED_MODEL_ID, FITTED_LAYERS, LoadedLens, ModelRuntime
 from model_forensics.lens_positions import (
     POSITION_MANIFEST_SCHEMA_VERSION,
     POSITION_ORDER,
 )
 from model_forensics.lens_runner import (
+    COMPATIBILITY_ATTEMPT_PREFIX_STREAM,
     PRIMARY_MODEL_REVISION,
     CompatibilityGateError,
     LensCompatibilityManifest,
+    LensProbeDesign,
     LensTraceInput,
     SameForwardBackend,
     execute_lens_traces,
@@ -103,9 +105,11 @@ class LensCommandGateError(RuntimeError):
         message: str,
         *,
         compatibility_manifest: LensCompatibilityManifest,
+        failure_manifest: LensFailureManifest | None = None,
     ) -> None:
         super().__init__(message)
         self.compatibility_manifest = compatibility_manifest
+        self.failure_manifest = failure_manifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +206,54 @@ class CompatibilityPrefixes:
             ),
         )
 
+    def to_manifest(self) -> CompatibilityPrefixManifest:
+        def entry(token_ids: Sequence[int]) -> dict[str, Any]:
+            values = tuple(token_ids)
+            return {
+                "token_count": len(values),
+                "token_ids_hash": token_stream_hash(
+                    values, stream=COMPATIBILITY_ATTEMPT_PREFIX_STREAM
+                ),
+            }
+
+        return CompatibilityPrefixManifest(
+            primary_trace_id=self.primary_trace_id,
+            four_b=entry(self.four_b_token_ids),
+            primary_full=entry(self.primary_full_token_ids),
+            primary_short=entry(self.primary_short_token_ids),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CompatibilityPrefixManifest(CanonicalRecord):
+    """Exact, content-addressed prefixes used by every compatibility attempt."""
+
+    primary_trace_id: str
+    four_b: Mapping[str, Any]
+    primary_full: Mapping[str, Any]
+    primary_short: Mapping[str, Any]
+    source_policy: str = "4b_pinned_text_and_first_manifest_ordered_primary_trace"
+    shortening_policy: str = "strict_prefix_length_frozen_before_runtime"
+    protocol_version: str = "lens-compatibility-prefixes-v1"
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.primary_trace_id:
+            raise LensCommandInputError("compatibility prefix manifest trace ID is empty")
+        for name in ("four_b", "primary_full", "primary_short"):
+            entry = dict(getattr(self, name))
+            if set(entry) != {"token_count", "token_ids_hash"}:
+                raise LensCommandInputError(f"{name} prefix evidence has a noncanonical schema")
+            if (
+                isinstance(entry["token_count"], bool)
+                or not isinstance(entry["token_count"], int)
+                or entry["token_count"] <= 0
+                or not isinstance(entry["token_ids_hash"], str)
+                or not entry["token_ids_hash"].startswith("sha256:")
+            ):
+                raise LensCommandInputError(f"{name} prefix evidence is invalid")
+            object.__setattr__(self, name, entry)
+
 
 @dataclass(frozen=True, slots=True)
 class LensCommandPaths:
@@ -209,8 +261,10 @@ class LensCommandPaths:
     anchor_manifest: Path
     position_manifest: Path
     lens_records: Path
+    compatibility_prefix_manifest: Path
     compatibility_manifest: Path
     execution_manifest: Path
+    failure_manifest: Path
 
     def __post_init__(self) -> None:
         normalized = [Path(getattr(self, name)).expanduser().resolve() for name in self.__slots__]
@@ -237,6 +291,8 @@ class LensExecutionManifest(CanonicalRecord):
     anchor_selection_hash: str
     position_manifest_hash: str
     rollout_manifest_hash: str
+    compatibility_prefix_manifest_hash: str
+    compatibility_prefix_manifest_sha256: str
     compatibility_manifest_hash: str
     primary_model_revision: str
     trace_count: int
@@ -244,9 +300,79 @@ class LensExecutionManifest(CanonicalRecord):
     layers: tuple[int, ...]
     lens_records_sha256: str
     lens_records_path: str
+    record_schema_version: int
+    probe_design_manifest_hash: str
+    probe_design_manifest_sha256: str
+    candidate_probe_manifest_hash: str
+    candidate_probe_manifest_sha256: str
+    probe_protocol_version: str
+    probe_cell_count: int
+    eligible_probe_cell_count: int
+    ineligible_probe_cell_count: int
+    eligible_record_count: int
+    ineligible_record_count: int
+    analysis_forward_rule: str
+    release_authorization_manifest_hash: str | None = None
+    release_authorization_manifest_sha256: str | None = None
     evidence_scope: str = "observational_readout"
     causal_claim: bool = False
-    schema_version: int = 1
+    schema_version: int = 3
+
+
+@dataclass(frozen=True, slots=True)
+class LensFailureManifest(CanonicalRecord):
+    """Authenticated alternate root after both bounded 122B attempts fail."""
+
+    primary_model_id: str
+    primary_model_revision: str
+    anchor_manifest_hash: str
+    anchor_selection_hash: str
+    position_manifest_hash: str
+    rollout_manifest_hash: str
+    probe_design_manifest_hash: str
+    probe_design_manifest_sha256: str
+    candidate_probe_manifest_hash: str
+    candidate_probe_manifest_sha256: str
+    probe_protocol_version: str
+    compatibility_prefix_manifest_hash: str
+    compatibility_prefix_manifest_sha256: str
+    compatibility_manifest_hash: str
+    compatibility_manifest_sha256: str
+    release_authorization_manifest_hash: str | None = None
+    release_authorization_manifest_sha256: str | None = None
+    status: str = "primary_122b_lens_unavailable"
+    failure_stage: str = "ordered_122b_compatibility_gate"
+    failure_policy: str = "two_bounded_version_fixed_attempts_then_behavior_only"
+    attempt_count_122b: int = 2
+    attempt_strategies: tuple[str, str] = (
+        "version_fixed_full_prefix",
+        "version_fixed_shortened_prefix",
+    )
+    all_122b_attempts_failed: bool = True
+    lens_records_absent: bool = True
+    execution_manifest_absent: bool = True
+    analysis_mode: str = "behavior_only"
+    lens_evidence_status: str = "unavailable_not_zero"
+    lens_claim_eligibility: bool = False
+    fallback_27b_policy: str = "methodology_support_only_not_122b_substitute"
+    fallback_27b_used_as_primary: bool = False
+    causal_claim: bool = False
+    schema_version: int = 2
+
+    def __post_init__(self) -> None:
+        if self.primary_model_id != EXPECTED_MODEL_ID:
+            raise ValueError("failure manifest must bind the primary 122B model")
+        if self.primary_model_revision != PRIMARY_MODEL_REVISION:
+            raise ValueError("failure manifest must bind the primary 122B revision")
+        if not (
+            self.attempt_count_122b == 2
+            and self.all_122b_attempts_failed
+            and self.lens_records_absent
+            and self.execution_manifest_absent
+        ):
+            raise ValueError("failure manifest may authenticate only the frozen two-failure root")
+        if self.fallback_27b_used_as_primary or self.lens_claim_eligibility or self.causal_claim:
+            raise ValueError("failure manifest cannot promote fallback or lens claims")
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +382,7 @@ class LensCommandResult:
     compatibility_manifest: LensCompatibilityManifest
     execution_manifest: LensExecutionManifest
     lens_records_path: Path
+    compatibility_prefix_manifest_path: Path
     compatibility_manifest_path: Path
     execution_manifest_path: Path
 
@@ -620,10 +747,182 @@ def _validate_compatibility_prefixes(
     source = by_id.get(prefixes.primary_trace_id)
     if source is None:
         raise LensCommandInputError("primary compatibility trace is not a selected frozen trace")
-    if prefixes.primary_full_token_ids != source.sequence_token_ids:
+    expected = source.sequence_token_ids[: max(source.position_indices.values()) + 1]
+    if prefixes.primary_full_token_ids != expected:
         raise LensCommandInputError(
-            "full primary compatibility input must equal its selected rollout token stream"
+            "full primary compatibility input must equal the authenticated analysis forward"
         )
+
+
+def validate_probe_design(
+    probe_design: LensProbeDesign,
+    validated: ValidatedLensInputs,
+) -> None:
+    """Bind the frozen probe universe and every causal cell to frozen inputs."""
+
+    expected_links = {
+        "anchor_manifest_hash": validated.anchor_manifest_hash,
+        "anchor_selection_hash": validated.anchor_selection_hash,
+        "rollout_manifest_hash": validated.rollout_manifest_hash,
+        "position_manifest_hash": validated.position_manifest_hash,
+    }
+    if probe_design.model_id != EXPECTED_MODEL_ID or any(
+        getattr(probe_design, field) != expected for field, expected in expected_links.items()
+    ):
+        raise LensCommandInputError("probe design disagrees with the frozen inputs")
+    expected_keys = {
+        (trace.trace_id, position, concept)
+        for trace in validated.traces
+        for position in POSITION_ORDER
+        for concept in probe_design.concepts
+    }
+    observed_keys = {
+        (cell.trace_id, cell.position_name, cell.concept) for cell in probe_design.cells
+    }
+    if observed_keys != expected_keys or len(probe_design.cells) != len(expected_keys):
+        raise LensCommandInputError("probe design cell inventory disagrees with frozen inputs")
+    traces = {trace.trace_id: trace for trace in validated.traces}
+    for cell in probe_design.cells:
+        trace = traces[cell.trace_id]
+        token_index = trace.position_indices[cell.position_name]
+        causal_ids = trace.sequence_token_ids[: token_index + 1]
+        if (
+            cell.token_index != token_index
+            or cell.causal_prefix_token_count != len(causal_ids)
+            or cell.causal_prefix_token_ids_hash
+            != token_stream_hash(causal_ids, stream="lens_causal_prefix")
+        ):
+            raise LensCommandInputError(
+                "probe design causal-prefix evidence disagrees with frozen inputs"
+            )
+
+
+def _is_authenticated_two_attempt_primary_failure(
+    manifest: LensCompatibilityManifest,
+) -> bool:
+    smoke = [attempt for attempt in manifest.attempts if attempt.stage == "4b_smoke"]
+    primary = [attempt for attempt in manifest.attempts if attempt.stage == "122b_preflight"]
+    return (
+        not manifest.primary_ready
+        and len(smoke) == 1
+        and smoke[0].status == "passed"
+        and len(primary) == 2
+        and tuple(attempt.ordinal for attempt in primary) == (1, 2)
+        and tuple(attempt.strategy for attempt in primary)
+        == ("version_fixed_full_prefix", "version_fixed_shortened_prefix")
+        and all(attempt.status == "failed" for attempt in primary)
+    )
+
+
+def validate_compatibility_prefix_manifest(
+    prefix_manifest: CompatibilityPrefixManifest,
+    compatibility_manifest: LensCompatibilityManifest,
+) -> None:
+    """Bind every compatibility attempt to its exact frozen token prefix."""
+
+    expected_by_attempt = {
+        ("4b_smoke", "pinned_text_only_single_forward"): prefix_manifest.four_b,
+        ("122b_preflight", "version_fixed_full_prefix"): prefix_manifest.primary_full,
+        (
+            "122b_preflight",
+            "version_fixed_shortened_prefix",
+        ): prefix_manifest.primary_short,
+    }
+    seen: set[tuple[str, str]] = set()
+    for attempt in compatibility_manifest.attempts:
+        identity = (attempt.stage, attempt.strategy)
+        expected = expected_by_attempt.get(identity)
+        if expected is None or identity in seen:
+            raise LensCommandInputError(
+                "compatibility manifest contains an unknown or duplicate attempt"
+            )
+        seen.add(identity)
+        if (
+            attempt.prefix_token_count != expected["token_count"]
+            or attempt.prefix_token_ids_hash != expected["token_ids_hash"]
+        ):
+            raise LensCommandInputError(
+                "compatibility attempt disagrees with its exact prefix manifest"
+            )
+
+
+def validate_lens_failure_manifest(
+    payload: Mapping[str, Any],
+    *,
+    compatibility_manifest: LensCompatibilityManifest,
+    compatibility_manifest_sha256: str,
+    compatibility_prefix_manifest: CompatibilityPrefixManifest,
+    compatibility_prefix_manifest_sha256: str,
+    release_authorization_manifest_hash: str | None = None,
+    release_authorization_manifest_sha256: str | None = None,
+    validated: ValidatedLensInputs,
+    probe_design: LensProbeDesign,
+    probe_design_manifest_sha256: str,
+    lens_records_path: str | Path,
+    execution_manifest_path: str | Path,
+) -> LensFailureManifest:
+    """Validate the sole behavior-only alternate root, including absent outputs."""
+
+    if not _is_authenticated_two_attempt_primary_failure(compatibility_manifest):
+        raise LensCommandInputError(
+            "failure manifest requires exactly two authenticated failed 122B attempts"
+        )
+    for value, context in (
+        (compatibility_manifest_sha256, "compatibility_manifest_sha256"),
+        (
+            compatibility_prefix_manifest_sha256,
+            "compatibility_prefix_manifest_sha256",
+        ),
+        (probe_design_manifest_sha256, "probe_design_manifest_sha256"),
+    ):
+        _require_hash(value, context=context, namespaced=False)
+    if (release_authorization_manifest_hash is None) != (
+        release_authorization_manifest_sha256 is None
+    ):
+        raise LensCommandInputError(
+            "release authorization hash and SHA-256 must be supplied together"
+        )
+    if release_authorization_manifest_hash is not None:
+        _require_hash(
+            release_authorization_manifest_hash,
+            context="release_authorization_manifest_hash",
+        )
+        assert release_authorization_manifest_sha256 is not None
+        _require_hash(
+            release_authorization_manifest_sha256,
+            context="release_authorization_manifest_sha256",
+            namespaced=False,
+        )
+    validate_compatibility_prefix_manifest(
+        compatibility_prefix_manifest, compatibility_manifest
+    )
+    validate_probe_design(probe_design, validated)
+    if Path(lens_records_path).expanduser().resolve().exists() or Path(
+        execution_manifest_path
+    ).expanduser().resolve().exists():
+        raise LensCommandInputError("failure root requires absent lens and execution artifacts")
+    expected = LensFailureManifest(
+        primary_model_id=EXPECTED_MODEL_ID,
+        primary_model_revision=PRIMARY_MODEL_REVISION,
+        anchor_manifest_hash=validated.anchor_manifest_hash,
+        anchor_selection_hash=validated.anchor_selection_hash,
+        position_manifest_hash=validated.position_manifest_hash,
+        rollout_manifest_hash=validated.rollout_manifest_hash,
+        probe_design_manifest_hash=probe_design.manifest_hash,
+        probe_design_manifest_sha256=probe_design_manifest_sha256,
+        candidate_probe_manifest_hash=probe_design.candidate_probe_manifest_hash,
+        candidate_probe_manifest_sha256=probe_design.candidate_probe_manifest_sha256,
+        probe_protocol_version=probe_design.protocol_version,
+        compatibility_prefix_manifest_hash=compatibility_prefix_manifest.record_hash,
+        compatibility_prefix_manifest_sha256=compatibility_prefix_manifest_sha256,
+        compatibility_manifest_hash=compatibility_manifest.record_hash,
+        compatibility_manifest_sha256=compatibility_manifest_sha256,
+        release_authorization_manifest_hash=release_authorization_manifest_hash,
+        release_authorization_manifest_sha256=release_authorization_manifest_sha256,
+    )
+    if dict(payload) != expected.to_dict(include_hash=True):
+        raise LensCommandInputError("lens failure manifest disagrees with authenticated evidence")
+    return expected
 
 
 def run_frozen_lens_command(
@@ -632,11 +931,17 @@ def run_frozen_lens_command(
     anchor_manifest: Mapping[str, Any],
     position_records: Sequence[Mapping[str, Any]],
     compatibility_prefixes: CompatibilityPrefixes,
+    probe_design: LensProbeDesign,
+    probe_design_manifest_sha256: str | None = None,
     smoke_runtime_factory: Callable[[], SmokeRuntimeBundle],
     primary_runtime_factory: Callable[[], PrimaryRuntimeBundle],
     lens_records_path: str | Path,
     compatibility_manifest_path: str | Path,
     execution_manifest_path: str | Path,
+    compatibility_prefix_manifest_path: str | Path | None = None,
+    failure_manifest_path: str | Path | None = None,
+    release_authorization_manifest_hash: str | None = None,
+    release_authorization_manifest_sha256: str | None = None,
     layers: Sequence[int] = FITTED_LAYERS,
 ) -> LensCommandResult:
     """Validate, gate, execute, and persist the real observational lens job."""
@@ -647,11 +952,56 @@ def run_frozen_lens_command(
         position_records=position_records,
     )
     _validate_compatibility_prefixes(compatibility_prefixes, validated.traces)
+    validate_probe_design(probe_design, validated)
+    if probe_design_manifest_sha256 is not None:
+        _require_hash(
+            probe_design_manifest_sha256,
+            context="probe_design_manifest_sha256",
+            namespaced=False,
+        )
+    if (release_authorization_manifest_hash is None) != (
+        release_authorization_manifest_sha256 is None
+    ):
+        raise LensCommandInputError(
+            "release authorization hash and SHA-256 must be supplied together"
+        )
+    if release_authorization_manifest_hash is not None:
+        _require_hash(
+            release_authorization_manifest_hash,
+            context="release_authorization_manifest_hash",
+        )
+        assert release_authorization_manifest_sha256 is not None
+        _require_hash(
+            release_authorization_manifest_sha256,
+            context="release_authorization_manifest_sha256",
+            namespaced=False,
+        )
     output = Path(lens_records_path).expanduser().resolve()
     compatibility_path = Path(compatibility_manifest_path).expanduser().resolve()
     execution_path = Path(execution_manifest_path).expanduser().resolve()
-    if len({output, compatibility_path, execution_path}) != 3:
+    prefix_manifest_path = (
+        Path(compatibility_prefix_manifest_path).expanduser().resolve()
+        if compatibility_prefix_manifest_path is not None
+        else compatibility_path.with_name("lens_compatibility_prefix_manifest.json")
+    )
+    failure_path = (
+        Path(failure_manifest_path).expanduser().resolve()
+        if failure_manifest_path is not None
+        else compatibility_path.with_name("lens_failure_manifest.json")
+    )
+    if len({output, prefix_manifest_path, compatibility_path, execution_path, failure_path}) != 5:
         raise LensCommandInputError("lens output paths must be distinct")
+    if output.exists() or execution_path.exists():
+        raise LensCommandInputError(
+            "lens records and execution manifest must be absent before primary execution"
+        )
+    if failure_path.exists():
+        raise LensCommandInputError(
+            "an authenticated prior 122B lens-failure root forbids additional primary attempts"
+        )
+    prefix_manifest = compatibility_prefixes.to_manifest()
+    write_json(prefix_manifest_path, prefix_manifest.to_dict(include_hash=True))
+    prefix_manifest_sha256 = sha256_file(prefix_manifest_path)
     normalized_layers = tuple(layers)
 
     primary_state: dict[str, PrimaryRuntimeBundle] = {}
@@ -685,6 +1035,7 @@ def run_frozen_lens_command(
             bundle.lenses,
             token_ids=ids,
             backend=bundle.backend,
+            probe_design=probe_design,
         )
 
     try:
@@ -697,7 +1048,40 @@ def run_frozen_lens_command(
         )
     except CompatibilityGateError as exc:
         write_compatibility_manifest(compatibility_path, exc.manifest)
-        raise LensCommandGateError(str(exc), compatibility_manifest=exc.manifest) from exc
+        failure: LensFailureManifest | None = None
+        if _is_authenticated_two_attempt_primary_failure(exc.manifest):
+            failure = LensFailureManifest(
+                primary_model_id=EXPECTED_MODEL_ID,
+                primary_model_revision=PRIMARY_MODEL_REVISION,
+                anchor_manifest_hash=validated.anchor_manifest_hash,
+                anchor_selection_hash=validated.anchor_selection_hash,
+                position_manifest_hash=validated.position_manifest_hash,
+                rollout_manifest_hash=validated.rollout_manifest_hash,
+                probe_design_manifest_hash=probe_design.manifest_hash,
+                probe_design_manifest_sha256=(
+                    probe_design_manifest_sha256
+                    or probe_design.manifest_hash.removeprefix("sha256:")
+                ),
+                candidate_probe_manifest_hash=probe_design.candidate_probe_manifest_hash,
+                candidate_probe_manifest_sha256=probe_design.candidate_probe_manifest_sha256,
+                probe_protocol_version=probe_design.protocol_version,
+                compatibility_prefix_manifest_hash=prefix_manifest.record_hash,
+                compatibility_prefix_manifest_sha256=prefix_manifest_sha256,
+                compatibility_manifest_hash=exc.manifest.record_hash,
+                compatibility_manifest_sha256=sha256_file(compatibility_path),
+                release_authorization_manifest_hash=(
+                    release_authorization_manifest_hash
+                ),
+                release_authorization_manifest_sha256=(
+                    release_authorization_manifest_sha256
+                ),
+            )
+            write_json(failure_path, failure.to_dict(include_hash=True))
+        raise LensCommandGateError(
+            str(exc),
+            compatibility_manifest=exc.manifest,
+            failure_manifest=failure,
+        ) from exc
     write_compatibility_manifest(compatibility_path, compatibility)
 
     bundle = primary_state.get("bundle")
@@ -708,14 +1092,19 @@ def run_frozen_lens_command(
         runtime=bundle.runtime,
         lenses=bundle.lenses,
         backend=bundle.backend,
+        probe_design=probe_design,
         output_path=output,
         layers=normalized_layers,
     )
+    eligible_cells = sum(cell.probe_eligible for cell in probe_design.cells)
+    rows_per_cell = 2 * len(normalized_layers)
     manifest = LensExecutionManifest(
         anchor_manifest_hash=validated.anchor_manifest_hash,
         anchor_selection_hash=validated.anchor_selection_hash,
         position_manifest_hash=validated.position_manifest_hash,
         rollout_manifest_hash=validated.rollout_manifest_hash,
+        compatibility_prefix_manifest_hash=prefix_manifest.record_hash,
+        compatibility_prefix_manifest_sha256=prefix_manifest_sha256,
         compatibility_manifest_hash=compatibility.record_hash,
         primary_model_revision=PRIMARY_MODEL_REVISION,
         trace_count=len(validated.traces),
@@ -723,6 +1112,23 @@ def run_frozen_lens_command(
         layers=normalized_layers,
         lens_records_sha256=sha256_file(output),
         lens_records_path=str(output),
+        record_schema_version=2,
+        probe_design_manifest_hash=probe_design.manifest_hash,
+        probe_design_manifest_sha256=(
+            probe_design_manifest_sha256
+            or probe_design.manifest_hash.removeprefix("sha256:")
+        ),
+        candidate_probe_manifest_hash=probe_design.candidate_probe_manifest_hash,
+        candidate_probe_manifest_sha256=probe_design.candidate_probe_manifest_sha256,
+        probe_protocol_version=probe_design.protocol_version,
+        probe_cell_count=len(probe_design.cells),
+        eligible_probe_cell_count=eligible_cells,
+        ineligible_probe_cell_count=len(probe_design.cells) - eligible_cells,
+        eligible_record_count=eligible_cells * rows_per_cell,
+        ineligible_record_count=(len(probe_design.cells) - eligible_cells) * rows_per_cell,
+        analysis_forward_rule="max_authenticated_position_inclusive",
+        release_authorization_manifest_hash=release_authorization_manifest_hash,
+        release_authorization_manifest_sha256=release_authorization_manifest_sha256,
     )
     write_json(execution_path, manifest.to_dict(include_hash=True))
     return LensCommandResult(
@@ -731,6 +1137,7 @@ def run_frozen_lens_command(
         compatibility_manifest=compatibility,
         execution_manifest=manifest,
         lens_records_path=output,
+        compatibility_prefix_manifest_path=prefix_manifest_path,
         compatibility_manifest_path=compatibility_path,
         execution_manifest_path=execution_path,
     )
@@ -740,6 +1147,10 @@ def run_frozen_lens_command_from_files(
     paths: LensCommandPaths,
     *,
     compatibility_prefixes: CompatibilityPrefixes,
+    probe_design: LensProbeDesign,
+    probe_design_manifest_sha256: str | None = None,
+    release_authorization_manifest_hash: str | None = None,
+    release_authorization_manifest_sha256: str | None = None,
     smoke_runtime_factory: Callable[[], SmokeRuntimeBundle],
     primary_runtime_factory: Callable[[], PrimaryRuntimeBundle],
     layers: Sequence[int] = FITTED_LAYERS,
@@ -757,28 +1168,39 @@ def run_frozen_lens_command_from_files(
         anchor_manifest=anchor_payload,
         position_records=read_jsonl(paths.position_manifest),
         compatibility_prefixes=compatibility_prefixes,
+        probe_design=probe_design,
+        probe_design_manifest_sha256=probe_design_manifest_sha256,
+        release_authorization_manifest_hash=release_authorization_manifest_hash,
+        release_authorization_manifest_sha256=release_authorization_manifest_sha256,
         smoke_runtime_factory=smoke_runtime_factory,
         primary_runtime_factory=primary_runtime_factory,
         lens_records_path=paths.lens_records,
+        compatibility_prefix_manifest_path=paths.compatibility_prefix_manifest,
         compatibility_manifest_path=paths.compatibility_manifest,
         execution_manifest_path=paths.execution_manifest,
+        failure_manifest_path=paths.failure_manifest,
         layers=layers,
     )
 
 
 __all__ = [
     "POSITION_RECORD_SCHEMA",
+    "CompatibilityPrefixManifest",
     "CompatibilityPrefixes",
     "LensCommandGateError",
     "LensCommandInputError",
     "LensCommandPaths",
     "LensCommandResult",
     "LensExecutionManifest",
+    "LensFailureManifest",
     "PrimaryRuntimeBundle",
     "SmokeRuntimeBundle",
     "ValidatedLensInputs",
     "required_position_record_schema",
     "run_frozen_lens_command",
     "run_frozen_lens_command_from_files",
+    "validate_compatibility_prefix_manifest",
     "validate_frozen_lens_inputs",
+    "validate_lens_failure_manifest",
+    "validate_probe_design",
 ]

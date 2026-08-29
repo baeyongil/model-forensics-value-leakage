@@ -5,9 +5,13 @@ from typing import ClassVar
 
 import pytest
 
+from model_forensics.lens import DEFAULT_CONCEPT_WORDS
+from model_forensics.lens_runner import FROZEN_PROBE_TOKEN_IDS
 from model_forensics.qwen4b_smoke import (
     SMOKE_MODEL_ID,
     SMOKE_MODEL_REVISION,
+    _fixture_evidence,
+    _probe_grid_evidence,
     run_qwen4b_prefix_smoke,
 )
 from model_forensics.resample_runner import RawPrefixGenerationRequest
@@ -321,3 +325,47 @@ def test_real_4b_smoke_is_fixed_and_rejects_unbounded_work_before_gpu_setup(tmp_
             rollout_max_tokens=4096,
         )
     assert not (tmp_path / "must-not-exist.json").exists()
+
+
+def test_nonprimary_fixture_exercises_parser_trajectory_and_exact_anchor_mapping() -> None:
+    evidence = _fixture_evidence(CharacterTokenizer())
+
+    assert evidence["synthetic"] is True
+    assert evidence["primary_eligible"] is False
+    assert evidence["trajectory"]["features"]["first_estimate"] == 36_000_000
+    assert evidence["trajectory"]["features"]["final_estimate"] == 42_000_000
+    assert evidence["anchor"]["token_span"]["round_trip_verified"] is True
+
+
+class ProbeTokenizer(CharacterTokenizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.probes = {
+            word: FROZEN_PROBE_TOKEN_IDS[concept][polarity][index]
+            for concept, polarities in DEFAULT_CONCEPT_WORDS.items()
+            for polarity, words in polarities.items()
+            for index, word in enumerate(words)
+        }
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        if text in self.probes:
+            return [self.probes[text]]
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
+def test_4b_probe_grid_exercises_full_shape_and_states_transport_boundary() -> None:
+    evidence = _probe_grid_evidence(
+        tokenizer=ProbeTokenizer(),
+        prompt_ids=(ord("p"), ord("q")),
+        completion_ids=tuple(ord(character) for character in "abcdef"),
+        prefix_count=2,
+        next_count=3,
+        answer_first_token=5,
+    )
+
+    assert evidence["probe_cell_count"] == 15
+    assert evidence["primary_eligible"] is False
+    boundary = evidence["transport_boundary"]
+    assert boundary["activation_transport_executed"] is False
+    assert boundary["fabricated_lens_record_count"] == 0
+    assert boundary["status"] == "not_executable_without_matched_4b_j_and_r_lenses"

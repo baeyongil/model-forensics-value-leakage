@@ -100,6 +100,20 @@ export RUNPOD_POD_ID
 make gpu-bootstrap GPU_PHASE="$GPU_PHASE"
 ```
 
+The first bootstrap authenticates and installs the exact sentence-transformers wheel plus its
+inference-critical version set. The environment record hashes each installed distribution's
+`METADATA` and `RECORD`, the wheel's PEP-610 archive SHA-256, and the pinned Transformers source
+commit. Primary semantic eligibility additionally requires the exact embedding-model revision and
+tokenizer/model runtime provenance; re-arm recomputes this identity and fails closed on drift.
+
+Before any 122B model load, bootstrap also runs the bounded real Qwen3.5-4B integration gate. It
+uses one rollout and two short raw-prefix continuations, exercises deterministic parsing,
+trajectory, anchor span-to-token mapping, and the complete 5-position × 3-concept probe-design
+plumbing, then writes a non-primary manifest. The 4B generation runtime has no matched J/R lens
+weights or same-forward activation contract, so the manifest must state that exact boundary,
+contain zero fabricated lens rows, and forbid analysis ingestion. Failure of this gate prevents the
+reusable setup lock from being created.
+
 The watchdog must remain armed for the entire paid phase. It performs stop—not this helper—and the
 reservation must be settled after the stopped state and provider cost are confirmed.
 

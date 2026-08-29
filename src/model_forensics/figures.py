@@ -39,10 +39,13 @@ def _finish(fig: Any, destination: str | Path) -> Path:
 
 
 def plot_first_vs_final_bias(summary: pd.DataFrame, destination: str | Path) -> Path:
-    """Plot good-side rates for first and final estimates by task/condition.
+    """Plot above-threshold rates for first and final estimates by task/condition.
 
     Required columns: ``task``, ``condition``, ``stage``, ``rate``, ``ci_low``,
-    and ``ci_high``. ``stage`` must contain ``first`` and ``final``.
+    and ``ci_high``. ``stage`` must contain ``first`` and ``final``.  This
+    figure deliberately retains the neutral controls, so its metric is
+    ``P(estimate > threshold)`` rather than the direction-aligned good-side
+    rate (which is undefined for baseline and threshold-only conditions).
     """
 
     required = {"task", "condition", "stage", "rate", "ci_low", "ci_high"}
@@ -83,7 +86,7 @@ def plot_first_vs_final_bias(summary: pd.DataFrame, destination: str | Path) -> 
         axis.spines[["top", "right"]].set_visible(False)
     axes[0][0].legend(frameon=False, loc="upper left")
     fig.suptitle(
-        "When does the value-direction gap enter the estimate?", fontsize=14, fontweight="bold"
+        "When do estimates cross the numeric threshold?", fontsize=14, fontweight="bold"
     )
     fig.tight_layout()
     return _finish(fig, destination)
@@ -112,22 +115,47 @@ def plot_sentence_effect_forest(effects: pd.DataFrame, destination: str | Path) 
     positions = np.arange(len(rows))[::-1]
     for y, (_, row) in zip(positions, rows.iterrows(), strict=True):
         color = COLORS.get(str(row["sentence_class"]), "#4B5563")
-        estimate = float(row["estimate"])
-        axis.errorbar(
-            estimate,
-            y,
-            xerr=[[estimate - float(row["ci_low"])], [float(row["ci_high"]) - estimate]],
-            fmt="o",
-            color=color,
-            capsize=3,
-            markersize=6,
-        )
+        values = pd.to_numeric(
+            pd.Series([row["estimate"], row["ci_low"], row["ci_high"]]),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        estimate, ci_low, ci_high = values
+        estimable = bool(np.isfinite(values).all() and ci_low <= estimate <= ci_high)
+        if estimable:
+            axis.errorbar(
+                estimate,
+                y,
+                xerr=[[estimate - ci_low], [ci_high - estimate]],
+                fmt="o",
+                color=color,
+                capsize=3,
+                markersize=6,
+            )
+        else:
+            # Missing complete-case estimands are legitimate outcomes of the
+            # frozen missingness policy.  Keep their rows visible rather than
+            # crashing or silently dropping them.
+            axis.scatter(0, y, marker="x", color=color, s=38, zorder=3)
+            axis.annotate(
+                "NA (not estimable)",
+                xy=(0, y),
+                xytext=(7, 0),
+                textcoords="offset points",
+                va="center",
+                fontsize=8,
+                color="#374151",
+            )
     axis.axvspan(-0.10, 0.10, color="#F3F4F6", zorder=-2, label="±10 pp ROPE")
     axis.axvline(0, color="#6B7280", linewidth=1)
-    labels = [
-        f"{str(row.sentence_class).replace('_', ' ')} · {str(row.direction).replace('_', ' ')}"
-        for row in rows.itertuples()
-    ]
+    labels = []
+    for row in rows.itertuples():
+        label = (
+            f"{str(row.sentence_class).replace('_', ' ')} · "
+            f"{str(row.direction).replace('_', ' ')}"
+        )
+        if any(pd.isna(value) for value in (row.estimate, row.ci_low, row.ci_high)):
+            label += " [not estimable]"
+        labels.append(label)
     axis.set_yticks(positions, labels)
     axis.set_xlabel("Delta P(good-side final answer): retain - divergent resample")
     axis.set_title("Which reasoning sentences causally control the answer?", fontweight="bold")
@@ -146,6 +174,8 @@ def plot_lens_heatmap(records: pd.DataFrame, destination: str | Path) -> Path:
     if missing:
         raise ValueError(f"lens records missing columns: {sorted(missing)}")
     subset = records[records["concept_set"] == "direction"].copy()
+    if "probe_eligible" in subset:
+        subset = subset[subset["probe_eligible"] == True].copy()  # noqa: E712
     if subset.empty:
         raise ValueError("no direction lens records")
     position_order = [
@@ -155,6 +185,22 @@ def plot_lens_heatmap(records: pd.DataFrame, destination: str | Path) -> Path:
         "anchor_post",
         "final_answer_pre",
     ]
+    complete_positions = (
+        subset.groupby("trace_id", observed=True)["position"].agg(lambda values: set(values))
+        if "trace_id" in subset
+        else pd.Series(dtype=object)
+    )
+    if not complete_positions.empty:
+        common_traces = {
+            str(trace_id)
+            for trace_id, positions in complete_positions.items()
+            if set(position_order).issubset(positions)
+        }
+        subset = subset[subset["trace_id"].astype(str).isin(common_traces)].copy()
+        if subset.empty:
+            raise ValueError("no trace is probe-eligible at every heatmap position")
+    else:
+        common_traces = set()
     lens_types = [kind for kind in ["j", "r"] if kind in set(subset["lens_type"])]
     plt = _pyplot()
     fig, axes = plt.subplots(1, len(lens_types), figsize=(6.2 * len(lens_types), 6), squeeze=False)
@@ -185,7 +231,9 @@ def plot_lens_heatmap(records: pd.DataFrame, destination: str | Path) -> Path:
         axis.set_title(f"{lens_type.upper()}-lens")
         fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="Signed direction contrast")
     fig.suptitle(
-        "Is the good-side direction represented before it is verbalized?", fontweight="bold"
+        "Is the good-side direction represented before it is verbalized?"
+        + (f" (common eligible traces n={len(common_traces)})" if common_traces else ""),
+        fontweight="bold",
     )
     fig.tight_layout()
     return _finish(fig, destination)

@@ -13,8 +13,9 @@ from model_forensics.qwen4b_smoke import run_qwen4b_prefix_smoke
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one pinned Qwen3.5-4B full rollout and one exact-token raw-prefix "
-            "continuation. This loads a local GPU model but calls no paid API."
+            "Run one pinned Qwen3.5-4B full rollout, exact-token retain/resample "
+            "continuations, a deterministic parser/span fixture, and the structural "
+            "probe grid. This non-primary gate loads a local GPU model but calls no paid API."
         )
     )
     parser.add_argument(

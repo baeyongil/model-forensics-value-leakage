@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import shlex
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -466,17 +470,18 @@ def test_watchdog_pid_file_must_point_to_live_process(tmp_path: Path) -> None:
 def test_bootstrap_arms_watchdog_before_any_download_and_never_deletes() -> None:
     script = BOOTSTRAP.read_text(encoding="utf-8")
     budget_gate = script.index("python3 scripts/gpu_budget_preflight.py")
-    arm = script.index("nohup python3 scripts/runpod_watchdog.py")
+    arm = script.rindex('with_watchdog_credentials env PYTHONPATH="$PWD/src" nohup')
     identity = script.index("python3 scripts/runpod_process_identity.py record")
     readiness = script.index("if watchdog_is_armed")
     first_download = script.index("curl --fail")
+    scrub = script.index("unset GPU_BUDGET_SESSION_ID RUNPOD_API_KEY HF_TOKEN")
     post_setup_gate = script.rindex("python3 scripts/runpod_active_session_verify.py")
-    assert budget_gate < arm < identity < readiness < first_download < post_setup_gate
+    assert scrub < budget_gate < arm < identity < readiness < first_download < post_setup_gate
     assert "kill -0" not in script
-    assert 'GPU_BUDGET_SESSION_ID="$GPU_BUDGET_SESSION_ID_PRIVATE"' in script
+    assert "printf -v GPU_BUDGET_SESSION_ID '%s' \"$GPU_BUDGET_SESSION_ID_PRIVATE\"" in script
     assert '--prior-committed-gpu-usd "$PRIOR_COMMITTED_GPU_USD"' in script
     assert '--maximum-runtime-hours "$MAXIMUM_SAFE_RUNTIME_HOURS"' in script
-    assert "env -u GPU_BUDGET_SESSION_ID" in script
+    assert "with_gpu_session_id env PYTHONPATH" in script
     assert '--session-id "$GPU_BUDGET_SESSION_ID"' not in script
     assert "scripts/runpod_session_prepare.py" in script
     assert "scripts/gpu_setup_lock.py validate" in script
@@ -488,3 +493,65 @@ def test_bootstrap_arms_watchdog_before_any_download_and_never_deletes() -> None
     assert "data/manifests/gpu_environment.json" not in script
     assert "/stop" not in script  # all mutation logic stays in the tested Python client
     assert "DELETE" not in script
+    assert "pip install --upgrade" not in script
+    assert "pip install uv" not in script
+    assert "uv pip install" not in script
+    assert "secret_free curl --fail" in script
+    assert "secret_free .venv-gpu/bin/python -m pip install" in script
+    assert "with_hf_token .venv-gpu/bin/python scripts/qwen4b_prefix_smoke.py" in script
+    assert "-e . --no-deps" in script
+
+
+def test_bootstrap_secret_wrappers_remove_inherited_private_exports() -> None:
+    script = BOOTSTRAP.read_text(encoding="utf-8")
+    wrapper_source = script[
+        script.index('EXPECTED_SESSION_HASH=""') : script.index('case "$GPU_FAMILY" in')
+    ]
+    secret_names = (
+        "GPU_BUDGET_SESSION_ID",
+        "RUNPOD_API_KEY",
+        "HF_TOKEN",
+        "GPU_BUDGET_SESSION_ID_PRIVATE",
+        "RUNPOD_API_KEY_PRIVATE",
+        "HF_TOKEN_PRIVATE",
+    )
+    probe = (
+        "import json, os; "
+        f"names={secret_names!r}; "
+        "print(json.dumps({name: os.environ.get(name) for name in names}, sort_keys=True))"
+    )
+    command = wrapper_source + "\n" + "\n".join(
+        (
+            'GPU_BUDGET_SESSION_ID_PRIVATE="actual-nonce"',
+            'RUNPOD_API_KEY_PRIVATE="actual-runpod"',
+            'HF_TOKEN_PRIVATE="actual-hf"',
+            f"secret_free python3 -c {shlex.quote(probe)}",
+            f"with_gpu_session_id python3 -c {shlex.quote(probe)}",
+            f"with_hf_token python3 -c {shlex.quote(probe)}",
+            f"with_watchdog_credentials python3 -c {shlex.quote(probe)}",
+        )
+    )
+    inherited = {name: f"inherited-{name.lower()}" for name in secret_names}
+    completed = subprocess.run(
+        ["bash", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **inherited},
+    )
+    rows = [json.loads(line) for line in completed.stdout.splitlines()]
+
+    assert rows[0] == {name: None for name in secret_names}
+    assert rows[1] == {
+        **{name: None for name in secret_names},
+        "GPU_BUDGET_SESSION_ID": "actual-nonce",
+    }
+    assert rows[2] == {
+        **{name: None for name in secret_names},
+        "HF_TOKEN": "actual-hf",
+    }
+    assert rows[3] == {
+        **{name: None for name in secret_names},
+        "RUNPOD_API_KEY": "actual-runpod",
+        "HF_TOKEN": "actual-hf",
+    }

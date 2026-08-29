@@ -74,6 +74,43 @@ def test_reservation_id_reuse_with_different_content_fails_closed(tmp_path) -> N
         )
 
 
+def test_batch_reservation_is_atomic_when_complete_inventory_exceeds_cap(tmp_path) -> None:
+    ledger = CostLedger(tmp_path / "cost.yaml", BudgetLimits(gpu=5, api=0.30, total=5.30))
+    reservations = (
+        (
+            "sha256:" + "1" * 64,
+            CostEntry(kind="api", amount_usd=0.20, description="first", status="estimated"),
+        ),
+        (
+            "sha256:" + "2" * 64,
+            CostEntry(kind="api", amount_usd=0.20, description="second", status="estimated"),
+        ),
+    )
+
+    with pytest.raises(BudgetExceeded):
+        ledger.reserve_batch(reservations)
+
+    assert not ledger.path.exists()
+
+
+def test_batch_reservation_returns_exact_created_and_covered_identities(tmp_path) -> None:
+    ledger = CostLedger(tmp_path / "cost.yaml")
+    existing_id = "sha256:" + "3" * 64
+    new_id = "sha256:" + "4" * 64
+    existing = CostEntry(
+        kind="api", amount_usd=0.10, description="existing", status="estimated"
+    )
+    new = CostEntry(kind="api", amount_usd=0.20, description="new", status="estimated")
+    ledger.reserve(existing_id, existing)
+
+    snapshot = ledger.reserve_batch(((existing_id, existing), (new_id, new)))
+
+    assert snapshot.covered_entry_ids == (existing_id,)
+    assert snapshot.created_entry_ids == (new_id,)
+    assert snapshot.committed_before["api"] == 0.10
+    assert snapshot.committed_after["api"] == 0.30
+
+
 def test_loaded_ledger_cannot_silently_change_hard_stops(tmp_path) -> None:
     path = tmp_path / "cost.yaml"
     CostLedger(path, BudgetLimits(gpu=5, api=2, total=7)).append(

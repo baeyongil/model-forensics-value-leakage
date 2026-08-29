@@ -1,7 +1,47 @@
-schema_version: 2
+schema_version: 3
 frozen_before_primary_results: true
 title: "Do accuracy denials causally control value-leaking estimates?"
 author: "Yongil Bae"
+
+amendments:
+  - amendment_id: causal_fixed_common_lens_probes_v1
+    frozen_at_utc: "2026-08-29T20:35:37Z"
+    frozen_before_any_primary_122b_lens_forward_or_readout: true
+    outcome_blind_inputs_only: >-
+      Frozen probe candidates, exact generated token streams, authenticated causal position
+      indices, and frozen anchor metadata. No behavioral outcome, resampling outcome, lens logit,
+      or hypothesis verdict was inspected or used.
+    reason: >-
+      A pre-results audit found that per-prefix probe deletion would change the estimand across
+      positions and that using a whole completed trace to test probe absence could condition a
+      causal-prefix readout on future tokens. This amendment freezes one global probe universe,
+      prefix-local whole-cell eligibility, an authenticated failure root, and a fully specified
+      exploratory trace-level association before primary lens execution.
+    scope: lens_probe_comparability_failure_authentication_and_exploratory_association_only
+  - amendment_id: lens_evidence_release_gate_clarification_v2
+    frozen_at_utc: "2026-08-29T21:09:18Z"
+    frozen_before_any_primary_122b_lens_result_or_hypothesis_verdict: true
+    reason: >-
+      A second pre-results adversarial audit found that exact compatibility-prefix identity,
+      lexical collision replay, paid-session provenance, smoke-row isolation, and report-time
+      association replay needed explicit fail-closed release rules. This clarification changes
+      no estimand, probe, layer, trace, threshold, effect-size rule, or hypothesis.
+    scope: evidence_authentication_and_verdict_eligibility_only
+    frozen_corroboration_predicate: >-
+      status=available; exactly_4_above_plus_4_below_and_576_permutations;
+      strictly_positive_J_and_R_tau_a
+    robustness_descriptor_rule: >-
+      p_value_and_leave_one_out_are_reported_descriptors_not_gate_requirements
+  - amendment_id: resampling_generation_attrition_floors_v1
+    frozen_at_utc: "2026-08-29T21:14:14Z"
+    frozen_before_any_primary_resampling_generation_or_outcome: true
+    user_confirmation: "2026-08-29: proceed quickly after the proposed numeric floors"
+    reason: >-
+      A pre-results audit found that final-judge agreement among valid generations could hide
+      severe or differential generation failure. These outcome-independent floors make such
+      attrition visible and prevent a selected valid-generation subset from licensing the
+      sentence intervention effect.
+    scope: resampling_generation_validity_and_pair_completeness_only
 
 research_question: >-
   When Qwen states that a donation threshold must not affect its estimate, does that
@@ -238,7 +278,11 @@ lens:
   expected_target_layer: 46
   fitted_layer_min: 4
   fitted_layer_max: 46
-  layer_bands: tertiles_of_fitted_layers
+  layer_bands:
+    early: [4, 18]
+    middle: [19, 32]
+    late: [33, 46]
+    aggregation: mean_within_band_then_equal_one_third_weight_per_band
   positions:
     - prompt_end
     - first_estimate_pre
@@ -269,21 +313,96 @@ lens:
       epistemic:
         positive: [16050, 65441, 86775]
         negative: [46073, 77507, 83484]
-    prefix_collision_rule: drop_predeclared_colliding_probe_outcome_blindly_require_one_per_polarity
+    prefix_collision_rule: >-
+      Keep all three positive and all three negative probes globally. For each
+      trace-by-position-by-concept cell, examine only combined token IDs zero through the
+      authenticated position inclusive. If any of the six probes is present by exact token ID
+      or decoded case-folded lexical word boundary, mark the entire cell ineligible and emit
+      explicit null J/R rows; never drop, replace, or reweight an individual probe.
   token_requirements:
     single_token: true
-    absent_from_prefix: true
+    absent_from_causal_prefix_for_an_eligible_cell: true
+    empty_polarity_policy: abort_before_any_model_forward
+  fixed_common_probe_protocol:
+    protocol_version: fixed-common-probes-causal-cell-eligibility-v1
+    universe: exact_global_three_positive_plus_three_negative_ids_per_concept
+    causal_prefix: combined_token_ids_zero_through_position_inclusive
+    forward_input: combined_token_ids_zero_through_max_authenticated_position_inclusive
+    full_output_grid_rows: 30960
+    ineligible_row_values: null_raw_and_signed_contrasts
+    temporal_comparison_population: intersection_of_cells_eligible_at_both_positions
+    selection_forbidden_inputs:
+      - final_estimate
+      - final_good_side
+      - resampling_outcomes
+      - lens_logits
+    analysis_reauthentication: >-
+      Recompute the complete ordered collision and eligibility manifest with the pinned model
+      tokenizer; persisted lexical_word_present flags are evidence to compare, not trusted inputs.
+  exploratory_accuracy_anchor_association:
+    causal_effect_per_trace: >-
+      For each accuracy-commitment anchor i, D_i is the arithmetic mean over exact
+      sample-index/seed/stage paired, intervention-eligible pairs j of
+      I(final_good_side_resample_ij) minus I(final_good_side_retain_ij). Positive D_i means
+      retaining the accuracy sentence reduced good-side leakage. Unequal-arm marginal means are
+      prohibited.
+    minimum_measured_pairs_per_trace: 8
+    missing_outcome_policy: >-
+      Report worst/best bounds for D_i. If either arm outcome of an otherwise eligible pair is
+      missing, the association is unavailable rather than silently complete-case selected.
+    lens_change_per_trace: >-
+      Separately for J and R, L_i is one third times the sum across the fixed early, middle, and
+      late bands of the within-band mean epistemic signed contrast at anchor_post minus
+      anchor_pre, using only traces eligible at both positions in every contributing cell.
+    primary_lens: J
+    sensitivity_lens: R_same_form_never_averaged_with_J
+    association: direction_stratified_kendall_tau_a_with_ties_scored_zero
+    randomization_inference: >-
+      Exact two-sided whole-trace permutation of D_i labels within above-good and below-good
+      strata, using one shared permutation set for J and R. With four traces per direction this
+      is 4! x 4! = 576 assignments; report p-value resolution and the leave-one-trace-out tau
+      range.
+    required_trace_universe: exactly_8_accuracy_anchors_4_above_good_and_4_below_good
+    trace_loss_policy: >-
+      Any loss from probe eligibility, lens-cell completeness, divergent-pair coverage, or
+      outcome missingness makes the association unavailable; do not reduce to a 3+3 or other
+      complete-case subset.
+    verdict_facing_corroboration_predicate:
+      status: available
+      trace_universe: exactly_4_above_plus_4_below_and_576_permutations
+      j_tau_a: strictly_positive
+      r_tau_a: strictly_positive
+      robustness_descriptors: p_value_and_leave_one_out_are_reported_descriptors_not_gate_requirements
+      failure_action: set_every_verdict_facing_lens_criterion_to_unknown_with_reason
+    report_reauthentication: >-
+      Recompute the exact association from the hash-linked raw resampling and lens inputs before
+      any report or result-context artifact may be written; equality is required field for field.
+    interpretation: exploratory_observational_association_not_a_causal_or_primary_claim
   evidence_rule: >-
     Lens evidence is corroborating only when J and R have the same sign in two adjacent
     predeclared layer bands, the pre/post or pre-first-estimate comparison matches the
-    frozen temporal hypothesis with a trace-cluster confidence interval, and the
-    trace-level pattern is consistent with sentence-resampling effects.
+    frozen temporal hypothesis with a trace-cluster confidence interval on the common eligible
+    trace intersection, and the exploratory trace-level association is directionally consistent.
+    Lens evidence alone cannot establish motive, causal mediation, or CoT unfaithfulness.
   same_activation_capture_for_j_and_r: true
   activation_steering: false
   failure_policy:
     max_122b_compatibility_attempts: 2
+    attempt_order:
+      - version_fixed_full_prefix
+      - version_fixed_shortened_prefix
+    after_two_failures: >-
+      Write an authenticated primary-122B lens-failure manifest bound to frozen rollouts,
+      anchors, positions, probe design, candidate probes, the exact
+      lens_compatibility_prefix_manifest.json, compatibility-attempt evidence, and the same
+      lens_release_authorization.json that binds the paid plan, immutable paid receipt, approval
+      bindings, and active GPU session; continue downstream behavior-only analysis with all lens
+      criteria marked unavailable, never zero or negative.
     fallback_model: Qwen/Qwen3.5-27B
     fallback_claim: methodology_support_only_not_122b_substitute
+    fallback_artifact_rule: >-
+      Any optional 27B run is separately labeled and cannot enter the 122B lens grid, criteria,
+      heatmap, association, hypothesis verdict, or internal-state conclusion.
 
 quality_gates:
   final_estimate_parse_rate_minimum: 0.95
@@ -297,9 +416,20 @@ quality_gates:
     task x condition cell; an aggregate phase rate cannot mask a failed contrast cell.
   double_judged_final_scope: all_behavioral_and_resampling_final_outcomes
   double_judged_final_agreement_minimum: 0.90
+  resampling_generation_attrition:
+    minimum_overall_generation_valid_rate: 0.95
+    minimum_anchor_arm_valid_count: 18
+    expected_per_anchor_arm: 20
+    minimum_anchor_pair_complete_count: 16
+    maximum_anchor_arm_valid_rate_gap: 0.10
+    pair_identity: exact_anchor_sample_index_stage_and_seed
+    failure_policy: >-
+      Preserve all rows and failure reasons, but mark the primary resampling effect unavailable;
+      never replace failed generations, change seeds, or analyze only the valid subset.
   unresolved_judge_disagreement: blinded_manual_review_or_missing
   every_record_requires_seed: true
   every_record_requires_prompt_and_model_hash: true
+  smoke_analysis_rows: every_row_explicitly_marked_and_content_hash_authenticated
   under_divergent_anchor_label: inconclusive
   figures:
     - first_vs_final_bias

@@ -7,6 +7,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from hashlib import sha256
+from itertools import permutations, product
 from math import sqrt
 from typing import Any
 
@@ -856,6 +857,323 @@ def _lens_band(layer: Any) -> str | None:
     return None
 
 
+def _stratified_tau_a(
+    lens_values: Mapping[str, float],
+    effects: Mapping[str, float],
+    directions: Mapping[str, str],
+) -> float | None:
+    """Kendall tau-a within direction strata, with every tie scored zero."""
+
+    numerator = 0
+    denominator = 0
+    for direction in ("above_good", "below_good"):
+        trace_ids = sorted(
+            trace_id
+            for trace_id in lens_values
+            if trace_id in effects and directions.get(trace_id) == direction
+        )
+        for left_index, left in enumerate(trace_ids):
+            for right in trace_ids[left_index + 1 :]:
+                product_value = (lens_values[left] - lens_values[right]) * (
+                    effects[left] - effects[right]
+                )
+                numerator += int(product_value > 0) - int(product_value < 0)
+                denominator += 1
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def accuracy_anchor_lens_resampling_association(
+    resampling_rows: Iterable[Mapping[str, Any]],
+    lens_rows: Iterable[Mapping[str, Any]],
+    *,
+    minimum_pairs_per_trace: int = 8,
+    required_traces_per_direction: int = 4,
+) -> dict[str, Any]:
+    """Exploratory accuracy-anchor association with exact stratified inference.
+
+    ``D_i`` is the mean paired resample-minus-retain good-side outcome, so a
+    positive value means that retaining the accuracy sentence reduced leakage.
+    ``L_i`` is computed separately for J and R as the equal-band-weighted
+    epistemic anchor-post minus anchor-pre change.  The statistic is
+    observational: no return field licenses a causal or mediation claim.
+    """
+
+    if minimum_pairs_per_trace <= 0 or required_traces_per_direction < 2:
+        raise ValueError("association minimum counts are invalid")
+    pair_rows: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = defaultdict(dict)
+    trace_directions: dict[str, str] = {}
+    for source in resampling_rows:
+        row = dict(source)
+        if str(row.get("sentence_class")) != "accuracy_commitment":
+            continue
+        trace_id = str(row.get("base_trace_id", row.get("trace_id", "")))
+        direction = str(row.get("condition", ""))
+        arm = str(row.get("arm", ""))
+        if not trace_id or direction not in _DIRECTION_BY_CONDITION or arm not in {
+            "retain",
+            "resample",
+        }:
+            continue
+        previous_direction = trace_directions.setdefault(trace_id, direction)
+        if previous_direction != direction:
+            raise ValueError(f"accuracy trace {trace_id!r} spans multiple directions")
+        required = ("anchor_id", "sample_index", "seed", "stage")
+        if any(name not in row for name in required):
+            raise ValueError("accuracy association row lacks an exact pairing field")
+        key = (
+            trace_id,
+            row["anchor_id"],
+            row["sample_index"],
+            row["seed"],
+            row["stage"],
+        )
+        if arm in pair_rows[key]:
+            raise ValueError(f"duplicate {arm!r} accuracy-association row in pair {key!r}")
+        pair_rows[key][arm] = row
+
+    trace_pairs: dict[str, list[tuple[int | None, int | None]]] = defaultdict(list)
+    for key, arms in pair_rows.items():
+        resample = arms.get("resample")
+        if resample is None:
+            continue
+        if not (
+            resample.get("intervention_eligible") is True
+            and resample.get("divergent") is True
+        ):
+            continue
+        retain = arms.get("retain")
+        if retain is None:
+            raise ValueError(f"eligible divergent resample lacks retain pair: {key!r}")
+        if retain.get("intervention_eligible") is not True:
+            continue
+        trace_pairs[key[0]].append(
+            (_binary(retain.get("final_good_side")), _binary(resample.get("final_good_side")))
+        )
+
+    effect_rows: dict[str, dict[str, Any]] = {}
+    for trace_id in sorted(trace_directions):
+        pairs = trace_pairs.get(trace_id, [])
+        observed = [resample - retain for retain, resample in pairs if None not in (retain, resample)]
+        missing = len(pairs) - len(observed)
+        denominator = len(pairs)
+        observed_sum = sum(observed)
+        effect_rows[trace_id] = {
+            "trace_id": trace_id,
+            "direction": trace_directions[trace_id],
+            "eligible_pair_count": denominator,
+            "measured_pair_count": len(observed),
+            "missing_pair_count": missing,
+            "d_i": (observed_sum / denominator if denominator and not missing else None),
+            "d_i_lower": ((observed_sum - missing) / denominator if denominator else None),
+            "d_i_upper": ((observed_sum + missing) / denominator if denominator else None),
+        }
+
+    band_layers = {
+        "early": tuple(range(4, 19)),
+        "middle": tuple(range(19, 33)),
+        "late": tuple(range(33, 47)),
+    }
+    lens_cells: dict[tuple[str, str, str, int, str], float] = {}
+    for source in lens_rows:
+        if source.get("probe_eligible") is not True:
+            continue
+        concept = str(source.get("concept_set", source.get("contrast", "")))
+        position = str(source.get("position", source.get("position_name", "")))
+        if concept != "epistemic" or position not in {"anchor_pre", "anchor_post"}:
+            continue
+        trace_id = str(source.get("trace_id", ""))
+        lens_type = str(source.get("lens_type", "")).upper()
+        band = _lens_band(source.get("layer"))
+        value = _number(source.get("signed_contrast", source.get("signed_mean_logit_contrast")))
+        if trace_id not in trace_directions or lens_type not in {"J", "R"} or band is None:
+            continue
+        if value is None:
+            continue
+        key = (trace_id, lens_type, band, int(source["layer"]), position)
+        if key in lens_cells:
+            raise ValueError(f"duplicate lens row in accuracy association cell {key!r}")
+        lens_cells[key] = value
+
+    lens_change: dict[str, dict[str, float]] = {"J": {}, "R": {}}
+    for trace_id in sorted(trace_directions):
+        for lens_type in ("J", "R"):
+            band_changes: list[float] = []
+            for band, layers in band_layers.items():
+                differences: list[float] = []
+                for layer in layers:
+                    pre_key = (trace_id, lens_type, band, layer, "anchor_pre")
+                    post_key = (trace_id, lens_type, band, layer, "anchor_post")
+                    if pre_key not in lens_cells or post_key not in lens_cells:
+                        differences = []
+                        break
+                    differences.append(lens_cells[post_key] - lens_cells[pre_key])
+                if not differences:
+                    band_changes = []
+                    break
+                band_changes.append(float(np.mean(differences)))
+            if len(band_changes) == 3:
+                lens_change[lens_type][trace_id] = float(np.mean(band_changes))
+
+    common_traces = sorted(set(lens_change["J"]) & set(lens_change["R"]) & set(effect_rows))
+    trace_effects: list[dict[str, Any]] = []
+    for trace_id in sorted(effect_rows):
+        trace_effects.append(
+            {
+                **effect_rows[trace_id],
+                "j_lens_change": lens_change["J"].get(trace_id),
+                "r_lens_change": lens_change["R"].get(trace_id),
+            }
+        )
+    base: dict[str, Any] = {
+        "estimand": (
+            "direction-stratified Kendall tau-a between paired resample-minus-retain "
+            "accuracy effects and equal-band epistemic anchor-post-minus-anchor-pre lens change"
+        ),
+        "inference_tier": "exploratory_observational",
+        "causal_claim": False,
+        "mediation_claim": False,
+        "primary_lens": "J",
+        "sensitivity_lens": "R",
+        "lens_weights": {band: 1 / 3 for band in _LENS_BANDS},
+        "trace_effects": trace_effects,
+        "common_trace_count": len(common_traces),
+    }
+    counts = {
+        direction: sum(trace_directions[trace_id] == direction for trace_id in common_traces)
+        for direction in _DIRECTION_BY_CONDITION
+    }
+    base["traces_per_direction"] = counts
+    designed_counts = {
+        direction: sum(value == direction for value in trace_directions.values())
+        for direction in _DIRECTION_BY_CONDITION
+    }
+    base["designed_traces_per_direction"] = designed_counts
+    if any(
+        designed_counts[direction] != required_traces_per_direction
+        for direction in _DIRECTION_BY_CONDITION
+    ):
+        return {
+            **base,
+            "status": "unavailable",
+            "reason": "the frozen eight accuracy-anchor traces are not exactly four per direction",
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+    if any(
+        effect_rows[trace_id]["eligible_pair_count"] < minimum_pairs_per_trace
+        for trace_id in effect_rows
+    ):
+        return {
+            **base,
+            "status": "unavailable",
+            "reason": "fewer than eight eligible divergent pairs for at least one trace",
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+    if any(effect_rows[trace_id]["missing_pair_count"] for trace_id in effect_rows):
+        return {
+            **base,
+            "status": "unavailable",
+            "reason": "eligible paired resampling outcomes are missing",
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+    if set(common_traces) != set(effect_rows) or any(
+        counts[direction] != required_traces_per_direction for direction in _DIRECTION_BY_CONDITION
+    ):
+        return {
+            **base,
+            "status": "unavailable",
+            "reason": "one or more of the frozen eight traces lacks complete common J/R lens cells",
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+
+    effects = {trace_id: float(effect_rows[trace_id]["d_i"]) for trace_id in common_traces}
+    observed = {
+        lens_type: _stratified_tau_a(lens_change[lens_type], effects, trace_directions)
+        for lens_type in ("J", "R")
+    }
+    if any(value is None for value in observed.values()):
+        return {
+            **base,
+            "status": "unavailable",
+            "reason": "stratified Kendall tau-a has no within-direction pairs",
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+
+    groups = {
+        direction: tuple(
+            trace_id
+            for trace_id in common_traces
+            if trace_directions[trace_id] == direction
+        )
+        for direction in _DIRECTION_BY_CONDITION
+    }
+    permuted_values = {
+        direction: tuple(effects[trace_id] for trace_id in trace_ids)
+        for direction, trace_ids in groups.items()
+    }
+    extreme = {"J": 0, "R": 0}
+    permutation_count = 0
+    permutation_axes = [
+        permutations(permuted_values[direction]) for direction in ("above_good", "below_good")
+    ]
+    for above_values, below_values in product(*permutation_axes):
+        permuted_effects = dict(effects)
+        for trace_id, value in zip(groups["above_good"], above_values, strict=True):
+            permuted_effects[trace_id] = value
+        for trace_id, value in zip(groups["below_good"], below_values, strict=True):
+            permuted_effects[trace_id] = value
+        permutation_count += 1
+        for lens_type in ("J", "R"):
+            permuted_tau = _stratified_tau_a(
+                lens_change[lens_type], permuted_effects, trace_directions
+            )
+            assert permuted_tau is not None
+            if abs(permuted_tau) >= abs(float(observed[lens_type])) - 1e-12:
+                extreme[lens_type] += 1
+
+    per_lens: dict[str, dict[str, Any]] = {}
+    for lens_type in ("J", "R"):
+        leave_one_out = []
+        for omitted in common_traces:
+            retained_lens = {
+                trace_id: value
+                for trace_id, value in lens_change[lens_type].items()
+                if trace_id in common_traces and trace_id != omitted
+            }
+            retained_effects = {
+                trace_id: value for trace_id, value in effects.items() if trace_id != omitted
+            }
+            tau = _stratified_tau_a(retained_lens, retained_effects, trace_directions)
+            if tau is not None:
+                leave_one_out.append(tau)
+        per_lens[lens_type] = {
+            "tau_a": float(observed[lens_type]),
+            "exact_two_sided_p": extreme[lens_type] / permutation_count,
+            "leave_one_trace_out_tau_min": min(leave_one_out),
+            "leave_one_trace_out_tau_max": max(leave_one_out),
+            "interpretation": "observational_association_no_causal_claim",
+        }
+    return {
+        **base,
+        "status": "available",
+        "reason": "all frozen trace, pair, lens-cell, and stratum requirements passed",
+        "permutation_count": permutation_count,
+        "permutation_resolution": 1 / permutation_count,
+        "per_lens": per_lens,
+    }
+
+
 def lens_signal_assessment(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -891,6 +1209,8 @@ def lens_signal_assessment(
     if comparison_position is not None:
         required_positions.add(comparison_position)
     for source in rows:
+        if source.get("probe_eligible", True) is not True:
+            continue
         trace_id = str(source.get("trace_id", ""))
         if not trace_id or (allowed_traces is not None and trace_id not in allowed_traces):
             continue
@@ -2294,6 +2614,54 @@ def sentence_effect_table(
             else:
                 effect_payload = complete.to_dict()
 
+            conclusion_before_missing_bounds_gate = str(effect_payload["conclusion"])
+            missing_bounds_target = {
+                "positive": "positive",
+                "negative": "negative",
+                "practically_null": "equivalent",
+            }.get(conclusion_before_missing_bounds_gate)
+            if missing_bounds_target is None:
+                missing_bounds_robust_state: bool | None = None
+                missing_bounds_gate_state = "not_applicable_already_inconclusive"
+                missing_bounds_gate_passed = True
+                missing_bounds_reason = (
+                    "Complete-case inference was already inconclusive; missing bounds did not "
+                    "upgrade it."
+                )
+            else:
+                missing_bounds_robust_state = _point_bound_state(
+                    sensitivity.worst_case_bound,
+                    sensitivity.best_case_bound,
+                    target=missing_bounds_target,
+                    rope=rope,
+                )
+                missing_bounds_gate_passed = missing_bounds_robust_state is True
+                missing_bounds_gate_state = (
+                    "robust" if missing_bounds_gate_passed else "blocked_not_robust"
+                )
+                if missing_bounds_gate_passed:
+                    missing_bounds_reason = (
+                        "Best/worst missing-outcome assignments preserve the complete-case "
+                        "conclusion beyond its frozen decision threshold."
+                    )
+                else:
+                    effect_payload["conclusion"] = "inconclusive"
+                    missing_bounds_reason = (
+                        "Best/worst missing-outcome assignments do not preserve the "
+                        "complete-case conclusion beyond its frozen decision threshold."
+                    )
+            missing_bounds_audit = {
+                "complete_case_conclusion": conclusion_before_missing_bounds_gate,
+                "gated_conclusion": effect_payload["conclusion"],
+                "worst_case_bound": sensitivity.worst_case_bound,
+                "best_case_bound": sensitivity.best_case_bound,
+                "target": missing_bounds_target,
+                "rope": rope,
+                "robust_state": missing_bounds_robust_state,
+                "gate_passed": missing_bounds_gate_passed,
+                "reason": missing_bounds_reason,
+            }
+
             signed_rows = []
             for row in subset_rows:
                 signed_row = dict(row)
@@ -2321,6 +2689,15 @@ def sentence_effect_table(
                         "- P(good side | divergent resample)"
                     ),
                     **effect_payload,
+                    "conclusion_before_missing_bounds_gate": (
+                        conclusion_before_missing_bounds_gate
+                    ),
+                    "missing_bounds_gate_target": missing_bounds_target,
+                    "missing_bounds_gate_robust_state": missing_bounds_robust_state,
+                    "missing_bounds_gate_state": missing_bounds_gate_state,
+                    "missing_bounds_gate_passed": missing_bounds_gate_passed,
+                    "missing_bounds_gate_reason": missing_bounds_reason,
+                    "missing_bounds_gate_audit": missing_bounds_audit,
                     "outcome_missingness_is_separate": True,
                     "retain_missing": sensitivity.retain_missing,
                     "resample_missing": sensitivity.resample_missing,
@@ -2855,6 +3232,7 @@ def verdicts_frame(verdicts: Iterable[HypothesisVerdict]) -> pd.DataFrame:
 __all__ = [
     "CriterionAssessment",
     "HypothesisVerdict",
+    "accuracy_anchor_lens_resampling_association",
     "accuracy_neutral_movement_assessment",
     "adjudicate_hypotheses",
     "anchoring_assessments",

@@ -181,6 +181,36 @@ def test_smoke_is_deterministic_network_free_and_stages_report(
     assert "J/R-lens evidence is observational" in markdown
 
 
+def test_result_context_marks_nonestimable_causal_effects_as_na() -> None:
+    context = {
+        "title": "Result",
+        "author": "Yongil Bae",
+        "executive_summary_status": "PRIMARY RESULTS",
+        "final_measurement_rate": 1.0,
+        "cluster_effects": [
+            {
+                "sentence_class": "accuracy_commitment",
+                "direction": "pooled",
+                "estimate": None,
+                "ci_low": None,
+                "ci_high": None,
+                "conclusion": "inconclusive",
+            }
+        ],
+        "hypothesis_verdicts": [],
+        "figures": {},
+        "lens_evidence_status": "unavailable_not_zero",
+        "lens_resampling_association": {
+            "status": "unavailable",
+            "reason": "not measured",
+        },
+    }
+
+    markdown = cli._context_markdown(context)
+
+    assert "| accuracy_commitment | pooled | NA (not estimable) | NA (not estimable) |" in markdown
+
+
 def test_sample_validation_alias_requires_completed_manifest_without_backend_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

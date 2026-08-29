@@ -28,6 +28,7 @@ from model_forensics.record_checkpoint import RecordCheckpointStore
 from model_forensics.resample_adjudication_phase import (
     ResampleAdjudicationGateError,
     ResampleAdjudicationPhaseError,
+    _quality_gate,
     load_authenticated_resample_generation,
     run_resample_adjudication_phase,
 )
@@ -104,6 +105,45 @@ def _frozen_design() -> tuple[AnchorManifest, dict[str, BaseTrace]]:
 class FixtureBackend:
     def __init__(self, *, malformed_request_id: str) -> None:
         self.malformed_request_id = malformed_request_id
+        self._decoded_pieces: dict[int, str] = {}
+        self._next_piece_id = 1_000_000
+
+    @property
+    def tokenizer(self) -> Any:
+        return self
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        del skip_special_tokens
+        assert clean_up_tokenization_spaces is False
+        return "".join(self._decoded_pieces.get(token_id, chr(token_id)) for token_id in token_ids)
+
+    def _piece_id(self, text: str) -> int:
+        token_id = self._next_piece_id
+        self._next_piece_id += 1
+        self._decoded_pieces[token_id] = text
+        return token_id
+
+    def _completion_ids(self, text: str, *, arm: str) -> tuple[int, ...]:
+        if arm != "resample" or text == "Unclosed but preserved raw output.":
+            return (self._piece_id(text),)
+        reasoning = text.split("</think>", 1)[0]
+        replacement = sentence_spans(reasoning)[0]
+        boundaries = [round(index * len(replacement.text) / 5) for index in range(6)]
+        pieces = [
+            replacement.text[boundaries[index] : boundaries[index + 1]]
+            for index in range(5)
+        ]
+        assert all(pieces)
+        return (
+            *(self._piece_id(piece) for piece in pieces),
+            self._piece_id(text[replacement.end :]),
+        )
 
     @property
     def provenance(self) -> Mapping[str, Any]:
@@ -138,7 +178,7 @@ class FixtureBackend:
                 text = " Continued reasoning.</think>Final answer: 80"
             else:
                 text = "A genuinely different replacement. More.</think>Final answer: 120"
-            completion_ids = tuple(ord(character) for character in text)
+            completion_ids = self._completion_ids(text, arm=request.arm)
             results.append(
                 RawPrefixGenerationResult(
                     request_id=request.request_id,
@@ -165,11 +205,18 @@ class FixtureEmbedder:
 
     @property
     def provenance(self) -> Mapping[str, Any]:
-        return {
+        payload: dict[str, Any] = {
+            "runtime_kind": "unit_test_double",
             "model_id": "fixture-embedder",
-            "revision": "fixed",
+            "model_revision": "fixed",
             "device": "cpu",
+            "primary_eligible": True,
         }
+        payload["provenance_hash"] = stable_hash(payload)
+        return payload
+
+    def assert_primary_eligible(self) -> None:
+        return None
 
     def encode(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
         self.calls += 1
@@ -446,6 +493,134 @@ def _rewrite_completed_checkpoint(checkpoint: Path, rows: list[dict[str, Any]]) 
     (checkpoint / "adjudication_manifest.json").unlink(missing_ok=True)
 
 
+def _attrition_quality_rows(
+    invalid: set[tuple[str, str, int]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for anchor_index in range(24):
+        anchor_id = f"anchor-{anchor_index:02d}"
+        for arm in ("retain", "resample"):
+            for sample_index in range(20):
+                valid = (anchor_id, arm, sample_index) not in invalid
+                rows.append(
+                    {
+                        "anchor_id": anchor_id,
+                        "arm": arm,
+                        "sample_index": sample_index,
+                        "generation_status": "valid" if valid else "terminal_invalid",
+                        "final_quality_denominator_eligible": valid,
+                        "dual_final_consensus": (
+                            {
+                                "exact_status_value_agreement": True,
+                                "known_consensus": True,
+                            }
+                            if valid
+                            else None
+                        ),
+                    }
+                )
+    return rows
+
+
+def _attrition_quality_gate(
+    invalid: set[tuple[str, str, int]],
+    **overrides: Any,
+) -> dict[str, Any]:
+    settings = {
+        "minimum_exact_agreement": 0.90,
+        "minimum_final_known_rate": 0.95,
+        "minimum_overall_generation_valid_rate": 0.95,
+        "minimum_anchor_arm_valid_count": 18,
+        "minimum_anchor_pair_complete_count": 16,
+        "maximum_anchor_arm_valid_rate_gap": 0.10,
+    }
+    settings.update(overrides)
+    return _quality_gate(_attrition_quality_rows(invalid), **settings)
+
+
+def test_generation_attrition_floors_accept_all_exact_boundaries() -> None:
+    invalid = {
+        (f"anchor-{anchor_index:02d}", arm, 0)
+        for anchor_index in range(24)
+        for arm in ("retain", "resample")
+    }
+    gate = _attrition_quality_gate(invalid)
+
+    assert gate["overall_generation_valid_rate"] == pytest.approx(0.95)
+    assert gate["generation_attrition_gate_passed"] is True
+    assert gate["gate_passed"] is True
+
+
+def test_generation_attrition_accepts_exact_18_per_arm_boundary() -> None:
+    invalid = {
+        ("anchor-00", arm, sample_index)
+        for arm in ("retain", "resample")
+        for sample_index in (0, 1)
+    }
+    gate = _attrition_quality_gate(invalid)
+    reports = [
+        row for row in gate["anchor_arm_reports"] if row["anchor_id"] == "anchor-00"
+    ]
+    assert {row["valid_generation_count"] for row in reports} == {18}
+    assert gate["anchor_arm_generation_valid_gate_passed"] is True
+
+
+def test_generation_attrition_accepts_exact_16_complete_pairs_boundary() -> None:
+    invalid = {
+        ("anchor-00", "retain", 0),
+        ("anchor-00", "retain", 1),
+        ("anchor-00", "resample", 2),
+        ("anchor-00", "resample", 3),
+    }
+    gate = _attrition_quality_gate(invalid)
+    report = next(row for row in gate["anchor_reports"] if row["anchor_id"] == "anchor-00")
+    assert report["pair_complete_generation_count"] == 16
+    assert gate["anchor_pair_complete_generation_gate_passed"] is True
+
+
+def test_generation_attrition_accepts_exact_ten_percentage_point_gap() -> None:
+    gate = _attrition_quality_gate(
+        {("anchor-00", "retain", 0), ("anchor-00", "retain", 1)}
+    )
+    report = next(row for row in gate["anchor_reports"] if row["anchor_id"] == "anchor-00")
+    assert report["absolute_arm_valid_rate_gap"] == pytest.approx(0.10)
+    assert gate["anchor_arm_attrition_gap_gate_passed"] is True
+
+
+def test_generation_attrition_gate_rejects_overall_rate_below_95_percent() -> None:
+    invalid = {
+        (f"anchor-{anchor_index:02d}", arm, 0)
+        for anchor_index in range(24)
+        for arm in ("retain", "resample")
+    }
+    invalid.add(("anchor-00", "retain", 1))
+    gate = _attrition_quality_gate(invalid)
+
+    assert gate["overall_generation_valid_gate_passed"] is False
+    assert gate["anchor_arm_generation_valid_gate_passed"] is True
+    assert gate["gate_passed"] is False
+
+
+def test_generation_attrition_gate_rejects_cell_pair_and_arm_gap_failures() -> None:
+    cell = _attrition_quality_gate(
+        {("anchor-00", "retain", sample_index) for sample_index in range(3)}
+    )
+    assert cell["anchor_arm_generation_valid_gate_passed"] is False
+    assert cell["anchor_arm_attrition_gap_gate_passed"] is False
+
+    pair = _attrition_quality_gate(
+        {
+            *(('anchor-00', 'retain', sample_index) for sample_index in range(3)),
+            *(('anchor-00', 'resample', sample_index) for sample_index in range(3, 6)),
+        },
+        minimum_overall_generation_valid_rate=0.0,
+        minimum_anchor_arm_valid_count=0,
+        maximum_anchor_arm_valid_rate_gap=1.0,
+    )
+    assert pair["anchor_pair_complete_generation_gate_passed"] is False
+    assert pair["gate_passed"] is False
+
+
 def test_authenticates_960_gpu_records_then_runs_cpu_classifiers_and_dual_finals(
     frozen_inputs: FrozenInputs,
     tmp_path: Path,
@@ -483,6 +658,10 @@ def test_authenticates_960_gpu_records_then_runs_cpu_classifiers_and_dual_finals
     assert 0 < primary.paid_calls < len(primary.requests)
     assert 0 < independent.paid_calls < len(independent.requests)
     assert 0 < classifier.paid_calls < len(classifier.requests)
+    assert result.rows[0]["provenance"]["semantic_embedder"]["model_revision"] == "fixed"
+    assert result.rows[0]["provenance"]["semantic_embedder"]["provenance_hash"].startswith(
+        "sha256:"
+    )
     invalid = next(
         row for row in result.rows if row["resample_id"] == frozen_inputs.terminal_invalid_id
     )

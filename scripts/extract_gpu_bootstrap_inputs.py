@@ -48,6 +48,61 @@ _RAW_HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _DATA_CENTER_RE = re.compile(r"[A-Z0-9][A-Z0-9-]{2,31}\Z")
 _QUERY_COMPONENT_RE = re.compile(r"[A-Za-z0-9._~-]+\Z")
+SEMANTIC_DISTRIBUTIONS = (
+    "huggingface-hub",
+    "numpy",
+    "scikit-learn",
+    "scipy",
+    "sentence-transformers",
+    "tokenizers",
+    "torch",
+    "transformers",
+)
+SEMANTIC_DISTRIBUTION_VERSION = "5.7.0"
+SEMANTIC_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+SEMANTIC_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+SEMANTIC_PROTOCOL_VERSION = "pinned-sentence-transformer-runtime-v2"
+SEMANTIC_STACK_VERSIONS = {
+    "huggingface-hub": "1.29.0",
+    "numpy": "2.5.2",
+    "scikit-learn": "1.9.0",
+    "scipy": "1.18.1",
+    "sentence-transformers": SEMANTIC_DISTRIBUTION_VERSION,
+    "tokenizers": "0.23.1",
+    "torch": "2.13.0",
+    "transformers": "5.16.0.dev0",
+}
+SEMANTIC_WHEEL_SHA256 = "b78141da3d8137e70d965866e2ca43190b9266f3d4d8752e250ded75e7136730"
+SEMANTIC_WHEEL_URL = (
+    "https://files.pythonhosted.org/packages/e8/c8/"
+    "f63d99e354532f5b83e735dd1e001bda92495fbfde934f65d924abf2b071/"
+    "sentence_transformers-5.7.0-py3-none-any.whl"
+)
+BOOTSTRAP_PROTOCOL_VERSION = "exact-direct-bootstrap-v1"
+BOOTSTRAP_CONSTRAINTS_PATH = "config/gpu_bootstrap_constraints.txt"
+BOOTSTRAP_CONSTRAINTS_SHA256 = (
+    "eac31466ffe0668c030ef18bb2e88444ad2ff264733ae2526787db30148db662"
+)
+BOOTSTRAP_DISTRIBUTION_VERSIONS = {
+    "accelerate": "1.12.0",
+    "huggingface-hub": "1.29.0",
+    "jlens": "0.1.0",
+    "matplotlib": "3.10.8",
+    "numpy": "2.5.2",
+    "pandas": "3.0.3",
+    "pydantic": "2.12.5",
+    "PyYAML": "6.0.3",
+    "safetensors": "0.7.0",
+    "scikit-learn": "1.9.0",
+    "scipy": "1.18.1",
+    "sentence-transformers": "5.7.0",
+    "setuptools": "80.9.0",
+    "tokenizers": "0.23.1",
+    "torch": "2.13.0",
+    "transformers": "5.16.0.dev0",
+    "vllm": "0.28.0",
+    "wheel": "0.46.3",
+}
 
 
 class BootstrapInputError(ValueError):
@@ -218,6 +273,28 @@ def _one_match(pattern: str, text: str, *, field: str) -> str:
     return str(matches[0]).strip()
 
 
+def _folded_or_scalar(text: str, *, key: str, field: str) -> str:
+    marker = re.search(rf"^  {re.escape(key)}:\s*>-\s*$", text, flags=re.MULTILINE)
+    if marker is None:
+        return _one_match(
+            rf"^  {re.escape(key)}:\s*([^\s#]+)\s*$",
+            text,
+            field=field,
+        )
+    tail = text[marker.end() :].splitlines()
+    continuation: list[str] = []
+    for line in tail:
+        if not line.strip():
+            continue
+        indentation = len(line) - len(line.lstrip(" "))
+        if indentation <= 2:
+            break
+        continuation.append(line.strip())
+    if not continuation:
+        raise BootstrapInputError(f"folded {field} is empty")
+    return " ".join(continuation)
+
+
 def load_gpu_lock(path: Path) -> dict[str, str]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -225,6 +302,8 @@ def load_gpu_lock(path: Path) -> dict[str, str]:
         raise BootstrapInputError("cannot read GPU/software lock") from exc
     if "\t" in text:
         raise BootstrapInputError("GPU/software lock must not contain tabs")
+    if _one_match(r"^schema_version:\s*([0-9]+)\s*$", text, field="schema version") != "3":
+        raise BootstrapInputError("GPU/software lock schema is unsupported")
     container = _one_match(
         r"^  reference:\s*([^\s#]+)\s*$",
         text,
@@ -262,10 +341,129 @@ def load_gpu_lock(path: Path) -> dict[str, str]:
     wheel_url = _credential_free_https(wheel_url, field="vLLM wheel URL")
     if not wheel_url.endswith(".whl"):
         raise BootstrapInputError("GPU lock vLLM URL must identify an exact wheel")
+    semantic_url = _folded_or_scalar(
+        text,
+        key="semantic_wheel_url",
+        field="semantic wheel URL",
+    )
+    semantic_hash = _one_match(
+        r"^  semantic_wheel_sha256:\s*([0-9a-f]+)\s*$",
+        text,
+        field="semantic wheel SHA-256",
+    )
+    semantic_version = _one_match(
+        r'^  semantic_distribution_version:\s*"([0-9A-Za-z.+-]+)"\s*$',
+        text,
+        field="semantic distribution version",
+    )
+    semantic_protocol = _one_match(
+        r"^  protocol_version:\s*([^\s#]+)\s*$",
+        text,
+        field="semantic runtime protocol",
+    )
+    semantic_model_id = _one_match(
+        r"^  semantic_model_id:\s*([^\s#]+)\s*$",
+        text,
+        field="semantic model ID",
+    )
+    semantic_model_revision = _one_match(
+        r"^  semantic_model_revision:\s*([0-9a-f]+)\s*$",
+        text,
+        field="semantic model revision",
+    )
+    stack_hash = _one_match(
+        r"^  stack_lock_hash:\s*(sha256:[0-9a-f]+)\s*$",
+        text,
+        field="semantic stack lock hash",
+    )
+    section = re.search(
+        r"^  required_distribution_versions:\s*$\n(?P<body>(?:^    [^\n]+\n)+)^  stack_lock_hash:",
+        text,
+        flags=re.MULTILINE,
+    )
+    if section is None:
+        raise BootstrapInputError("GPU lock semantic distribution version set is absent")
+    versions: dict[str, str] = {}
+    for line in section.group("body").splitlines():
+        match = re.fullmatch(r'    ([a-z0-9-]+):\s*"([0-9A-Za-z.+-]+)"', line)
+        if match is None or match.group(1) in versions:
+            raise BootstrapInputError("GPU lock semantic distribution version row is malformed")
+        versions[match.group(1)] = match.group(2)
+    if tuple(sorted(versions)) != SEMANTIC_DISTRIBUTIONS:
+        raise BootstrapInputError("GPU lock semantic distribution inventory drifted")
+    if stack_hash != _stable_hash(dict(sorted(versions.items()))):
+        raise BootstrapInputError("GPU lock semantic stack hash mismatch")
+    if versions != SEMANTIC_STACK_VERSIONS:
+        raise BootstrapInputError("GPU lock semantic distribution versions drifted")
+    semantic_url = _credential_free_https(semantic_url, field="semantic wheel URL")
+    if not semantic_url.endswith(".whl") or _RAW_HASH_RE.fullmatch(semantic_hash) is None:
+        raise BootstrapInputError("GPU lock semantic wheel artifact is invalid")
+    if (
+        semantic_protocol != SEMANTIC_PROTOCOL_VERSION
+        or semantic_url != SEMANTIC_WHEEL_URL
+        or semantic_hash != SEMANTIC_WHEEL_SHA256
+        or semantic_version != SEMANTIC_DISTRIBUTION_VERSION
+        or semantic_model_id != SEMANTIC_MODEL_ID
+        or semantic_model_revision != SEMANTIC_MODEL_REVISION
+    ):
+        raise BootstrapInputError("GPU lock semantic runtime disagrees with the compiled lock")
+    bootstrap_protocol = _one_match(
+        r"^  bootstrap_protocol_version:\s*([^\s#]+)\s*$",
+        text,
+        field="bootstrap protocol",
+    )
+    constraints_path = _one_match(
+        r"^  constraints_path:\s*([^\s#]+)\s*$", text, field="bootstrap constraints path"
+    )
+    constraints_hash = _one_match(
+        r"^  constraints_sha256:\s*([0-9a-f]+)\s*$",
+        text,
+        field="bootstrap constraints SHA-256",
+    )
+    bootstrap_lock_hash = _one_match(
+        r"^  distribution_lock_hash:\s*(sha256:[0-9a-f]+)\s*$",
+        text,
+        field="bootstrap distribution lock hash",
+    )
+    bootstrap_section = re.search(
+        r"^bootstrap_environment:\s*$\n(?P<body>(?:^  .*\n|^    .*\n)+?)^container_image:",
+        text,
+        flags=re.MULTILINE,
+    )
+    if bootstrap_section is None:
+        raise BootstrapInputError("GPU bootstrap environment lock is absent")
+    bootstrap_versions_section = re.search(
+        r"^  required_distribution_versions:\s*$\n(?P<body>(?:^    [^\n]+\n)+)^  distribution_lock_hash:",
+        bootstrap_section.group("body"),
+        flags=re.MULTILINE,
+    )
+    if bootstrap_versions_section is None:
+        raise BootstrapInputError("GPU bootstrap distribution inventory is absent")
+    bootstrap_versions: dict[str, str] = {}
+    for line in bootstrap_versions_section.group("body").splitlines():
+        match = re.fullmatch(r'    ([A-Za-z0-9-]+):\s*"([0-9A-Za-z.+-]+)"', line)
+        if match is None or match.group(1) in bootstrap_versions:
+            raise BootstrapInputError("GPU bootstrap distribution row is malformed")
+        bootstrap_versions[match.group(1)] = match.group(2)
+    if (
+        bootstrap_protocol != BOOTSTRAP_PROTOCOL_VERSION
+        or constraints_path != BOOTSTRAP_CONSTRAINTS_PATH
+        or constraints_hash != BOOTSTRAP_CONSTRAINTS_SHA256
+        or bootstrap_versions != BOOTSTRAP_DISTRIBUTION_VERSIONS
+        or bootstrap_lock_hash != _stable_hash(dict(sorted(bootstrap_versions.items())))
+    ):
+        raise BootstrapInputError("GPU bootstrap environment disagrees with the compiled lock")
     return {
         "container_image_digest": container,
         "vllm_wheel_url": wheel_url,
         "vllm_wheel_sha256": wheel_hash,
+        "semantic_wheel_url": semantic_url,
+        "semantic_wheel_sha256": semantic_hash,
+        "semantic_distribution_version": semantic_version,
+        "semantic_stack_lock_hash": stack_hash,
+        "bootstrap_constraints_path": constraints_path,
+        "bootstrap_constraints_sha256": constraints_hash,
+        "bootstrap_distribution_lock_hash": bootstrap_lock_hash,
     }
 
 
@@ -295,6 +493,13 @@ def main() -> int:
         "container_image_digest",
         "vllm_wheel_url",
         "vllm_wheel_sha256",
+        "semantic_wheel_url",
+        "semantic_wheel_sha256",
+        "semantic_distribution_version",
+        "semantic_stack_lock_hash",
+        "bootstrap_constraints_path",
+        "bootstrap_constraints_sha256",
+        "bootstrap_distribution_lock_hash",
     )
     print("\t".join(values[key] for key in ordered))
     return 0

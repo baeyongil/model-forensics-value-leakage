@@ -10,6 +10,7 @@ command silently substitutes local mock results.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import shutil
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,12 +29,16 @@ import pandas as pd
 import yaml
 
 from model_forensics.adjudication import (
+    FINAL_ANSWER_INSTRUMENT,
+    TRAJECTORY_INSTRUMENT,
     AdjudicationCaller,
     DeterministicSmokeCaller,
     JudgeProvenance,
     blinded_case_from_rollout,
+    build_adjudication_request,
 )
 from model_forensics.analysis import (
+    accuracy_anchor_lens_resampling_association,
     adjudicate_hypotheses,
     apply_divergent_coverage_gate,
     behavior_missingness_summary,
@@ -83,12 +89,15 @@ from model_forensics.calibration import (
     evaluate_adjudication_quality,
     freeze_consensus_baseline_threshold,
 )
+from model_forensics.classification import build_blinded_request
 from model_forensics.config import RunConfig, load_preregistration, load_run_config
 from model_forensics.estimate_spans import (
+    FIRST_ESTIMATE_SPAN_INSTRUMENT,
     FIRST_ESTIMATE_SPAN_INSTRUMENT_ID,
     FirstEstimateSpan,
     FirstEstimateSpanRecord,
     collect_first_estimate_span,
+    parse_first_estimate_span,
 )
 from model_forensics.execution_bindings import (
     build_approval_bindings,
@@ -103,6 +112,7 @@ from model_forensics.figures import (
 from model_forensics.gpu_budget import load_gpu_phase_budget_reservation
 from model_forensics.io import (
     assert_unique,
+    canonical_json,
     read_json,
     read_jsonl,
     sha256_file,
@@ -120,34 +130,59 @@ from model_forensics.lens_production import (
     assert_primary_lens_config,
     encode_frozen_4b_compatibility_prefix,
     freeze_production_compatibility_prefixes,
+    freeze_production_probe_design,
     production_runtime_factories,
 )
-from model_forensics.paid_phase_receipt import PaidPhaseReceiptStore
+from model_forensics.lens_runner import (
+    JLENS_REVISION,
+    SMOKE_MODEL_ID,
+    SMOKE_MODEL_REVISION,
+    TRANSFORMERS_REVISION,
+)
+from model_forensics.paid_phase_receipt import (
+    PAID_PHASE_RECEIPT_PROTOCOL,
+    PaidPhaseReceiptStore,
+)
 from model_forensics.paid_response_store import PaidResponseStore
 from model_forensics.prompts import QUESTIONS, Task, build_prompt
 from model_forensics.providers import (
     OpenRouterAdjudicationCaller,
     OpenRouterClassificationCaller,
+    OpenRouterDispatchGuard,
     OpenRouterJSONClient,
+    OpenRouterPhasePreflight,
+    OpenRouterRequestSpec,
     TokenPrice,
+    preflight_openrouter_phase,
 )
-from model_forensics.record_checkpoint import RecordCheckpointStore
-from model_forensics.replacement_provider import TwoRouteOpenRouterReplacementClassifier
+from model_forensics.record_checkpoint import (
+    RECORD_CHECKPOINT_PROTOCOL,
+    RecordCheckpointStore,
+)
+from model_forensics.replacement_provider import (
+    REPLACEMENT_CLASSIFIER_PROMPT,
+    TwoRouteOpenRouterReplacementClassifier,
+)
 from model_forensics.resample_adjudication_phase import (
+    evaluate_generation_attrition,
     load_authenticated_resample_generation,
     run_resample_adjudication_phase,
 )
 from model_forensics.resample_phases import (
+    GENERATION_STATUS_VALID,
     ResamplingGenerationRecord,
     generate_sentence_resampling_intermediates,
 )
 from model_forensics.resample_runner import (
     NeutralControlSpec,
     ReplacementTokenTolerance,
+    _replacement_classification_request,
+    _replacement_token_audit,
     build_fixed_stage_two_allocation_manifest,
     build_initial_allocation_manifest,
     run_sentence_resampling,
 )
+from model_forensics.resampling import assess_semantic_divergence
 from model_forensics.rollout_adjudication import (
     adjudicate_raw_rows,
     enrich_adjudicated_rows,
@@ -168,7 +203,11 @@ from model_forensics.semantic_backend import (
     SEMANTIC_MODEL_REVISION,
     PinnedSentenceTransformerEmbedder,
 )
-from model_forensics.token_spans import token_stream_hash, validate_token_stream_manifest
+from model_forensics.token_spans import (
+    locate_completion_sections,
+    token_stream_hash,
+    validate_token_stream_manifest,
+)
 from model_forensics.upstream import ensure_pinned_checkout, write_reference_summary
 from model_forensics.vllm_prefix import VLLMRawPrefixBackend
 
@@ -292,6 +331,7 @@ def _authorize_paid_plan(
     gate: ValidatedPaidGate,
     command_phase: str,
     plan_hash: str,
+    api_completion_preflight: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     directory = (
         Path(args.paid_receipt_dir).resolve()
@@ -304,7 +344,218 @@ def _authorize_paid_plan(
         approval_id_hash=gate.approval_id_hash,
         bindings_hash=gate.bindings_hash,
         plan_hash=plan_hash,
+        api_completion_preflight=api_completion_preflight,
     )
+
+
+def _api_ledger(config: RunConfig, gate: ValidatedPaidGate) -> CostLedger:
+    return CostLedger(
+        _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml",
+        BudgetLimits(
+            gpu=float(gate.bindings.caps_usd.gpu),
+            api=float(gate.bindings.caps_usd.api),
+            total=float(gate.bindings.caps_usd.total),
+        ),
+    )
+
+
+def _adjudication_request_spec(
+    *,
+    route_name: str,
+    route: Mapping[str, Any],
+    request: Any,
+    store: PaidResponseStore,
+) -> OpenRouterRequestSpec:
+    return OpenRouterRequestSpec(
+        route=route_name,
+        model_id=str(route["model"]),
+        model_revision=None,
+        price=TokenPrice(
+            input_per_million=float(route["input_usd_per_million_tokens"]),
+            output_per_million=float(route["output_usd_per_million_tokens"]),
+        ),
+        request_id=str(request.request_id),
+        system_prompt=str(request.system_prompt),
+        user_content=canonical_json(dict(request.user_payload)),
+        purpose="adjudication",
+        max_output_tokens=512,
+        paid_response_store=store,
+    )
+
+
+def _bind_api_completion_preflight(
+    plan: Mapping[str, Any],
+    preflight: OpenRouterPhasePreflight,
+) -> dict[str, Any]:
+    payload = {key: value for key, value in plan.items() if key != "plan_hash"}
+    payload["api_completion_preflight"] = dict(preflight.manifest)
+    payload["plan_hash"] = stable_hash(payload)
+    return payload
+
+
+def _freeze_or_reuse_api_paid_plan(
+    path: Path,
+    proposed: Mapping[str, Any],
+    current: OpenRouterPhasePreflight,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    """Freeze the first cost snapshot while allowing a monotone paid resume.
+
+    Per-call reservations and authenticated response checkpoints necessarily
+    change the ledger after an interrupted attempt.  The immutable phase plan
+    therefore remains the first authorized snapshot, while every retry reruns
+    the live whole-phase gate.  A retry is accepted only when the exact request
+    universe is unchanged and the remaining inventory has not grown.
+    """
+
+    expected = dict(proposed)
+    if not path.exists():
+        _freeze_or_verify_json(path, expected, label=label)
+        return expected
+    observed = read_json(path)
+    if not isinstance(observed, dict) or observed.get("plan_hash") != stable_hash(
+        {key: value for key, value in observed.items() if key != "plan_hash"}
+    ):
+        raise CLIError(f"{label} hash mismatch")
+    static_observed = {
+        key: value
+        for key, value in observed.items()
+        if key not in {"plan_hash", "api_completion_preflight"}
+    }
+    static_expected = {
+        key: value
+        for key, value in expected.items()
+        if key not in {"plan_hash", "api_completion_preflight"}
+    }
+    frozen_completion = observed.get("api_completion_preflight")
+    if not isinstance(frozen_completion, Mapping):
+        raise CLIError(f"{label} lacks its API completion inventory")
+    frozen_without_hash = {
+        key: value for key, value in frozen_completion.items() if key != "manifest_hash"
+    }
+    if frozen_completion.get("manifest_hash") != stable_hash(frozen_without_hash):
+        raise CLIError(f"{label} API completion inventory hash mismatch")
+    live = current.manifest
+    frozen_pending = frozen_completion.get("pending_request_identities")
+    live_pending = live.get("pending_request_identities")
+    if (
+        not isinstance(frozen_pending, list)
+        or not isinstance(live_pending, list)
+        or any(not isinstance(value, str) for value in [*frozen_pending, *live_pending])
+        or len(frozen_pending) != len(set(frozen_pending))
+        or len(live_pending) != len(set(live_pending))
+    ):
+        raise CLIError(f"{label} lacks exact pending request identities")
+    frozen_routes = frozen_completion.get("per_route")
+    live_routes = live.get("per_route")
+    route_universe_matches = bool(
+        isinstance(frozen_routes, Mapping)
+        and isinstance(live_routes, Mapping)
+        and set(frozen_routes) == set(live_routes)
+        and all(
+            isinstance(frozen_routes[route], Mapping)
+            and isinstance(live_routes[route], Mapping)
+            and frozen_routes[route].get("logical_invocation_count")
+            == live_routes[route].get("logical_invocation_count")
+            and frozen_routes[route].get("unique_request_count")
+            == live_routes[route].get("unique_request_count")
+            and int(live_routes[route].get("pending_request_count", -1))
+            <= int(frozen_routes[route].get("pending_request_count", -1))
+            for route in frozen_routes
+        )
+    )
+    if (
+        static_observed != static_expected
+        or frozen_completion.get("full_inventory_hash") != live.get("full_inventory_hash")
+        or frozen_completion.get("paid_response_store_identities_hash")
+        != live.get("paid_response_store_identities_hash")
+        or frozen_completion.get("logical_invocation_count")
+        != live.get("logical_invocation_count")
+        or frozen_completion.get("unique_request_count") != live.get("unique_request_count")
+        or not route_universe_matches
+        or not set(live_pending).issubset(set(frozen_pending))
+        or int(live.get("pending_request_count", -1))
+        > int(frozen_completion.get("pending_request_count", -1))
+        or float(live.get("conservative_pending_usd", math.inf))
+        > float(frozen_completion.get("conservative_pending_usd", -1)) + 1e-9
+    ):
+        raise CLIError(f"{label} retry is not a monotone subset of the authorized inventory")
+    return observed
+
+
+@contextmanager
+def _api_completion_attempt_lock(path: Path):  # type: ignore[no-untyped-def]
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with os.fdopen(descriptor, "a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _freeze_api_completion_attempt(
+    checkpoint_dir: Path,
+    *,
+    paid_plan_hash: str,
+    preflight: OpenRouterPhasePreflight,
+) -> dict[str, Any]:
+    """Persist a content-addressed receipt for the live retry budget gate."""
+
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol_version": "api-completion-attempt-receipt-v1",
+        "command_phase": preflight.phase,
+        "paid_plan_hash": paid_plan_hash,
+        "api_completion_preflight": dict(preflight.manifest),
+    }
+    payload["receipt_hash"] = stable_hash(payload)
+    directory = checkpoint_dir / "api_completion_preflights"
+    path = directory / f"{preflight.manifest_hash.split(':', 1)[1]}.json"
+    pending = preflight.manifest.get("pending_request_identities")
+    if (
+        not isinstance(pending, list)
+        or any(not isinstance(value, str) for value in pending)
+        or len(pending) != len(set(pending))
+    ):
+        raise CLIError("API completion preflight lacks exact pending request identities")
+    with _api_completion_attempt_lock(directory / ".attempt.lock"):
+        for previous_path in sorted(directory.glob("*.json")):
+            previous = read_json(previous_path)
+            if (
+                not isinstance(previous, dict)
+                or previous.get("receipt_hash")
+                != stable_hash(
+                    {key: value for key, value in previous.items() if key != "receipt_hash"}
+                )
+                or previous.get("protocol_version")
+                != "api-completion-attempt-receipt-v1"
+                or previous.get("command_phase") != preflight.phase
+                or previous.get("paid_plan_hash") != paid_plan_hash
+                or not isinstance(previous.get("api_completion_preflight"), Mapping)
+            ):
+                raise CLIError("API completion attempt receipt failed authentication")
+            previous_pending = previous["api_completion_preflight"].get(
+                "pending_request_identities"
+            )
+            if (
+                not isinstance(previous_pending, list)
+                or any(not isinstance(value, str) for value in previous_pending)
+                or not set(pending).issubset(set(previous_pending))
+            ):
+                raise CLIError(
+                    "API completion retry is not a monotone subset of the prior attempt"
+                )
+        _freeze_or_verify_json(path, payload, label="API completion attempt receipt")
+    return payload
 
 
 def _validate_active_gpu_session(
@@ -1660,6 +1911,47 @@ def _command_behavior_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
             "thresholds": dict(sorted(thresholds.items())),
         }
 
+    ledger = _api_ledger(config, gate)
+    paid_response_dir = checkpoint_dir / "paid_responses"
+    primary_response_store = PaidResponseStore(paid_response_dir / "primary")
+    independent_response_store = PaidResponseStore(paid_response_dir / "independent_final")
+    request_specs: list[OpenRouterRequestSpec] = []
+    for source in generation.rows:
+        try:
+            question = QUESTIONS[Task(str(source.get("task")))]
+        except ValueError as exc:
+            raise CLIError(f"unsupported behavioral task: {source.get('task')!r}") from exc
+        case = blinded_case_from_rollout(source, task_question=question)
+        final_request = build_adjudication_request(case, FINAL_ANSWER_INSTRUMENT)
+        trajectory_request = build_adjudication_request(case, TRAJECTORY_INSTRUMENT)
+        request_specs.extend(
+            (
+                _adjudication_request_spec(
+                    route_name="primary_final_and_trajectory",
+                    route=primary_route,
+                    request=final_request,
+                    store=primary_response_store,
+                ),
+                _adjudication_request_spec(
+                    route_name="primary_final_and_trajectory",
+                    route=primary_route,
+                    request=trajectory_request,
+                    store=primary_response_store,
+                ),
+                _adjudication_request_spec(
+                    route_name="independent_final",
+                    route=independent_route,
+                    request=final_request,
+                    store=independent_response_store,
+                ),
+            )
+        )
+    api_completion = preflight_openrouter_phase(
+        phase=command_phase,
+        requests=request_specs,
+        ledger=ledger,
+    )
+
     paid_plan = _behavioral_paid_plan(
         config=config,
         phase=phase,
@@ -1674,6 +1966,18 @@ def _command_behavior_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         threshold_contract=threshold_contract,
         baseline_adjudication=baseline_manifest,
     )
+    paid_plan = _bind_api_completion_preflight(paid_plan, api_completion)
+    paid_plan = _freeze_or_reuse_api_paid_plan(
+        checkpoint_dir / "paid_plan.json",
+        paid_plan,
+        api_completion,
+        label=f"behavioral {phase} API paid plan",
+    )
+    _freeze_api_completion_attempt(
+        checkpoint_dir,
+        paid_plan_hash=str(paid_plan["plan_hash"]),
+        preflight=api_completion,
+    )
     # The immutable one-plan receipt is the second and final authorization
     # boundary.  Provider clients are constructed only after it succeeds.
     paid_receipt = _authorize_paid_plan(
@@ -1682,19 +1986,11 @@ def _command_behavior_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         gate=gate,
         command_phase=command_phase,
         plan_hash=str(paid_plan["plan_hash"]),
+        api_completion_preflight=paid_plan["api_completion_preflight"],
     )
 
-    ledger_path = _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml"
-    ledger = CostLedger(
-        ledger_path,
-        BudgetLimits(
-            gpu=float(gate.bindings.caps_usd.gpu),
-            api=float(gate.bindings.caps_usd.api),
-            total=float(gate.bindings.caps_usd.total),
-        ),
-    )
-    paid_response_dir = checkpoint_dir / "paid_responses"
     api_key_env = config.execution.secret_env.get("openrouter", "OPENROUTER_API_KEY")
+    dispatch_guard = OpenRouterDispatchGuard(api_completion)
     primary_caller = OpenRouterAdjudicationCaller(
         model_id=str(primary_route["model"]),
         model_revision=None,
@@ -1704,7 +2000,9 @@ def _command_behavior_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         ),
         ledger=ledger,
         api_key_env=api_key_env,
-        paid_response_store=PaidResponseStore(paid_response_dir / "primary"),
+        paid_response_store=primary_response_store,
+        dispatch_guard=dispatch_guard,
+        dispatch_route="primary_final_and_trajectory",
     )
     independent_caller = OpenRouterAdjudicationCaller(
         model_id=str(independent_route["model"]),
@@ -1715,7 +2013,9 @@ def _command_behavior_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         ),
         ledger=ledger,
         api_key_env=api_key_env,
-        paid_response_store=PaidResponseStore(paid_response_dir / "independent_final"),
+        paid_response_store=independent_response_store,
+        dispatch_guard=dispatch_guard,
+        dispatch_route="independent_final",
     )
     api_usage_path = checkpoint_dir / "openrouter_usage_audit.jsonl"
     primary_client = getattr(primary_caller, "_client", None)
@@ -1810,6 +2110,18 @@ def _command_behavior_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _command_sample(args: argparse.Namespace) -> dict[str, Any]:
+    raise CLIError(
+        "legacy combined sample command is hard-disabled; use behavior-generate then behavior-adjudicate"
+    )
+
+
+def _disabled_legacy_command_sample_body(args: argparse.Namespace) -> dict[str, Any]:
+    raise CLIError("disabled legacy sample body cannot execute paid providers")
+
+
+def _unreachable_legacy_command_sample_reference(args: argparse.Namespace) -> dict[str, Any]:
+    raise CLIError("legacy sample implementation is permanently unreachable")
+
     config = load_run_config(args.config)
     # This validation intentionally precedes backend construction: an unfrozen
     # run must not import vLLM, allocate GPUs, or initiate a model download.
@@ -2118,6 +2430,9 @@ def _candidate_from_row(row: Mapping[str, Any], *, row_number: int) -> AnchorCan
             "token_span",
             "classifier_provenance_hash",
             "classifier_judgments_hash",
+            "classification_candidate_id",
+            "classification_lock_hash",
+            "prefilter_manifest_hash",
         }
         provenance_missing = sorted(required_provenance - set(provenance))
         if provenance_missing:
@@ -2274,7 +2589,423 @@ def _load_authenticated_behavioral_rollouts(
     return rows, dict(sampling)
 
 
-def _load_authenticated_anchor_output(path: Path) -> tuple[dict[str, Any], AnchorManifest]:
+def _anchor_manifest_is_synthetic(
+    payload: Mapping[str, Any],
+    manifest: AnchorManifest,
+) -> bool:
+    provenance_flags = {
+        anchor.provenance.get("synthetic_smoke") is True for anchor in manifest.anchors
+    }
+    declared = payload.get("synthetic_smoke")
+    if declared is True:
+        if provenance_flags != {True}:
+            raise CLIError("synthetic anchor manifest mixes smoke and primary provenance")
+        return True
+    if declared not in {False, None} or True in provenance_flags:
+        raise CLIError("anchor manifest synthetic-smoke identity is inconsistent")
+    return False
+
+
+def _anchor_bundle_artifact(
+    *,
+    root: Path,
+    construction: Mapping[str, Any],
+    path_field: str,
+    sha_field: str,
+    label: str,
+) -> Path:
+    artifact = _safe_project_artifact(root, construction.get(path_field), label=label)
+    if not artifact.is_file() or construction.get(sha_field) != sha256_file(artifact):
+        raise CLIError(f"{label} SHA-256 mismatch")
+    return artifact
+
+
+def _validate_primary_anchor_provenance(
+    *,
+    config: RunConfig,
+    path: Path,
+    payload: Mapping[str, Any],
+    manifest: AnchorManifest,
+    rollout_rows: Sequence[Mapping[str, Any]] | None,
+) -> None:
+    """Authenticate and reconstruct the complete blind-label-to-anchor chain."""
+
+    root = _project_root(config)
+    construction = payload.get("candidate_construction")
+    if not isinstance(construction, Mapping):
+        raise CLIError("primary anchor manifest lacks candidate-construction provenance")
+    construction_path = _anchor_bundle_artifact(
+        root=root,
+        construction=construction,
+        path_field="construction_manifest",
+        sha_field="construction_manifest_sha256",
+        label="anchor candidate-construction manifest",
+    )
+    construction_manifest = read_json(construction_path)
+    if not isinstance(construction_manifest, Mapping):
+        raise CLIError("anchor candidate-construction manifest is not an object")
+    construction_hash = _verify_embedded_hash(
+        construction_manifest,
+        field="manifest_hash",
+        label="anchor candidate-construction manifest",
+    )
+    construction_metadata = construction_manifest.get("metadata")
+    linked_fields = {
+        "construction_manifest",
+        "construction_manifest_sha256",
+        "construction_manifest_hash",
+    }
+    if (
+        set(construction_manifest)
+        != {"schema_version", "protocol_version", "metadata", "manifest_hash"}
+        or construction_manifest.get("schema_version") != 1
+        or construction_manifest.get("protocol_version")
+        != "anchor-candidate-construction-v1"
+        or construction_hash != construction.get("construction_manifest_hash")
+        or not isinstance(construction_metadata, Mapping)
+        or dict(construction_metadata)
+        != {key: value for key, value in construction.items() if key not in linked_fields}
+    ):
+        raise CLIError("anchor candidate-construction manifest linkage mismatch")
+    candidate_path = _safe_project_artifact(
+        root,
+        payload.get("candidate_file"),
+        label="anchor candidate artifact",
+    )
+    if not candidate_path.is_file() or payload.get("candidate_file_sha256") != sha256_file(
+        candidate_path
+    ):
+        raise CLIError("anchor candidate artifact SHA-256 mismatch")
+    prefilter_path = _anchor_bundle_artifact(
+        root=root,
+        construction=construction,
+        path_field="prefilter_manifest",
+        sha_field="prefilter_manifest_sha256",
+        label="anchor prefilter manifest",
+    )
+    lock_path = _anchor_bundle_artifact(
+        root=root,
+        construction=construction,
+        path_field="classification_lock",
+        sha_field="classification_lock_sha256",
+        label="anchor classification lock",
+    )
+    rollout_path = _anchor_bundle_artifact(
+        root=root,
+        construction=construction,
+        path_field="rollouts",
+        sha_field="rollouts_sha256",
+        label="anchor source rollouts",
+    )
+    construction_rollouts = _load_authenticated_rollout_rows(
+        config,
+        rollout_path,
+        label="anchor source rollouts",
+    )
+    if rollout_rows is not None and [dict(row) for row in rollout_rows] != construction_rollouts:
+        raise CLIError("requested rollouts differ from the anchor construction source")
+    rollout_rows = construction_rollouts
+    rollout_by_id = {str(row.get("run_id", "")): dict(row) for row in rollout_rows}
+    if len(rollout_by_id) != len(rollout_rows) or "" in rollout_by_id:
+        raise CLIError("anchor source rollouts contain duplicate or empty run IDs")
+
+    prefilter = read_json(prefilter_path)
+    if not isinstance(prefilter, Mapping):
+        raise CLIError("anchor prefilter manifest is not an object")
+    prefilter_hash = _verify_embedded_hash(
+        prefilter,
+        field="manifest_hash",
+        label="anchor prefilter manifest",
+    )
+    if (
+        prefilter_hash != construction.get("prefilter_manifest_hash")
+        or prefilter.get("tokenizer_id") != config.model.id
+        or prefilter.get("tokenizer_revision") != config.model.revision
+    ):
+        raise CLIError("anchor prefilter manifest identity mismatch")
+    prefilter_rows = prefilter.get("candidates")
+    if not isinstance(prefilter_rows, list) or not prefilter_rows:
+        raise CLIError("anchor prefilter manifest has no candidate inventory")
+    max_per_family = prefilter.get("max_per_trace_per_family")
+    if isinstance(max_per_family, bool) or not isinstance(max_per_family, int) or max_per_family <= 0:
+        raise CLIError("anchor prefilter bound is invalid")
+
+    prefilter_order: list[tuple[str, int]] = []
+    prefilter_family_counts: Counter[tuple[str, str]] = Counter()
+    for index, source in enumerate(prefilter_rows, start=1):
+        if not isinstance(source, Mapping) or not isinstance(source.get("request"), Mapping):
+            raise CLIError(f"anchor prefilter candidate {index} is malformed")
+        trace_id = str(source.get("trace_id", ""))
+        rollout = rollout_by_id.get(trace_id)
+        request = source["request"]
+        if rollout is None:
+            raise CLIError(f"anchor prefilter candidate {index} lacks its source rollout")
+        reasoning = rollout.get("reasoning")
+        raw_text = rollout.get("raw_text")
+        threshold = rollout.get("threshold")
+        streams = rollout.get("token_streams")
+        if (
+            not isinstance(reasoning, str)
+            or not isinstance(raw_text, str)
+            or threshold is None
+            or not isinstance(streams, Mapping)
+        ):
+            raise CLIError(f"anchor prefilter candidate {index} source evidence is incomplete")
+        try:
+            expected_request = build_blinded_request(
+                trace_id=trace_id,
+                source_text=reasoning,
+                sentence_index=int(request["sentence_index"]),
+                threshold_value=threshold,
+                include_neighbors=True,
+            ).audit_dict()
+            _, completion_ids = validate_token_stream_manifest(streams, require_both=True)
+            sections = locate_completion_sections(raw_text)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CLIError(
+                f"anchor prefilter candidate {index} cannot reconstruct its blind request"
+            ) from exc
+        if stable_hash(dict(request)) != stable_hash(
+            expected_request
+        ) or source.get("source_reasoning_hash") != stable_hash(reasoning):
+            raise CLIError(f"anchor prefilter candidate {index} blind request drifted")
+        if sections.reasoning != reasoning:
+            raise CLIError(f"anchor prefilter candidate {index} trace section drifted")
+        char_start = int(request["char_start"])
+        char_end = int(request["char_end"])
+        sentence_text = reasoning[char_start:char_end]
+        _validate_persisted_position_span(
+            source.get("token_span"),
+            completion_ids=completion_ids,
+            raw_text=raw_text,
+            expected_section="reasoning",
+            expected_section_start=char_start,
+            expected_section_end=char_end,
+            expected_completion_start=sections.reasoning_char_start + char_start,
+            expected_completion_end=sections.reasoning_char_start + char_end,
+            expected_text=sentence_text,
+            label=f"anchor prefilter candidate {index}",
+        )
+        token_span = source["token_span"]
+        lexical_family = source.get("lexical_family")
+        if (
+            token_span.get("leading_envelope_text") != ""
+            or lexical_family not in {"accuracy", "value", "calculation"}
+        ):
+            raise CLIError(f"anchor prefilter candidate {index} eligibility evidence drifted")
+        prefilter_order.append((trace_id, int(request["sentence_index"])))
+        prefilter_family_counts[(trace_id, str(lexical_family))] += 1
+    if prefilter_order != sorted(prefilter_order) or any(
+        count > max_per_family for count in prefilter_family_counts.values()
+    ):
+        raise CLIError("anchor prefilter ordering/bounded inventory drifted")
+
+    locked = read_json(lock_path)
+    if not isinstance(locked, Mapping):
+        raise CLIError("anchor classification lock is not an object")
+    lock_hash = _verify_embedded_hash(
+        locked,
+        field="lock_hash",
+        label="anchor classification lock",
+    )
+    if (
+        lock_hash != construction.get("classification_lock_hash")
+        or locked.get("prefilter_manifest_hash") != prefilter_hash
+    ):
+        raise CLIError("anchor classification lock does not bind the frozen prefilter")
+    locked_rows = locked.get("records")
+    locked_token_spans = locked.get("token_spans")
+    if not isinstance(locked_rows, list) or not isinstance(locked_token_spans, Mapping):
+        raise CLIError("anchor classification lock inventory is malformed")
+    classifier_routes = construction.get("classifier_routes")
+    if (
+        not isinstance(classifier_routes, list)
+        or len(classifier_routes) != 2
+        or any(not isinstance(route, Mapping) for route in classifier_routes)
+        or len(
+            {
+                (
+                    str(route.get("provider")),
+                    str(route.get("model_id")),
+                    route.get("model_revision"),
+                )
+                for route in classifier_routes
+            }
+        )
+        != 2
+        or any(route.get("external") is not True for route in classifier_routes)
+    ):
+        raise CLIError("anchor classifier route provenance is not two-route external evidence")
+
+    prefilter_by_id: dict[str, Mapping[str, Any]] = {}
+    for source in prefilter_rows:
+        candidate_id = str(source["request"].get("candidate_id", ""))
+        if not candidate_id or candidate_id in prefilter_by_id:
+            raise CLIError("anchor prefilter candidate IDs are empty or duplicated")
+        prefilter_by_id[candidate_id] = source
+
+    locked_by_id: dict[str, Mapping[str, Any]] = {}
+    for index, source in enumerate(locked_rows, start=1):
+        if not isinstance(source, Mapping):
+            raise CLIError(f"locked classification {index} is not an object")
+        candidate_id = str(source.get("candidate_id", ""))
+        prefiltered = prefilter_by_id.get(candidate_id)
+        if not candidate_id or candidate_id in locked_by_id or prefiltered is None:
+            raise CLIError("locked classification candidate inventory disagrees with prefilter")
+        request = prefiltered["request"]
+        if any(
+            source.get(field) != request.get(field)
+            for field in (
+                "candidate_id",
+                "sentence_index",
+                "char_start",
+                "char_end",
+                "input_hash",
+                "prompt_hash",
+                "rubric_version",
+            )
+        ) or (
+            source.get("trace_id") != prefiltered.get("trace_id")
+            or source.get("sentence_text")
+            != rollout_by_id[str(prefiltered["trace_id"])]["reasoning"][
+                int(request["char_start"]) : int(request["char_end"])
+            ]
+            or source.get("model_provenance") != classifier_routes
+        ):
+            raise CLIError(f"locked classification {candidate_id} differs from its blind request")
+        judgments = source.get("judgments")
+        if (
+            not isinstance(judgments, list)
+            or len(judgments) != 2
+            or any(not isinstance(judgment, Mapping) for judgment in judgments)
+            or [judgment.get("judgment_index") for judgment in judgments] != [0, 1]
+        ):
+            raise CLIError(f"locked classification {candidate_id} lacks two-route judgments")
+        if locked_token_spans.get(candidate_id) != prefiltered.get("token_span"):
+            raise CLIError(f"locked classification {candidate_id} token span drifted")
+        locked_by_id[candidate_id] = source
+    if set(locked_by_id) != set(prefilter_by_id) or set(locked_token_spans) != set(locked_by_id):
+        raise CLIError("classification lock does not cover the exact prefilter inventory")
+
+    candidate_rows = _record_rows(candidate_path, label="anchor candidates")
+    if payload.get("candidate_count") != len(candidate_rows):
+        raise CLIError("anchor candidate count disagrees with the bound artifact")
+    candidate_objects = [
+        _candidate_from_row(row, row_number=index)
+        for index, row in enumerate(candidate_rows, start=1)
+    ]
+    if payload.get("preselection_manifest_hash") != stable_hash(
+        [candidate.selection_payload() for candidate in candidate_objects]
+    ):
+        raise CLIError("anchor preselection manifest hash mismatch")
+
+    for index, (row, candidate) in enumerate(
+        zip(candidate_rows, candidate_objects, strict=True),
+        start=1,
+    ):
+        provenance = candidate.provenance
+        candidate_id = str(provenance.get("classification_candidate_id", ""))
+        locked_record = locked_by_id.get(candidate_id)
+        prefiltered = prefilter_by_id.get(candidate_id)
+        source = rollout_by_id.get(candidate.trace_id)
+        if locked_record is None or prefiltered is None or source is None:
+            raise CLIError(f"anchor candidate row {index} lacks a locked source join")
+        reasoning = source.get("reasoning")
+        if not isinstance(reasoning, str) or reasoning[candidate.char_start : candidate.char_end] != (
+            candidate.sentence_text
+        ):
+            raise CLIError(f"anchor candidate row {index} no longer reconstructs its rollout span")
+        if prefiltered.get("source_reasoning_hash") != stable_hash(reasoning):
+            raise CLIError(f"anchor candidate row {index} prefilter source hash mismatch")
+        if any(
+            locked_record.get(field) != expected
+            for field, expected in (
+                ("trace_id", candidate.trace_id),
+                ("label", candidate.sentence_class),
+                ("sentence_index", candidate.sentence_index),
+                ("sentence_text", candidate.sentence_text),
+                ("char_start", candidate.char_start),
+                ("char_end", candidate.char_end),
+                ("eligible", True),
+                ("confidence", row.get("classifier_confidence")),
+                ("resolution", row.get("classifier_resolution")),
+            )
+        ):
+            raise CLIError(f"anchor candidate row {index} differs from locked classification")
+        judgments = locked_record.get("judgments")
+        model_provenance = locked_record.get("model_provenance")
+        if not isinstance(judgments, list) or not isinstance(model_provenance, list):
+            raise CLIError(f"locked classification {candidate_id} lacks judge provenance")
+        token_span = provenance.get("token_span")
+        if (
+            provenance.get("classification_lock_hash") != lock_hash
+            or provenance.get("prefilter_manifest_hash") != prefilter_hash
+            or provenance.get("classifier_judgments_hash") != stable_hash(judgments)
+            or provenance.get("classifier_provenance_hash") != stable_hash(model_provenance)
+            or token_span != locked_token_spans[candidate_id]
+        ):
+            raise CLIError(f"anchor candidate row {index} classification provenance mismatch")
+        if (
+            candidate.direction != source.get("condition")
+            or candidate.initial_side != ("good" if source.get("first_good_side") is True else "bad")
+            or candidate.final_flip is not source.get("first_to_final_flip")
+            or provenance.get("task") != source.get("task")
+            or provenance.get("threshold") != source.get("threshold")
+            or provenance.get("prompt_hash") != source.get("prompt_hash")
+            or provenance.get("model_hash") != source.get("model_hash")
+            or provenance.get("source_rollout_hash") != source.get("record_hash")
+            or provenance.get("reasoning_span_hash") != stable_hash(candidate.sentence_text)
+        ):
+            raise CLIError(f"anchor candidate row {index} outcome/source strata mismatch")
+        if not isinstance(token_span, Mapping):
+            raise CLIError(f"anchor candidate row {index} token span is malformed")
+        streams = source.get("token_streams")
+        try:
+            _, completion_ids = validate_token_stream_manifest(
+                streams if isinstance(streams, Mapping) else {},
+                require_both=True,
+            )
+            token_start = int(token_span["token_start"])
+            token_end = int(token_span["token_end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CLIError(f"anchor candidate row {index} token evidence is invalid") from exc
+        span_ids = list(completion_ids[token_start:token_end])
+        if (
+            token_span.get("token_ids") != span_ids
+            or token_span.get("text") != candidate.sentence_text
+            or token_span.get("section_char_start") != candidate.char_start
+            or token_span.get("section_char_end") != candidate.char_end
+            or token_span.get("round_trip_verified") is not True
+            or token_span.get("completion_token_ids_hash")
+            != token_stream_hash(completion_ids, stream="completion")
+            or token_span.get("token_ids_hash")
+            != token_stream_hash(span_ids, stream="completion_span")
+        ):
+            raise CLIError(f"anchor candidate row {index} exact token span mismatch")
+
+    try:
+        reconstructed = select_frozen_anchors(
+            candidate_objects,
+            sentence_classes=manifest.sentence_classes,
+            directions=manifest.directions,
+            per_cell=manifest.per_cell,
+            seed=manifest.seed,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CLIError(f"anchor candidate selection cannot be reconstructed: {exc}") from exc
+    if reconstructed.as_dict() != manifest.as_dict():
+        raise CLIError("anchor manifest does not reconstruct from locked candidate judgments")
+    if path != _safe_project_artifact(root, _path_payload(path, root), label="anchor manifest"):
+        raise CLIError("anchor manifest path is outside the project provenance boundary")
+
+
+def _load_authenticated_anchor_output(
+    path: Path,
+    *,
+    config: RunConfig | None = None,
+    rollout_rows: Sequence[Mapping[str, Any]] | None = None,
+    require_primary_provenance: bool = False,
+) -> tuple[dict[str, Any], AnchorManifest]:
     if not path.is_file():
         raise CLIError(f"anchor manifest is absent at {path}")
     payload = read_json(path)
@@ -2282,6 +3013,19 @@ def _load_authenticated_anchor_output(path: Path) -> tuple[dict[str, Any], Ancho
         raise CLIError("anchor manifest is not an object")
     _verify_embedded_hash(payload, field="manifest_hash", label="anchor manifest")
     manifest = _anchor_manifest_from_payload(payload)
+    synthetic_smoke = _anchor_manifest_is_synthetic(payload, manifest)
+    if require_primary_provenance and synthetic_smoke:
+        raise CLIError("primary anchor input refuses synthetic smoke provenance")
+    if not synthetic_smoke and (require_primary_provenance or config is not None):
+        if config is None:  # pragma: no cover - guarded by the condition above
+            raise CLIError("primary anchor provenance validation requires the run configuration")
+        _validate_primary_anchor_provenance(
+            config=config,
+            path=path,
+            payload=payload,
+            manifest=manifest,
+            rollout_rows=rollout_rows,
+        )
     return dict(payload), manifest
 
 
@@ -2353,6 +3097,68 @@ def _anchor_paid_plan(
     return payload
 
 
+def _anchor_construction_manifest_path(config: RunConfig) -> Path:
+    return _resolve(config, config.paths.manifest_dir) / "anchor_candidate_construction.json"
+
+
+def _freeze_anchor_construction_metadata(
+    config: RunConfig,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    reserved = {
+        "construction_manifest",
+        "construction_manifest_sha256",
+        "construction_manifest_hash",
+    }
+    if reserved.intersection(metadata):
+        raise CLIError("anchor construction metadata contains reserved linkage fields")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol_version": "anchor-candidate-construction-v1",
+        "metadata": dict(metadata),
+    }
+    payload["manifest_hash"] = stable_hash(payload)
+    path = _anchor_construction_manifest_path(config)
+    _freeze_or_verify_json(path, payload, label="anchor candidate-construction manifest")
+    return {
+        **dict(metadata),
+        "construction_manifest": _path_payload(path, _project_root(config)),
+        "construction_manifest_sha256": sha256_file(path),
+        "construction_manifest_hash": payload["manifest_hash"],
+    }
+
+
+def _load_anchor_construction_metadata(config: RunConfig) -> dict[str, Any]:
+    root = _project_root(config)
+    path = _anchor_construction_manifest_path(config)
+    if not path.is_file():
+        raise CLIError(
+            "primary anchor candidates lack the frozen candidate-construction manifest"
+        )
+    payload = read_json(path)
+    if not isinstance(payload, Mapping):
+        raise CLIError("anchor candidate-construction manifest is not an object")
+    manifest_hash = _verify_embedded_hash(
+        payload,
+        field="manifest_hash",
+        label="anchor candidate-construction manifest",
+    )
+    metadata = payload.get("metadata")
+    if (
+        set(payload) != {"schema_version", "protocol_version", "metadata", "manifest_hash"}
+        or payload.get("schema_version") != 1
+        or payload.get("protocol_version") != "anchor-candidate-construction-v1"
+        or not isinstance(metadata, Mapping)
+    ):
+        raise CLIError("anchor candidate-construction manifest schema mismatch")
+    return {
+        **dict(metadata),
+        "construction_manifest": _path_payload(path, root),
+        "construction_manifest_sha256": sha256_file(path),
+        "construction_manifest_hash": manifest_hash,
+    }
+
+
 def _freeze_anchor_file(
     config: RunConfig,
     preregistration: Mapping[str, Any],
@@ -2371,6 +3177,16 @@ def _freeze_anchor_file(
         _candidate_from_row(row, row_number=index)
         for index, row in enumerate(candidate_rows, start=1)
     ]
+    synthetic_smoke = bool(candidates) and all(
+        candidate.provenance.get("synthetic_smoke") is True for candidate in candidates
+    )
+    if not synthetic_smoke:
+        if build_metadata is None:
+            build_metadata = _load_anchor_construction_metadata(config)
+        elif "construction_manifest" not in build_metadata:
+            build_metadata = _freeze_anchor_construction_metadata(config, build_metadata)
+        elif dict(build_metadata) != _load_anchor_construction_metadata(config):
+            raise CLIError("anchor construction metadata differs from its frozen sidecar")
     anchors_config = preregistration.get("anchors")
     if not isinstance(anchors_config, Mapping):
         raise CLIError("preregistration is missing anchors configuration")
@@ -2384,6 +3200,7 @@ def _freeze_anchor_file(
         seed=f"{int(preregistration['sampling']['master_seed'])}:anchor-selection-v1",
     )
     payload = manifest.as_dict()
+    payload["synthetic_smoke"] = synthetic_smoke
     payload["preselection_manifest_hash"] = stable_hash(
         [candidate.selection_payload() for candidate in candidates]
     )
@@ -2417,9 +3234,6 @@ def _freeze_anchor_file(
     if output_path.exists():
         observed = read_json(output_path)
         legacy_payload = {key: value for key, value in payload.items() if key != "manifest_hash"}
-        synthetic_smoke = bool(candidates) and all(
-            candidate.provenance.get("synthetic_smoke") is True for candidate in candidates
-        )
         if observed == legacy_payload or synthetic_smoke:
             # One deterministic schema migration for pre-hash smoke artifacts.
             # The smoke command also refreshes its checked-in deterministic
@@ -2451,7 +3265,7 @@ def _command_anchors(args: argparse.Namespace) -> dict[str, Any]:
     # A canonical completed manifest is a free validation target.  It must never
     # make approval freshness or API availability a condition of reproducibility.
     if output.is_file():
-        payload, manifest = _load_authenticated_anchor_output(output)
+        payload, manifest = _load_authenticated_anchor_output(output, config=config)
         if candidates.is_file():
             if payload.get("candidate_file_sha256") != sha256_file(candidates):
                 raise CLIError("completed anchor manifest candidate-file hash mismatch")
@@ -2516,34 +3330,10 @@ def _command_anchors(args: argparse.Namespace) -> dict[str, Any]:
         classifier_google_route = _exact_approved_route(gate, "classifier_google")
         if classifier_anthropic_route["model"] == classifier_google_route["model"]:
             raise CLIError("approved anchor classifier routes must be distinct")
-        paid_plan = _anchor_paid_plan(
-            config=config,
-            gate=gate,
-            rollout_path=rollout_path,
-            sampling_manifest_path=sampling_manifest_path,
-            sampling_manifest=sampling_manifest,
-            candidates_path=candidates,
-            output_path=output,
-            classifier_routes=(classifier_anthropic_route, classifier_google_route),
-            max_per_trace_per_family=max_per_trace,
-            confidence_threshold=confidence_threshold,
-        )
-        checkpoint_dir = _resolve(config, config.paths.interim_dir) / "checkpoints/anchors"
-        _freeze_or_verify_json(
-            checkpoint_dir / "paid_plan.json",
-            paid_plan,
-            label="anchor paid plan",
-        )
-        paid_receipt = _authorize_paid_plan(
-            args,
-            config=config,
-            gate=gate,
-            command_phase="anchors_api",
-            plan_hash=str(paid_plan["plan_hash"]),
-        )
 
-        # The authorization receipt is intentionally complete before either of
-        # these constructors can download a tokenizer or initialize a paid route.
+        # Exact token spans determine the bounded, frozen classifier inventory.
+        # This local construction is complete before any paid provider client is
+        # created, so the whole-phase budget gate can fail with zero transports.
         try:
             from transformers import AutoTokenizer
         except ImportError as exc:
@@ -2554,38 +3344,6 @@ def _command_anchors(args: argparse.Namespace) -> dict[str, Any]:
             config.model.id,
             revision=config.model.revision,
             trust_remote_code=False,
-        )
-
-        ledger_path = _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml"
-        ledger = CostLedger(
-            ledger_path,
-            BudgetLimits(
-                gpu=float(gate.bindings.caps_usd.gpu),
-                api=float(gate.bindings.caps_usd.api),
-                total=float(gate.bindings.caps_usd.total),
-            ),
-        )
-        secret_env = config.execution.secret_env.get("openrouter", "OPENROUTER_API_KEY")
-        paid_response_dir = checkpoint_dir / "paid_responses"
-        classifier_a = OpenRouterClassificationCaller(
-            model_id=str(classifier_anthropic_route["model"]),
-            price=TokenPrice(
-                classifier_anthropic_route["input_usd_per_million_tokens"],
-                classifier_anthropic_route["output_usd_per_million_tokens"],
-            ),
-            ledger=ledger,
-            api_key_env=secret_env,
-            paid_response_store=PaidResponseStore(paid_response_dir / "classifier_anthropic"),
-        )
-        classifier_b = OpenRouterClassificationCaller(
-            model_id=str(classifier_google_route["model"]),
-            price=TokenPrice(
-                classifier_google_route["input_usd_per_million_tokens"],
-                classifier_google_route["output_usd_per_million_tokens"],
-            ),
-            ledger=ledger,
-            api_key_env=secret_env,
-            paid_response_store=PaidResponseStore(paid_response_dir / "classifier_google"),
         )
         prefilter = prefilter_anchor_sentences(
             rollout_rows,
@@ -2601,6 +3359,112 @@ def _command_anchors(args: argparse.Namespace) -> dict[str, Any]:
             prefilter_path,
             prefilter.to_dict(),
             label="anchor prefilter manifest",
+        )
+
+        checkpoint_dir = _resolve(config, config.paths.interim_dir) / "checkpoints/anchors"
+        paid_response_dir = checkpoint_dir / "paid_responses"
+        classifier_a_store = PaidResponseStore(
+            paid_response_dir / "classifier_anthropic"
+        )
+        classifier_b_store = PaidResponseStore(paid_response_dir / "classifier_google")
+        classifier_specs: list[OpenRouterRequestSpec] = []
+        classifier_routes_and_stores = (
+            ("classifier_anthropic", classifier_anthropic_route, classifier_a_store, 0),
+            ("classifier_google", classifier_google_route, classifier_b_store, 1),
+        )
+        for candidate in prefilter.candidates:
+            for route_name, route, response_store, judgment_index in (
+                classifier_routes_and_stores
+            ):
+                judgment_id = hashlib.sha256(
+                    canonical_json(
+                        {
+                            "candidate_id": candidate.request.candidate_id,
+                            "prompt_hash": candidate.request.prompt_hash,
+                            "judgment_index": judgment_index,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                classifier_specs.append(
+                    OpenRouterRequestSpec(
+                        route=route_name,
+                        model_id=str(route["model"]),
+                        model_revision=None,
+                        price=TokenPrice(
+                            float(route["input_usd_per_million_tokens"]),
+                            float(route["output_usd_per_million_tokens"]),
+                        ),
+                        request_id=judgment_id,
+                        user_content=candidate.request.prompt,
+                        purpose="classification",
+                        max_output_tokens=256,
+                        paid_response_store=response_store,
+                    )
+                )
+        ledger = _api_ledger(config, gate)
+        api_completion = preflight_openrouter_phase(
+            phase="anchors_api",
+            requests=classifier_specs,
+            ledger=ledger,
+        )
+        paid_plan = _anchor_paid_plan(
+            config=config,
+            gate=gate,
+            rollout_path=rollout_path,
+            sampling_manifest_path=sampling_manifest_path,
+            sampling_manifest=sampling_manifest,
+            candidates_path=candidates,
+            output_path=output,
+            classifier_routes=(classifier_anthropic_route, classifier_google_route),
+            max_per_trace_per_family=max_per_trace,
+            confidence_threshold=confidence_threshold,
+        )
+        paid_plan = _bind_api_completion_preflight(paid_plan, api_completion)
+        paid_plan = _freeze_or_reuse_api_paid_plan(
+            checkpoint_dir / "paid_plan.json",
+            paid_plan,
+            api_completion,
+            label="anchor paid plan",
+        )
+        _freeze_api_completion_attempt(
+            checkpoint_dir,
+            paid_plan_hash=str(paid_plan["plan_hash"]),
+            preflight=api_completion,
+        )
+        paid_receipt = _authorize_paid_plan(
+            args,
+            config=config,
+            gate=gate,
+            command_phase="anchors_api",
+            plan_hash=str(paid_plan["plan_hash"]),
+            api_completion_preflight=paid_plan["api_completion_preflight"],
+        )
+        ledger_path = _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml"
+        secret_env = config.execution.secret_env.get("openrouter", "OPENROUTER_API_KEY")
+        dispatch_guard = OpenRouterDispatchGuard(api_completion)
+        classifier_a = OpenRouterClassificationCaller(
+            model_id=str(classifier_anthropic_route["model"]),
+            price=TokenPrice(
+                classifier_anthropic_route["input_usd_per_million_tokens"],
+                classifier_anthropic_route["output_usd_per_million_tokens"],
+            ),
+            ledger=ledger,
+            api_key_env=secret_env,
+            paid_response_store=classifier_a_store,
+            dispatch_guard=dispatch_guard,
+            dispatch_route="classifier_anthropic",
+        )
+        classifier_b = OpenRouterClassificationCaller(
+            model_id=str(classifier_google_route["model"]),
+            price=TokenPrice(
+                classifier_google_route["input_usd_per_million_tokens"],
+                classifier_google_route["output_usd_per_million_tokens"],
+            ),
+            ledger=ledger,
+            api_key_env=secret_env,
+            paid_response_store=classifier_b_store,
+            dispatch_guard=dispatch_guard,
+            dispatch_route="classifier_google",
         )
         locked = classify_prefiltered_sentences(
             prefilter,
@@ -2643,8 +3507,10 @@ def _command_anchors(args: argparse.Namespace) -> dict[str, Any]:
             "rollouts_sha256": sha256_file(rollout_path),
             "prefilter_manifest": _path_payload(prefilter_path, root),
             "prefilter_manifest_hash": prefilter.manifest_hash,
+            "prefilter_manifest_sha256": sha256_file(prefilter_path),
             "classification_lock": _path_payload(locked_path, root),
             "classification_lock_hash": locked.lock_hash,
+            "classification_lock_sha256": sha256_file(locked_path),
             "classifier_routes": [
                 classifier_a.provenance.as_dict(),
                 classifier_b.provenance.as_dict(),
@@ -2660,12 +3526,13 @@ def _command_anchors(args: argparse.Namespace) -> dict[str, Any]:
         output,
         build_metadata=build_metadata,
     )
+    payload, frozen_manifest = _load_authenticated_anchor_output(output, config=config)
     return {
         "command": "anchors",
         "status": "complete",
         "validation_only": False,
         "paid_calls_performed": paid_call_count,
-        "anchors": len(payload["anchors"]),
+        "anchors": len(frozen_manifest.anchors),
         "selection_hash": payload["selection_hash"],
         "manifest_hash": payload["manifest_hash"],
         "output": _path_payload(output, _project_root(config)),
@@ -2929,16 +3796,12 @@ def _validate_primary_resampling_inputs(
         rollout_by_id[run_id] = dict(row)
         token_streams_by_id[run_id] = (prompt_ids, completion_ids)
 
-    anchor_payload = read_json(anchor_path)
-    if not isinstance(anchor_payload, Mapping):
-        raise CLIError("anchor manifest is not an object")
-    _verify_embedded_hash(
-        anchor_payload,
-        field="manifest_hash",
-        label="anchor manifest",
-        required=False,
+    anchor_payload, anchor_manifest = _load_authenticated_anchor_output(
+        anchor_path,
+        config=config,
+        rollout_rows=rollout_rows,
+        require_primary_provenance=True,
     )
-    anchor_manifest = _anchor_manifest_from_payload(anchor_payload)
     for anchor in anchor_manifest.anchors:
         source = rollout_by_id.get(anchor.trace_id)
         if source is None:
@@ -3089,6 +3952,10 @@ class _CheckpointingRawPrefixBackend:
     @property
     def provenance(self) -> Mapping[str, Any]:
         return self._delegate.provenance
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._delegate.tokenizer
 
     def encode_prefix(self, messages: Any, raw_thinking_prefix: str) -> Any:
         return self._delegate.encode_prefix(messages, raw_thinking_prefix)
@@ -3414,7 +4281,14 @@ def _command_resample_generate(args: argparse.Namespace) -> dict[str, Any]:
 
 def _resample_adjudication_settings(
     preregistration: Mapping[str, Any],
-) -> tuple[NeutralControlSpec, ReplacementTokenTolerance, float, float, float]:
+) -> tuple[
+    NeutralControlSpec,
+    ReplacementTokenTolerance,
+    float,
+    float,
+    float,
+    dict[str, float | int],
+]:
     resampling = preregistration.get("resampling")
     quality = preregistration.get("quality_gates")
     external = preregistration.get("external_judging")
@@ -3451,6 +4325,30 @@ def _resample_adjudication_settings(
         raise CLIError("outcome calibration settings are absent")
     minimum_agreement = float(calibration["minimum_exact_status_and_value_agreement"])
     minimum_known = float(quality["external_final_known_rate_minimum"])
+    raw_attrition = quality.get("resampling_generation_attrition")
+    if not isinstance(raw_attrition, Mapping):
+        raise CLIError("frozen resampling generation-attrition gates are absent")
+    attrition: dict[str, float | int] = {
+        "minimum_overall_generation_valid_rate": float(
+            raw_attrition.get("minimum_overall_generation_valid_rate", -1)
+        ),
+        "minimum_anchor_arm_valid_count": int(
+            raw_attrition.get("minimum_anchor_arm_valid_count", -1)
+        ),
+        "minimum_anchor_pair_complete_count": int(
+            raw_attrition.get("minimum_anchor_pair_complete_count", -1)
+        ),
+        "maximum_anchor_arm_valid_rate_gap": float(
+            raw_attrition.get("maximum_anchor_arm_valid_rate_gap", -1)
+        ),
+    }
+    if attrition != {
+        "minimum_overall_generation_valid_rate": 0.95,
+        "minimum_anchor_arm_valid_count": 18,
+        "minimum_anchor_pair_complete_count": 16,
+        "maximum_anchor_arm_valid_rate_gap": 0.10,
+    }:
+        raise CLIError("resampling generation-attrition gates disagree with the frozen design")
     confidence = float(classification["confidence_threshold"])
     if any(
         not math.isfinite(value) or not 0 <= value <= 1
@@ -3470,6 +4368,7 @@ def _resample_adjudication_settings(
         confidence,
         minimum_agreement,
         minimum_known,
+        attrition,
     )
 
 
@@ -3564,9 +4463,33 @@ def _command_resample_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         initial_allocation_manifest=initial_allocation,
         stage_two_allocation_manifest=stage_two_allocation,
     )
-    neutral_control, token_tolerance, confidence, minimum_agreement, minimum_known = (
-        _resample_adjudication_settings(preregistration)
+    (
+        neutral_control,
+        token_tolerance,
+        confidence,
+        minimum_agreement,
+        minimum_known,
+        generation_attrition,
+    ) = _resample_adjudication_settings(preregistration)
+    generation_gate = evaluate_generation_attrition(
+        generation.rows,
+        minimum_overall_generation_valid_rate=float(
+            generation_attrition["minimum_overall_generation_valid_rate"]
+        ),
+        minimum_anchor_arm_valid_count=int(
+            generation_attrition["minimum_anchor_arm_valid_count"]
+        ),
+        minimum_anchor_pair_complete_count=int(
+            generation_attrition["minimum_anchor_pair_complete_count"]
+        ),
+        maximum_anchor_arm_valid_rate_gap=float(
+            generation_attrition["maximum_anchor_arm_valid_rate_gap"]
+        ),
     )
+    if generation_gate["generation_attrition_gate_passed"] is not True:
+        raise CLIError(
+            "resampling generation attrition failed before API budget preflight"
+        )
     primary_route = _exact_approved_route(gate, "primary_final_and_trajectory")
     independent_route = _exact_approved_route(gate, "independent_final")
     classifier_routes = (
@@ -3594,6 +4517,115 @@ def _command_resample_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
     )
     ledger_path = _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml"
     api_usage_path = checkpoint_dir / "openrouter_usage_audit.jsonl"
+    ledger = _api_ledger(config, gate)
+    paid_response_dir = checkpoint_dir / "paid_responses"
+    response_stores = {
+        "primary": PaidResponseStore(paid_response_dir / "primary"),
+        "independent_final": PaidResponseStore(paid_response_dir / "independent_final"),
+        "classifier_anthropic": PaidResponseStore(
+            paid_response_dir / "classifier_anthropic"
+        ),
+        "classifier_google": PaidResponseStore(paid_response_dir / "classifier_google"),
+    }
+
+    # All classifier eligibility decisions are local and deterministic, so make
+    # them now and enumerate the exact final/classifier payloads before a paid
+    # client exists. Terminal-invalid generations have no API requests.
+    embedder = PinnedSentenceTransformerEmbedder(device="cpu")
+    anchors_by_id = {anchor.anchor_id: anchor for anchor in anchor_manifest.anchors}
+    resample_request_specs: list[OpenRouterRequestSpec] = []
+    for intermediate in generation.rows:
+        if intermediate.generation_status != GENERATION_STATUS_VALID:
+            continue
+        base = base_traces[intermediate.base_trace_id]
+        case = blinded_case_from_rollout(
+            {
+                "reasoning": intermediate.full_trace,
+                "answer": intermediate.answer,
+            },
+            task_question=QUESTIONS[Task(str(base["task"]))],
+        )
+        final_request = build_adjudication_request(case, FINAL_ANSWER_INSTRUMENT)
+        resample_request_specs.extend(
+            (
+                _adjudication_request_spec(
+                    route_name="primary_final",
+                    route=primary_route,
+                    request=final_request,
+                    store=response_stores["primary"],
+                ),
+                _adjudication_request_spec(
+                    route_name="independent_final",
+                    route=independent_route,
+                    request=final_request,
+                    store=response_stores["independent_final"],
+                ),
+            )
+        )
+        if intermediate.arm != "resample":
+            continue
+        anchor = anchors_by_id[intermediate.anchor_id]
+        divergence = assess_semantic_divergence(
+            anchor.sentence_text,
+            intermediate.replacement_sentence,
+            embedder,
+        )
+        token_audit = _replacement_token_audit(
+            anchor_token_count=len(intermediate.anchor_token_ids),
+            replacement_token_count=len(intermediate.replacement_token_ids),
+            tolerance=token_tolerance,
+        )
+        if (
+            not divergence.divergent
+            or token_audit["within_absolute_tolerance"] is not True
+            or token_audit["within_relative_tolerance"] is not True
+        ):
+            continue
+        classification_request = _replacement_classification_request(
+            original_sentence=anchor.sentence_text,
+            replacement_sentence=intermediate.replacement_sentence,
+            target_sentence_class=anchor.sentence_class,
+            threshold=float(base["threshold"]),
+            neutral_control=neutral_control,
+        )
+        classifier_user_content = canonical_json(classification_request.visible_payload())
+        for route_index, (route_name, route) in enumerate(
+            zip(
+                ("classifier_anthropic", "classifier_google"),
+                classifier_routes,
+                strict=True,
+            )
+        ):
+            logical_id = stable_hash(
+                {
+                    "request_hash": classification_request.request_hash,
+                    "route_index": route_index,
+                    "model_id": route["model"],
+                    "model_revision": None,
+                }
+            )
+            resample_request_specs.append(
+                OpenRouterRequestSpec(
+                    route=route_name,
+                    model_id=str(route["model"]),
+                    model_revision=None,
+                    price=TokenPrice(
+                        float(route["input_usd_per_million_tokens"]),
+                        float(route["output_usd_per_million_tokens"]),
+                    ),
+                    request_id=logical_id,
+                    system_prompt=REPLACEMENT_CLASSIFIER_PROMPT,
+                    user_content=classifier_user_content,
+                    purpose="replacement_classification",
+                    max_output_tokens=512,
+                    paid_response_store=response_stores[route_name],
+                )
+            )
+    api_completion = preflight_openrouter_phase(
+        phase="resample_api",
+        requests=resample_request_specs,
+        ledger=ledger,
+    )
     paid_plan: dict[str, Any] = {
         "schema_version": 1,
         "protocol_version": "resample-api-paid-plan-v1",
@@ -3634,38 +4666,49 @@ def _command_resample_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         "quality_gates": {
             "minimum_exact_agreement": minimum_agreement,
             "minimum_final_known_rate": minimum_known,
+            "generation_attrition": dict(generation_attrition),
         },
         "outputs": {
             "checkpoint_dir": _path_payload(checkpoint_dir, root),
             "artifact": _path_payload(artifact, root),
             "api_usage_audit": _path_payload(api_usage_path, root),
         },
+        "paid_response_stores": {
+            role: _path_payload(store.directory, root)
+            for role, store in sorted(response_stores.items())
+        },
         "cost_ledger": {
             "path": _path_payload(ledger_path, root),
             "caps_usd": gate.bindings.caps_usd.model_dump(mode="json"),
         },
+        "api_completion_preflight": dict(api_completion.manifest),
     }
     paid_plan["plan_hash"] = stable_hash(paid_plan)
+    paid_plan = _freeze_or_reuse_api_paid_plan(
+        checkpoint_dir / "paid_plan.json",
+        paid_plan,
+        api_completion,
+        label="resample API paid plan",
+    )
+    _freeze_api_completion_attempt(
+        checkpoint_dir,
+        paid_plan_hash=str(paid_plan["plan_hash"]),
+        preflight=api_completion,
+    )
     paid_receipt = _authorize_paid_plan(
         args,
         config=config,
         gate=gate,
         command_phase="resample_api",
         plan_hash=paid_plan["plan_hash"],
-    )
-
-    ledger = CostLedger(
-        ledger_path,
-        BudgetLimits(
-            gpu=float(gate.bindings.caps_usd.gpu),
-            api=float(gate.bindings.caps_usd.api),
-            total=float(gate.bindings.caps_usd.total),
-        ),
+        api_completion_preflight=paid_plan["api_completion_preflight"],
     )
     api_key_env = config.execution.secret_env.get("openrouter", "OPENROUTER_API_KEY")
-    paid_response_dir = checkpoint_dir / "paid_responses"
+    dispatch_guard = OpenRouterDispatchGuard(api_completion)
 
-    def json_client(route: Mapping[str, Any], role: str) -> OpenRouterJSONClient:
+    def json_client(
+        route: Mapping[str, Any], role: str, dispatch_route: str
+    ) -> OpenRouterJSONClient:
         return OpenRouterJSONClient(
             model_id=str(route["model"]),
             model_revision=None,
@@ -3675,10 +4718,14 @@ def _command_resample_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
             ),
             ledger=ledger,
             api_key_env=api_key_env,
-            paid_response_store=PaidResponseStore(paid_response_dir / role),
+            paid_response_store=response_stores[role],
+            dispatch_guard=dispatch_guard,
+            dispatch_route=dispatch_route,
         )
 
-    def adjudication_caller(route: Mapping[str, Any], role: str) -> OpenRouterAdjudicationCaller:
+    def adjudication_caller(
+        route: Mapping[str, Any], role: str, dispatch_route: str
+    ) -> OpenRouterAdjudicationCaller:
         return OpenRouterAdjudicationCaller(
             model_id=str(route["model"]),
             model_revision=None,
@@ -3688,20 +4735,25 @@ def _command_resample_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
             ),
             ledger=ledger,
             api_key_env=api_key_env,
-            paid_response_store=PaidResponseStore(paid_response_dir / role),
+            paid_response_store=response_stores[role],
+            dispatch_guard=dispatch_guard,
+            dispatch_route=dispatch_route,
         )
 
-    primary_caller = adjudication_caller(primary_route, "primary")
-    independent_caller = adjudication_caller(independent_route, "independent_final")
+    primary_caller = adjudication_caller(primary_route, "primary", "primary_final")
+    independent_caller = adjudication_caller(
+        independent_route, "independent_final", "independent_final"
+    )
     classifier_clients = (
-        json_client(classifier_routes[0], "classifier_anthropic"),
-        json_client(classifier_routes[1], "classifier_google"),
+        json_client(
+            classifier_routes[0], "classifier_anthropic", "classifier_anthropic"
+        ),
+        json_client(classifier_routes[1], "classifier_google", "classifier_google"),
     )
     replacement_classifier = TwoRouteOpenRouterReplacementClassifier(
         classifier_clients,
         confidence_threshold=confidence,
     )
-    embedder = PinnedSentenceTransformerEmbedder(device="cpu")
     primary_client = getattr(primary_caller, "_client", None)
     independent_client = getattr(independent_caller, "_client", None)
 
@@ -3732,6 +4784,18 @@ def _command_resample_adjudicate(args: argparse.Namespace) -> dict[str, Any]:
         execution_id=execution_id,
         minimum_exact_agreement=minimum_agreement,
         minimum_final_known_rate=minimum_known,
+        minimum_overall_generation_valid_rate=float(
+            generation_attrition["minimum_overall_generation_valid_rate"]
+        ),
+        minimum_anchor_arm_valid_count=int(
+            generation_attrition["minimum_anchor_arm_valid_count"]
+        ),
+        minimum_anchor_pair_complete_count=int(
+            generation_attrition["minimum_anchor_pair_complete_count"]
+        ),
+        maximum_anchor_arm_valid_rate_gap=float(
+            generation_attrition["maximum_anchor_arm_valid_rate_gap"]
+        ),
         on_record_committed=checkpoint_usage,
     )
     checkpoint_usage()
@@ -3832,6 +4896,18 @@ def _required_resample_args(args: argparse.Namespace) -> list[str]:
 
 
 def _command_resample(args: argparse.Namespace) -> dict[str, Any]:
+    raise CLIError(
+        "legacy combined resample command is hard-disabled; use resample-generate then resample-adjudicate"
+    )
+
+
+def _disabled_legacy_command_resample_body(args: argparse.Namespace) -> dict[str, Any]:
+    raise CLIError("disabled legacy resample body cannot execute paid providers")
+
+
+def _unreachable_legacy_command_resample_reference(args: argparse.Namespace) -> dict[str, Any]:
+    raise CLIError("legacy resample implementation is permanently unreachable")
+
     config = load_run_config(args.config)
     artifact = (
         Path(args.input).resolve()
@@ -4417,7 +5493,12 @@ def _load_authenticated_position_inputs(
     anchor_path: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], AnchorManifest]:
     rollout_rows = _load_authenticated_rollout_rows(config, rollout_path)
-    anchor_payload, frozen = _load_authenticated_anchor_output(anchor_path)
+    anchor_payload, frozen = _load_authenticated_anchor_output(
+        anchor_path,
+        config=config,
+        rollout_rows=rollout_rows,
+        require_primary_provenance=True,
+    )
     rollout_by_id = {str(row["run_id"]): row for row in rollout_rows}
     for anchor in frozen.anchors:
         source = rollout_by_id.get(anchor.trace_id)
@@ -4539,6 +5620,539 @@ def _first_estimate_record_from_dict(source: Any) -> FirstEstimateSpanRecord:
     return record
 
 
+def _position_summary_artifact(
+    *,
+    root: Path,
+    summary: Mapping[str, Any],
+    path_field: str,
+    sha_field: str,
+    label: str,
+) -> Path:
+    path = _safe_project_artifact(root, summary.get(path_field), label=label)
+    if not path.is_file() or summary.get(sha_field) != sha256_file(path):
+        raise CLIError(f"{label} SHA-256 mismatch")
+    return path
+
+
+def _position_linked_artifact(
+    *,
+    root: Path,
+    link: Any,
+    label: str,
+) -> Path:
+    if not isinstance(link, Mapping):
+        raise CLIError(f"lens position manifest lacks {label} linkage")
+    path = _safe_project_artifact(root, link.get("path"), label=label)
+    if not path.is_file() or link.get("sha256") != sha256_file(path):
+        raise CLIError(f"{label} SHA-256 mismatch")
+    return path
+
+
+def _validate_position_paid_checkpoint_chain(
+    *,
+    config: RunConfig,
+    summary: Mapping[str, Any],
+    rollout_path: Path,
+    anchor_path: Path,
+    anchor_payload: Mapping[str, Any],
+    frozen: AnchorManifest,
+    output: Path,
+) -> dict[str, dict[str, Any]]:
+    root = _project_root(config)
+    paid_plan_path = _position_linked_artifact(
+        root=root,
+        link=summary.get("paid_plan"),
+        label="positions paid plan",
+    )
+    paid_plan = read_json(paid_plan_path)
+    if not isinstance(paid_plan, Mapping):
+        raise CLIError("positions paid plan is not an object")
+    paid_plan_hash = _verify_embedded_hash(
+        paid_plan,
+        field="plan_hash",
+        label="positions paid plan",
+    )
+    expected_trace_ids = [anchor.trace_id for anchor in frozen.anchors]
+    expected_anchor_ids = [anchor.anchor_id for anchor in frozen.anchors]
+    paid_rollouts = paid_plan.get("rollouts")
+    paid_anchors = paid_plan.get("anchor_manifest")
+    tokenizer = paid_plan.get("tokenizer")
+    if (
+        summary.get("paid_plan_hash") != paid_plan_hash
+        or paid_plan.get("schema_version") != 1
+        or paid_plan.get("protocol_version") != "positions-api-paid-plan-v1"
+        or paid_plan.get("command_phase") != "positions_api"
+        or paid_plan.get("config_hash")
+        != stable_hash(config.model_dump(mode="json", exclude={"source_path"}))
+        or paid_plan.get("preregistration_hash")
+        != stable_hash(load_preregistration(config))
+        or not isinstance(paid_rollouts, Mapping)
+        or paid_rollouts.get("path") != _path_payload(rollout_path, root)
+        or paid_rollouts.get("sha256") != sha256_file(rollout_path)
+        or not isinstance(paid_anchors, Mapping)
+        or paid_anchors.get("path") != _path_payload(anchor_path, root)
+        or paid_anchors.get("sha256") != sha256_file(anchor_path)
+        or paid_anchors.get("manifest_hash") != anchor_payload.get("manifest_hash")
+        or paid_anchors.get("selection_hash") != frozen.selection_hash
+        or paid_plan.get("trace_ids") != expected_trace_ids
+        or paid_plan.get("anchor_ids") != expected_anchor_ids
+        or not isinstance(tokenizer, Mapping)
+        or tokenizer.get("id") != config.model.id
+        or tokenizer.get("revision") != config.model.revision
+        or paid_plan.get("instrument_id") != FIRST_ESTIMATE_SPAN_INSTRUMENT_ID
+        or paid_plan.get("route") != summary.get("judge_route")
+        or paid_plan.get("output") != _path_payload(output, root)
+    ):
+        raise CLIError("positions paid plan disagrees with frozen source artifacts")
+
+    paid_receipt_path = _position_linked_artifact(
+        root=root,
+        link=summary.get("paid_receipt"),
+        label="positions paid receipt",
+    )
+    paid_receipt = read_json(paid_receipt_path)
+    if not isinstance(paid_receipt, Mapping):
+        raise CLIError("positions paid receipt is not an object")
+    receipt_hash = _verify_embedded_hash(
+        paid_receipt,
+        field="receipt_hash",
+        label="positions paid receipt",
+    )
+    if (
+        receipt_hash != summary.get("paid_receipt_hash")
+        or paid_receipt.get("schema_version") != 1
+        or paid_receipt.get("protocol_version") != PAID_PHASE_RECEIPT_PROTOCOL
+        or paid_receipt.get("command_phase") != "positions_api"
+        or paid_receipt.get("plan_hash") != paid_plan_hash
+    ):
+        raise CLIError("positions paid receipt does not authorize the frozen paid plan")
+
+    checkpoint_manifest_path = _position_linked_artifact(
+        root=root,
+        link=summary.get("checkpoint_manifest"),
+        label="positions checkpoint manifest",
+    )
+    paid_checkpoint_dir = _safe_project_artifact(
+        root,
+        paid_plan.get("checkpoint_dir"),
+        label="positions paid checkpoint directory",
+    )
+    if checkpoint_manifest_path != paid_checkpoint_dir / "span_units/checkpoint_manifest.json":
+        raise CLIError("positions checkpoint manifest is outside the frozen paid checkpoint")
+    checkpoint_manifest = read_json(checkpoint_manifest_path)
+    if not isinstance(checkpoint_manifest, Mapping):
+        raise CLIError("positions checkpoint manifest is not an object")
+    checkpoint_hash = _verify_embedded_hash(
+        checkpoint_manifest,
+        field="manifest_hash",
+        label="positions checkpoint manifest",
+    )
+    if checkpoint_hash != summary.get("checkpoint_manifest_hash"):
+        raise CLIError("positions checkpoint manifest hash disagrees with release summary")
+    checkpoint_plan_path = checkpoint_manifest_path.parent / "checkpoint_plan.json"
+    if not checkpoint_plan_path.is_file():
+        raise CLIError("positions checkpoint plan is absent")
+    checkpoint_plan = read_json(checkpoint_plan_path)
+    if not isinstance(checkpoint_plan, Mapping):
+        raise CLIError("positions checkpoint plan is not an object")
+    checkpoint_plan_hash = _verify_embedded_hash(
+        checkpoint_plan,
+        field="plan_hash",
+        label="positions checkpoint plan",
+    )
+    expected_checkpoint_payload = {
+        "protocol_version": "positions-span-records-v1",
+        "paid_plan_hash": paid_plan_hash,
+        "trace_ids": expected_trace_ids,
+        "anchor_ids": expected_anchor_ids,
+    }
+    if (
+        checkpoint_plan.get("schema_version") != 1
+        or checkpoint_plan.get("protocol_version") != RECORD_CHECKPOINT_PROTOCOL
+        or checkpoint_plan.get("id_field") != "trace_id"
+        or checkpoint_plan.get("payload") != expected_checkpoint_payload
+        or checkpoint_manifest.get("schema_version") != 1
+        or checkpoint_manifest.get("protocol_version") != RECORD_CHECKPOINT_PROTOCOL
+        or checkpoint_manifest.get("complete") is not True
+        or checkpoint_manifest.get("plan_hash") != checkpoint_plan_hash
+        or checkpoint_manifest.get("id_field") != "trace_id"
+        or checkpoint_manifest.get("row_count") != len(expected_trace_ids)
+        or checkpoint_manifest.get("expected_ids_hash") != stable_hash(expected_trace_ids)
+    ):
+        raise CLIError("positions checkpoint plan/inventory disagrees with frozen anchors")
+    rows_name = checkpoint_manifest.get("rows_file")
+    if (
+        not isinstance(rows_name, str)
+        or not rows_name
+        or Path(rows_name).name != rows_name
+    ):
+        raise CLIError("positions checkpoint rows path is unsafe")
+    checkpoint_rows_path = checkpoint_manifest_path.parent / rows_name
+    if not checkpoint_rows_path.is_file() or checkpoint_manifest.get("rows_sha256") != sha256_file(
+        checkpoint_rows_path
+    ):
+        raise CLIError("positions checkpoint rows SHA-256 mismatch")
+    checkpoint_rows = _record_rows(checkpoint_rows_path, label="positions checkpoint rows")
+    if (
+        [str(row.get("trace_id")) for row in checkpoint_rows] != expected_trace_ids
+        or checkpoint_manifest.get("record_hashes_hash")
+        != stable_hash([row["record_hash"] for row in checkpoint_rows])
+    ):
+        raise CLIError("positions checkpoint row inventory mismatch")
+    records_dir = checkpoint_manifest_path.parent / "records"
+    if not records_dir.is_dir():
+        raise CLIError("positions checkpoint individual records are absent")
+    expected_record_paths: dict[str, Path] = {}
+    for trace_id in expected_trace_ids:
+        digest = stable_hash(
+            {"id_field": "trace_id", "identifier": trace_id}
+        ).split(":", 1)[1]
+        expected_record_paths[trace_id] = records_dir / f"{digest}.json"
+    if set(records_dir.glob("*.json")) != set(expected_record_paths.values()):
+        raise CLIError("positions checkpoint individual record inventory mismatch")
+    by_trace = {str(row["trace_id"]): row for row in checkpoint_rows}
+    for trace_id, record_path in expected_record_paths.items():
+        source = read_json(record_path)
+        if not isinstance(source, Mapping) or dict(source) != by_trace[trace_id]:
+            raise CLIError(
+                f"positions checkpoint individual record disagrees for {trace_id}"
+            )
+    return {str(row["trace_id"]): row for row in checkpoint_rows}
+
+
+def _validate_persisted_position_span(
+    span: Any,
+    *,
+    completion_ids: Sequence[int],
+    raw_text: str,
+    expected_section: str,
+    expected_section_start: int,
+    expected_section_end: int,
+    expected_completion_start: int,
+    expected_completion_end: int,
+    expected_text: str,
+    label: str,
+) -> tuple[int, int]:
+    if not isinstance(span, Mapping):
+        raise CLIError(f"{label} token span is not an object")
+    expected_fields = {
+        "schema_version",
+        "section",
+        "section_char_start",
+        "section_char_end",
+        "completion_char_start",
+        "completion_char_end",
+        "token_start",
+        "token_end",
+        "token_envelope_char_start",
+        "token_envelope_char_end",
+        "text",
+        "leading_envelope_text",
+        "trailing_envelope_text",
+        "token_ids",
+        "token_ids_hash",
+        "completion_token_ids_hash",
+        "round_trip_verified",
+    }
+    if set(span) != expected_fields or span.get("schema_version") != "1":
+        raise CLIError(f"{label} token span has an unsupported evidence schema")
+    try:
+        token_start = int(span["token_start"])
+        token_end = int(span["token_end"])
+        envelope_start = int(span["token_envelope_char_start"])
+        envelope_end = int(span["token_envelope_char_end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CLIError(f"{label} token span has invalid token offsets") from exc
+    if not 0 <= token_start < token_end <= len(completion_ids):
+        raise CLIError(f"{label} token span is outside the exact completion stream")
+    if not 0 <= envelope_start <= expected_completion_start < expected_completion_end <= (
+        envelope_end
+    ) <= len(raw_text):
+        raise CLIError(f"{label} token envelope is outside the exact completion text")
+    span_ids = list(completion_ids[token_start:token_end])
+    if (
+        span.get("section") != expected_section
+        or span.get("section_char_start") != expected_section_start
+        or span.get("section_char_end") != expected_section_end
+        or span.get("completion_char_start") != expected_completion_start
+        or span.get("completion_char_end") != expected_completion_end
+        or span.get("text") != expected_text
+        or raw_text[expected_completion_start:expected_completion_end] != expected_text
+        or span.get("leading_envelope_text")
+        != raw_text[envelope_start:expected_completion_start]
+        or span.get("trailing_envelope_text")
+        != raw_text[expected_completion_end:envelope_end]
+        or span.get("token_ids") != span_ids
+        or span.get("token_ids_hash")
+        != token_stream_hash(span_ids, stream="completion_span")
+        or span.get("completion_token_ids_hash")
+        != token_stream_hash(completion_ids, stream="completion")
+        or span.get("round_trip_verified") is not True
+    ):
+        raise CLIError(f"{label} token span does not reconstruct from frozen evidence")
+    return token_start, token_end
+
+
+def _validate_recomputed_position_row(
+    *,
+    row: Mapping[str, Any],
+    rollout: Mapping[str, Any],
+    anchor: FrozenAnchor,
+    first_estimate_record: FirstEstimateSpanRecord,
+    anchor_manifest_hash: str,
+) -> None:
+    expected_row_fields = {
+        "schema_version",
+        "trace_id",
+        "anchor_id",
+        "anchor_manifest_hash",
+        "rollout_record_hash",
+        "first_estimate_span_record_hash",
+        "first_estimate_span_instrument_id",
+        "first_estimate_span_primary_inference",
+        "prompt_token_ids_hash",
+        "completion_token_ids_hash",
+        "combined_token_stream_hash",
+        "position_order",
+        "position_indices",
+        "position_evidence",
+        "good_side_direction",
+        "causal_claim",
+        "record_hash",
+    }
+    if set(row) != expected_row_fields or row.get("schema_version") != 1:
+        raise CLIError("lens position row has an unsupported evidence schema")
+    streams = rollout.get("token_streams")
+    raw_text = rollout.get("raw_text")
+    if not isinstance(streams, Mapping) or not isinstance(raw_text, str):
+        raise CLIError("lens position source rollout lacks exact token evidence")
+    try:
+        prompt_ids, completion_ids = validate_token_stream_manifest(streams, require_both=True)
+    except (TypeError, ValueError) as exc:
+        raise CLIError("lens position source token stream is invalid") from exc
+    if prompt_ids is None or completion_ids is None or not prompt_ids:  # pragma: no cover
+        raise CLIError("lens position source token stream is incomplete")
+    sections = locate_completion_sections(raw_text)
+    if sections.reasoning != rollout.get("reasoning") or sections.answer != rollout.get("answer"):
+        raise CLIError("lens position source sections differ from the frozen rollout")
+    evidence = row.get("position_evidence")
+    if not isinstance(evidence, Mapping) or set(evidence) != {
+        "first_estimate",
+        "anchor",
+        "answer_first_token",
+    }:
+        raise CLIError("lens position row lacks exact position evidence")
+    adjudicated = first_estimate_record.adjudication
+    if (
+        adjudicated.source not in {"trace", "answer"}
+        or adjudicated.quote is None
+        or first_estimate_record.resolved_char_start is None
+        or first_estimate_record.resolved_char_end is None
+    ):
+        raise CLIError("lens position first-estimate adjudication is not a known exact span")
+    if adjudicated.source == "trace":
+        section_name = "reasoning"
+        section_offset = sections.reasoning_char_start
+    else:
+        section_name = "answer"
+        section_offset = sections.answer_char_start
+    first_start, _ = _validate_persisted_position_span(
+        evidence.get("first_estimate"),
+        completion_ids=completion_ids,
+        raw_text=raw_text,
+        expected_section=section_name,
+        expected_section_start=first_estimate_record.resolved_char_start,
+        expected_section_end=first_estimate_record.resolved_char_end,
+        expected_completion_start=section_offset + first_estimate_record.resolved_char_start,
+        expected_completion_end=section_offset + first_estimate_record.resolved_char_end,
+        expected_text=adjudicated.quote,
+        label="first-estimate",
+    )
+    frozen_anchor_span = anchor.provenance.get("token_span")
+    if evidence.get("anchor") != frozen_anchor_span:
+        raise CLIError("lens position anchor evidence differs from the frozen anchor span")
+    anchor_start, anchor_end = _validate_persisted_position_span(
+        evidence.get("anchor"),
+        completion_ids=completion_ids,
+        raw_text=raw_text,
+        expected_section="reasoning",
+        expected_section_start=anchor.char_start,
+        expected_section_end=anchor.char_end,
+        expected_completion_start=sections.reasoning_char_start + anchor.char_start,
+        expected_completion_end=sections.reasoning_char_start + anchor.char_end,
+        expected_text=anchor.sentence_text,
+        label="anchor",
+    )
+    if not sections.answer:
+        raise CLIError("lens position final-answer boundary is undefined")
+    answer_start, _ = _validate_persisted_position_span(
+        evidence.get("answer_first_token"),
+        completion_ids=completion_ids,
+        raw_text=raw_text,
+        expected_section="answer",
+        expected_section_start=0,
+        expected_section_end=1,
+        expected_completion_start=sections.answer_char_start,
+        expected_completion_end=sections.answer_char_start + 1,
+        expected_text=sections.answer[:1],
+        label="final-answer",
+    )
+    prompt_count = len(prompt_ids)
+
+    def before(token_start: int) -> int:
+        return prompt_count - 1 if token_start == 0 else prompt_count + token_start - 1
+
+    expected_positions = {
+        "prompt_end": prompt_count - 1,
+        "first_estimate_pre": before(first_start),
+        "anchor_pre": before(anchor_start),
+        "anchor_post": prompt_count + anchor_end - 1,
+        "final_answer_pre": before(answer_start),
+    }
+    expected_direction = 1 if anchor.direction == "above_good" else -1
+    if (
+        row.get("trace_id") != anchor.trace_id
+        or row.get("anchor_id") != anchor.anchor_id
+        or row.get("anchor_manifest_hash") != anchor_manifest_hash
+        or row.get("rollout_record_hash") != rollout.get("record_hash")
+        or row.get("first_estimate_span_record_hash")
+        != first_estimate_record.to_dict()["record_hash"]
+        or row.get("first_estimate_span_instrument_id") != FIRST_ESTIMATE_SPAN_INSTRUMENT_ID
+        or row.get("first_estimate_span_primary_inference") is not True
+        or row.get("prompt_token_ids_hash") != streams.get("prompt_token_ids_hash")
+        or row.get("completion_token_ids_hash") != streams.get("completion_token_ids_hash")
+        or row.get("combined_token_stream_hash") != streams.get("combined_token_stream_hash")
+        or tuple(row.get("position_order", ())) != POSITION_ORDER
+        or row.get("position_indices") != expected_positions
+        or row.get("good_side_direction") != expected_direction
+        or row.get("causal_claim") is not False
+    ):
+        raise CLIError("lens position row does not recompute from frozen source evidence")
+
+
+def _validate_position_span_chain(
+    *,
+    span_row: Mapping[str, Any],
+    raw_row: Mapping[str, Any],
+    checkpoint_row: Mapping[str, Any],
+    rollout: Mapping[str, Any],
+    anchor: FrozenAnchor,
+    anchor_manifest_hash: str,
+    summary: Mapping[str, Any],
+) -> FirstEstimateSpanRecord:
+    if set(span_row) != {"trace_id", "anchor_id", "span_record", "record_hash"}:
+        raise CLIError("first-estimate span row has an unsupported schema")
+    if set(raw_row) != {
+        "trace_id",
+        "anchor_id",
+        "case_hash",
+        "request_id",
+        "raw_response",
+        "response_hash",
+        "record_hash",
+    }:
+        raise CLIError("raw first-estimate response row has an unsupported schema")
+    expected_checkpoint_fields = {
+        "trace_id",
+        "anchor_id",
+        "anchor_manifest_hash",
+        "source_rollout_hash",
+        "case_hash",
+        "span_record",
+        "raw_response",
+        "response_hash",
+        "record_hash",
+    }
+    if set(checkpoint_row) != expected_checkpoint_fields:
+        raise CLIError("positions checkpoint row has an unsupported schema")
+
+    trace_id = anchor.trace_id
+    anchor_id = anchor.anchor_id
+    if (
+        span_row.get("trace_id") != trace_id
+        or span_row.get("anchor_id") != anchor_id
+        or raw_row.get("trace_id") != trace_id
+        or raw_row.get("anchor_id") != anchor_id
+    ):
+        raise CLIError("first-estimate span/raw inventory changed anchor identity")
+    record = _first_estimate_record_from_dict(span_row.get("span_record"))
+    case = blinded_case_from_rollout(
+        rollout,
+        task_question=QUESTIONS[Task.GIRAFFE],
+    )
+    request = build_adjudication_request(case, FIRST_ESTIMATE_SPAN_INSTRUMENT)
+    route = summary.get("judge_route")
+    if not isinstance(route, Mapping):
+        raise CLIError("lens position manifest judge route is malformed")
+    if (
+        record.case_hash != case.case_hash
+        or record.request_id != request.request_id
+        or record.instrument_hash != request.instrument_hash
+        or record.primary_inference is not True
+        or record.provenance.provider != route.get("provider")
+        or record.provenance.model_id != route.get("model")
+    ):
+        raise CLIError("first-estimate span record does not match its blind request/route")
+
+    raw_response = raw_row.get("raw_response")
+    if not isinstance(raw_response, str):
+        raise CLIError("raw first-estimate response is not text")
+    response_hash = stable_hash({"raw_response": raw_response})
+    if (
+        raw_row.get("case_hash") != case.case_hash
+        or raw_row.get("request_id") != request.request_id
+        or raw_row.get("response_hash") != response_hash
+        or record.response_hash != response_hash
+    ):
+        raise CLIError("raw first-estimate response hash/request linkage mismatch")
+    try:
+        parsed = parse_first_estimate_span(raw_response)
+    except (TypeError, ValueError) as exc:
+        raise CLIError("raw first-estimate response cannot reproduce its adjudication") from exc
+    if parsed != record.adjudication:
+        raise CLIError("raw first-estimate response differs from its persisted adjudication")
+
+    if parsed.status == "KNOWN":
+        assert parsed.source is not None
+        assert parsed.quote is not None
+        assert parsed.occurrence is not None
+        source_text = case.trace if parsed.source == "trace" else case.answer
+        starts: list[int] = []
+        cursor = 0
+        while True:
+            start = source_text.find(parsed.quote, cursor)
+            if start < 0:
+                break
+            starts.append(start)
+            cursor = start + 1
+        if parsed.occurrence > len(starts):
+            raise CLIError("raw first-estimate response quotes an absent source occurrence")
+        expected_start = starts[parsed.occurrence - 1]
+        expected_end = expected_start + len(parsed.quote)
+        if (
+            record.resolved_char_start != expected_start
+            or record.resolved_char_end != expected_end
+        ):
+            raise CLIError("first-estimate source offsets do not reproduce from the raw response")
+    elif record.resolved_char_start is not None or record.resolved_char_end is not None:
+        raise CLIError("UNKNOWN first-estimate response persisted source offsets")
+
+    expected_checkpoint = {
+        "trace_id": trace_id,
+        "anchor_id": anchor_id,
+        "anchor_manifest_hash": anchor_manifest_hash,
+        "source_rollout_hash": rollout.get("record_hash"),
+        "case_hash": case.case_hash,
+        "span_record": record.to_dict(),
+        "raw_response": raw_response,
+        "response_hash": response_hash,
+    }
+    expected_checkpoint["record_hash"] = stable_hash(expected_checkpoint)
+    if dict(checkpoint_row) != expected_checkpoint:
+        raise CLIError("positions checkpoint does not reproduce the released span/raw evidence")
+    return record
+
+
 def _validate_completed_positions(
     *,
     config: RunConfig,
@@ -4553,38 +6167,100 @@ def _validate_completed_positions(
     if not isinstance(summary, Mapping):
         raise CLIError("lens position manifest is not an object")
     _verify_embedded_hash(summary, field="manifest_hash", label="lens position manifest")
-    if summary.get("status") != "complete" or summary.get("failures") != []:
+    if (
+        summary.get("protocol_version") != "lens-position-release-v2"
+        or summary.get("status") != "complete"
+        or summary.get("failures") != []
+        or summary.get("synthetic_smoke") not in {None, False}
+    ):
         raise CLIError("lens position manifest does not certify a completed run")
     rollout_rows, anchor_payload, frozen = _load_authenticated_position_inputs(
         config=config,
         rollout_path=rollout_path,
         anchor_path=anchor_path,
     )
-    del rollout_rows
+    root = _project_root(config)
     if (
-        summary.get("positions") != _path_payload(output, _project_root(config))
+        summary.get("positions") != _path_payload(output, root)
         or summary.get("positions_sha256") != sha256_file(output)
+        or summary.get("rollouts") != _path_payload(rollout_path, root)
         or summary.get("rollouts_sha256") != sha256_file(rollout_path)
+        or summary.get("anchor_manifest") != _path_payload(anchor_path, root)
         or summary.get("anchor_manifest_hash") != anchor_payload["manifest_hash"]
     ):
         raise CLIError("lens position manifest source/output hashes disagree")
+    span_path = _position_summary_artifact(
+        root=root,
+        summary=summary,
+        path_field="first_estimate_spans",
+        sha_field="first_estimate_spans_sha256",
+        label="first-estimate span artifact",
+    )
+    raw_path = _position_summary_artifact(
+        root=root,
+        summary=summary,
+        path_field="raw_responses",
+        sha_field="raw_responses_sha256",
+        label="raw first-estimate response artifact",
+    )
     rows = _record_rows(output, label="lens positions")
+    span_rows = _record_rows(span_path, label="first-estimate spans")
+    raw_rows = _record_rows(raw_path, label="raw first-estimate responses")
     expected_ids = [anchor.anchor_id for anchor in frozen.anchors]
+    expected_trace_ids = [anchor.trace_id for anchor in frozen.anchors]
     if (
         len(rows) != len(expected_ids)
         or [str(row.get("anchor_id")) for row in rows] != expected_ids
-        or [str(row.get("trace_id")) for row in rows]
-        != [anchor.trace_id for anchor in frozen.anchors]
+        or [str(row.get("trace_id")) for row in rows] != expected_trace_ids
+        or len(span_rows) != len(expected_ids)
+        or [str(row.get("anchor_id")) for row in span_rows] != expected_ids
+        or [str(row.get("trace_id")) for row in span_rows] != expected_trace_ids
+        or len(raw_rows) != len(expected_ids)
+        or [str(row.get("anchor_id")) for row in raw_rows] != expected_ids
+        or [str(row.get("trace_id")) for row in raw_rows] != expected_trace_ids
     ):
         raise CLIError("completed lens position inventory disagrees with frozen anchors")
-    for index, row in enumerate(rows, start=1):
-        if (
-            row.get("anchor_manifest_hash") != anchor_payload["manifest_hash"]
-            or tuple(row.get("position_order", ())) != POSITION_ORDER
-            or set(row.get("position_indices", {})) != set(POSITION_ORDER)
-            or row.get("causal_claim") is not False
-        ):
-            raise CLIError(f"lens position row {index} violates the frozen position contract")
+    checkpoint_rows = _validate_position_paid_checkpoint_chain(
+        config=config,
+        summary=summary,
+        rollout_path=rollout_path,
+        anchor_path=anchor_path,
+        anchor_payload=anchor_payload,
+        frozen=frozen,
+        output=output,
+    )
+    rollout_by_id = {str(row["run_id"]): row for row in rollout_rows}
+    for row, span_row, raw_row, anchor in zip(
+        rows,
+        span_rows,
+        raw_rows,
+        frozen.anchors,
+        strict=True,
+    ):
+        record = _validate_position_span_chain(
+            span_row=span_row,
+            raw_row=raw_row,
+            checkpoint_row=checkpoint_rows[anchor.trace_id],
+            rollout=rollout_by_id[anchor.trace_id],
+            anchor=anchor,
+            anchor_manifest_hash=str(anchor_payload["manifest_hash"]),
+            summary=summary,
+        )
+        _validate_recomputed_position_row(
+            row=row,
+            rollout=rollout_by_id[anchor.trace_id],
+            anchor=anchor,
+            first_estimate_record=record,
+            anchor_manifest_hash=str(anchor_payload["manifest_hash"]),
+        )
+    try:
+        validate_frozen_lens_inputs(
+            rollouts=rollout_rows,
+            anchor_manifest=anchor_payload,
+            position_records=rows,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CLIError(f"completed lens positions fail the lens input gate: {exc}") from exc
     if summary.get("position_count") != len(rows):
         raise CLIError("lens position manifest count mismatch")
     return {
@@ -4593,8 +6269,8 @@ def _validate_completed_positions(
         "validation_only": True,
         "paid_calls_performed": 0,
         "positions": len(rows),
-        "output": _path_payload(output, _project_root(config)),
-        "manifest": _path_payload(summary_path, _project_root(config)),
+        "output": _path_payload(output, root),
+        "manifest": _path_payload(summary_path, root),
         "manifest_hash": summary["manifest_hash"],
     }
 
@@ -4649,6 +6325,35 @@ def _command_positions(args: argparse.Namespace) -> dict[str, Any]:
         command_phase="positions_api",
     )
     route = _exact_approved_route(gate, "primary_final_and_trajectory")
+    checkpoint_dir = _resolve(config, config.paths.interim_dir) / "checkpoints/positions"
+    position_response_store = PaidResponseStore(
+        checkpoint_dir / "paid_responses/primary_final_and_trajectory"
+    )
+    rollout_by_id = {str(row["run_id"]): row for row in rollout_rows}
+    position_request_specs: list[OpenRouterRequestSpec] = []
+    for anchor in frozen.anchors:
+        rollout = rollout_by_id[anchor.trace_id]
+        try:
+            task = Task(str(rollout.get("task", "")))
+        except ValueError as exc:
+            raise CLIError(f"unknown task for selected trace {anchor.trace_id}") from exc
+        case = blinded_case_from_rollout(rollout, task_question=QUESTIONS[task])
+        position_request_specs.append(
+            _adjudication_request_spec(
+                route_name="primary_final_and_trajectory",
+                route=route,
+                request=build_adjudication_request(case, FIRST_ESTIMATE_SPAN_INSTRUMENT),
+                store=position_response_store,
+            )
+        )
+    ledger_path = _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml"
+    ledger = _api_ledger(config, gate)
+    api_completion = preflight_openrouter_phase(
+        phase="positions_api",
+        requests=position_request_specs,
+        ledger=ledger,
+    )
+    dispatch_guard = OpenRouterDispatchGuard(api_completion)
     paid_plan = _positions_paid_plan(
         config=config,
         gate=gate,
@@ -4659,11 +6364,17 @@ def _command_positions(args: argparse.Namespace) -> dict[str, Any]:
         output=output,
         route=route,
     )
-    checkpoint_dir = _resolve(config, config.paths.interim_dir) / "checkpoints/positions"
-    _freeze_or_verify_json(
+    paid_plan = _bind_api_completion_preflight(paid_plan, api_completion)
+    paid_plan = _freeze_or_reuse_api_paid_plan(
         checkpoint_dir / "paid_plan.json",
         paid_plan,
+        api_completion,
         label="positions paid plan",
+    )
+    _freeze_api_completion_attempt(
+        checkpoint_dir,
+        paid_plan_hash=str(paid_plan["plan_hash"]),
+        preflight=api_completion,
     )
     paid_receipt = _authorize_paid_plan(
         args,
@@ -4671,6 +6382,13 @@ def _command_positions(args: argparse.Namespace) -> dict[str, Any]:
         gate=gate,
         command_phase="positions_api",
         plan_hash=str(paid_plan["plan_hash"]),
+        api_completion_preflight=paid_plan["api_completion_preflight"],
+    )
+    paid_receipt_path = checkpoint_dir / "paid_receipt.json"
+    _freeze_or_verify_json(
+        paid_receipt_path,
+        dict(paid_receipt),
+        label="positions paid receipt provenance",
     )
 
     try:
@@ -4683,15 +6401,6 @@ def _command_positions(args: argparse.Namespace) -> dict[str, Any]:
         trust_remote_code=False,
     )
 
-    ledger_path = _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml"
-    ledger = CostLedger(
-        ledger_path,
-        BudgetLimits(
-            gpu=float(gate.bindings.caps_usd.gpu),
-            api=float(gate.bindings.caps_usd.api),
-            total=float(gate.bindings.caps_usd.total),
-        ),
-    )
     judge: OpenRouterAdjudicationCaller | None = None
 
     def get_judge() -> OpenRouterAdjudicationCaller:
@@ -4705,9 +6414,9 @@ def _command_positions(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 ledger=ledger,
                 api_key_env=config.execution.secret_env.get("openrouter", "OPENROUTER_API_KEY"),
-                paid_response_store=PaidResponseStore(
-                    checkpoint_dir / "paid_responses/primary_final_and_trajectory"
-                ),
+                paid_response_store=position_response_store,
+                dispatch_guard=dispatch_guard,
+                dispatch_route="primary_final_and_trajectory",
             )
         return judge
 
@@ -4722,7 +6431,6 @@ def _command_positions(args: argparse.Namespace) -> dict[str, Any]:
         },
     )
     existing = {str(row["trace_id"]): row for row in store.load_records()}
-    rollout_by_id = {str(row["run_id"]): row for row in rollout_rows}
     position_rows: list[dict[str, Any]] = []
     span_rows: list[dict[str, Any]] = []
     raw_rows: list[dict[str, Any]] = []
@@ -4845,8 +6553,26 @@ def _command_positions(args: argparse.Namespace) -> dict[str, Any]:
         "judge_route": dict(route),
         "cost_ledger": _path_payload(ledger_path, root),
         "paid_plan_hash": paid_plan["plan_hash"],
+        "paid_plan": {
+            "path": _path_payload(checkpoint_dir / "paid_plan.json", root),
+            "sha256": sha256_file(checkpoint_dir / "paid_plan.json"),
+        },
         "paid_receipt_hash": paid_receipt["receipt_hash"],
+        "paid_receipt": {
+            "path": _path_payload(paid_receipt_path, root),
+            "sha256": sha256_file(paid_receipt_path),
+        },
         "checkpoint_manifest_hash": finalized.manifest["manifest_hash"],
+        "checkpoint_manifest": {
+            "path": _path_payload(
+                checkpoint_dir / "span_units/checkpoint_manifest.json",
+                root,
+            ),
+            "sha256": sha256_file(
+                checkpoint_dir / "span_units/checkpoint_manifest.json"
+            ),
+        },
+        "synthetic_smoke": False,
     }
     if api_usage_path.is_file():
         summary["api_usage_audit"] = {
@@ -4888,15 +6614,208 @@ def _normalize_lens_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, An
             raise CLIError(
                 f"lens row {index} incorrectly labels an observational readout as causal"
             )
-        contrast = float(row["signed_contrast"])
-        if not math.isfinite(contrast):
-            raise CLIError(f"lens row {index} has a non-finite contrast")
+        probe_eligible = row.get("probe_eligible", True)
+        if not isinstance(probe_eligible, bool):
+            raise CLIError(f"lens row {index} has non-boolean probe eligibility")
+        if probe_eligible:
+            try:
+                contrast = float(row["signed_contrast"])
+            except (TypeError, ValueError) as exc:
+                raise CLIError(f"eligible lens row {index} lacks a finite contrast") from exc
+            if not math.isfinite(contrast):
+                raise CLIError(f"lens row {index} has a non-finite contrast")
+        else:
+            if (
+                row["signed_contrast"] is not None
+                or row.get("signed_mean_logit_contrast") is not None
+                or row.get("raw_mean_logit_contrast") is not None
+            ):
+                raise CLIError(f"ineligible lens row {index} must store null contrasts")
+            if (
+                row.get("probe_ineligibility_reason")
+                != "causal_prefix_probe_collision"
+                or not isinstance(row.get("collision_evidence_hash"), str)
+            ):
+                raise CLIError(f"ineligible lens row {index} lacks collision evidence")
+            contrast = None
         row["layer"] = int(row["layer"])
         row["signed_contrast"] = contrast
         normalized.append(row)
     if not normalized:
         raise CLIError("lens artifact is empty")
     return normalized
+
+
+def _lens_release_gate_hashes(
+    *,
+    paid_plan: Mapping[str, Any],
+    paid_receipt: Mapping[str, Any],
+    active_gpu_gate: Mapping[str, Any],
+    probe_design_path: Path,
+) -> tuple[str, str, str, str]:
+    """Validate all non-secret release gates before writing any lens gate artifact."""
+
+    def canonical_hash(payload: Mapping[str, Any], field: str, label: str) -> str:
+        value = payload.get(field)
+        expected = stable_hash({key: item for key, item in payload.items() if key != field})
+        if not isinstance(value, str) or value != expected:
+            raise CLIError(f"{label} {field} mismatch")
+        return value
+
+    if active_gpu_gate.get("passed") is not True:
+        raise CLIError("active GPU session gate did not pass")
+    active_hash = canonical_hash(
+        active_gpu_gate, "record_hash", "active GPU session gate"
+    )
+    if (
+        active_gpu_gate.get("protocol_version") != "active-runpod-session-v1"
+        or active_gpu_gate.get("phase") != "lens_gpu"
+    ):
+        raise CLIError("active GPU session gate is not the frozen lens phase")
+    plan_hash = canonical_hash(paid_plan, "plan_hash", "lens paid plan")
+    receipt_hash = canonical_hash(
+        paid_receipt, "receipt_hash", "lens paid receipt"
+    )
+    bindings_hash = paid_plan.get("approval_bindings_hash")
+    if (
+        paid_plan.get("protocol_version") != "lens-gpu-paid-plan-v2"
+        or paid_plan.get("command_phase") != "lens_gpu"
+        or not isinstance(bindings_hash, str)
+    ):
+        raise CLIError("lens paid plan lacks its approval-binding contract")
+    if (
+        paid_receipt.get("protocol_version") != PAID_PHASE_RECEIPT_PROTOCOL
+        or paid_receipt.get("command_phase") != "lens_gpu"
+        or paid_receipt.get("plan_hash") != plan_hash
+        or paid_receipt.get("bindings_hash") != bindings_hash
+    ):
+        raise CLIError("lens paid receipt disagrees with plan/approval bindings")
+    probe = _require_mapping_artifact(
+        probe_design_path, label="lens probe design manifest"
+    )
+    _, probe_hash = _verify_canonical_payload_hash(
+        probe, label="lens probe design manifest", fields=("manifest_hash",)
+    )
+    return plan_hash, receipt_hash, active_hash, probe_hash
+
+
+def _persist_lens_release_authorization(
+    *,
+    config: RunConfig,
+    paid_plan: Mapping[str, Any],
+    paid_receipt: Mapping[str, Any],
+    active_gpu_gate: Mapping[str, Any],
+    probe_design_path: Path,
+) -> dict[str, Any]:
+    """Persist one idempotent gate bundle only after every in-memory gate passes."""
+
+    root = _project_root(config)
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    plan_hash, receipt_hash, active_hash, probe_hash = _lens_release_gate_hashes(
+        paid_plan=paid_plan,
+        paid_receipt=paid_receipt,
+        active_gpu_gate=active_gpu_gate,
+        probe_design_path=probe_design_path,
+    )
+    plan_path = manifest_dir / "lens_paid_plan.json"
+    receipt_path = manifest_dir / "lens_paid_receipt.json"
+    active_path = manifest_dir / "lens_active_gpu_session_gate.json"
+    authorization_path = manifest_dir / "lens_release_authorization.json"
+    _freeze_or_verify_json(plan_path, dict(paid_plan), label="lens paid plan")
+    _freeze_or_verify_json(receipt_path, dict(paid_receipt), label="lens paid receipt")
+    _freeze_or_verify_json(
+        active_path, dict(active_gpu_gate), label="lens active GPU session gate"
+    )
+    authorization: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol_version": "lens-release-authorization-v1",
+        "command_phase": "lens_gpu",
+        "approval_bindings_hash": paid_plan["approval_bindings_hash"],
+        "paid_plan": {
+            "path": _path_payload(plan_path, root),
+            "sha256": sha256_file(plan_path),
+            "plan_hash": plan_hash,
+        },
+        "paid_receipt": {
+            "path": _path_payload(receipt_path, root),
+            "sha256": sha256_file(receipt_path),
+            "receipt_hash": receipt_hash,
+        },
+        "active_gpu_session_gate": {
+            "path": _path_payload(active_path, root),
+            "sha256": sha256_file(active_path),
+            "record_hash": active_hash,
+        },
+        "probe_design_manifest": {
+            "path": _path_payload(probe_design_path, root),
+            "sha256": sha256_file(probe_design_path),
+            "manifest_hash": probe_hash,
+        },
+    }
+    authorization["manifest_hash"] = stable_hash(authorization)
+    _freeze_or_verify_json(
+        authorization_path,
+        authorization,
+        label="lens release authorization",
+    )
+    return authorization
+
+
+def _load_lens_release_authorization(
+    *,
+    config: RunConfig,
+    probe_design_path: Path,
+) -> dict[str, Any]:
+    """Revalidate the persisted gate bundle without requiring a live GPU session."""
+
+    root = _project_root(config)
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    plan_path = manifest_dir / "lens_paid_plan.json"
+    receipt_path = manifest_dir / "lens_paid_receipt.json"
+    active_path = manifest_dir / "lens_active_gpu_session_gate.json"
+    authorization_path = manifest_dir / "lens_release_authorization.json"
+    plan = _require_mapping_artifact(plan_path, label="lens paid plan")
+    receipt = _require_mapping_artifact(receipt_path, label="lens paid receipt")
+    active = _require_mapping_artifact(active_path, label="lens active GPU session gate")
+    plan_hash, receipt_hash, active_hash, probe_hash = _lens_release_gate_hashes(
+        paid_plan=plan,
+        paid_receipt=receipt,
+        active_gpu_gate=active,
+        probe_design_path=probe_design_path,
+    )
+    observed = _require_mapping_artifact(
+        authorization_path, label="lens release authorization"
+    )
+    expected: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol_version": "lens-release-authorization-v1",
+        "command_phase": "lens_gpu",
+        "approval_bindings_hash": plan["approval_bindings_hash"],
+        "paid_plan": {
+            "path": _path_payload(plan_path, root),
+            "sha256": sha256_file(plan_path),
+            "plan_hash": plan_hash,
+        },
+        "paid_receipt": {
+            "path": _path_payload(receipt_path, root),
+            "sha256": sha256_file(receipt_path),
+            "receipt_hash": receipt_hash,
+        },
+        "active_gpu_session_gate": {
+            "path": _path_payload(active_path, root),
+            "sha256": sha256_file(active_path),
+            "record_hash": active_hash,
+        },
+        "probe_design_manifest": {
+            "path": _path_payload(probe_design_path, root),
+            "sha256": sha256_file(probe_design_path),
+            "manifest_hash": probe_hash,
+        },
+    }
+    expected["manifest_hash"] = stable_hash(expected)
+    if observed != expected:
+        raise CLIError("lens release authorization disagrees with persisted gate links")
+    return expected
 
 
 def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
@@ -4912,6 +6831,7 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
     paid_plan: dict[str, Any] | None = None
     paid_receipt: Mapping[str, Any] | None = None
     active_gpu_gate: dict[str, Any] | None = None
+    release_authorization: dict[str, Any] | None = None
     if not artifact.is_file():
         config.assert_execution_ready()
         preregistration = load_preregistration(config)
@@ -4958,6 +6878,32 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
             anchor_manifest=anchor_payload,
             position_records=read_jsonl(position_path),
         )
+        manifest_dir = _resolve(config, config.paths.manifest_dir)
+        candidate_probe_path = (
+            Path(args.probe_candidates).resolve()
+            if args.probe_candidates
+            else manifest_dir / "lens_probe_token_verification.json"
+        )
+        if not candidate_probe_path.is_file():
+            raise CLIError(f"frozen candidate probe manifest is absent: {candidate_probe_path}")
+        candidate_probe_payload = read_json(candidate_probe_path)
+        if not isinstance(candidate_probe_payload, Mapping):
+            raise CLIError("candidate probe manifest must contain an object")
+        candidate_probe_hash = _verify_embedded_hash(
+            candidate_probe_payload,
+            field="manifest_hash",
+            label="candidate probe manifest",
+        )
+        probe_design = freeze_production_probe_design(
+            validated,
+            candidate_probe_manifest_hash=candidate_probe_hash,
+            candidate_probe_manifest_sha256=sha256_file(candidate_probe_path),
+        )
+        probe_design_path = (
+            Path(args.probe_design).resolve()
+            if args.probe_design
+            else manifest_dir / "lens_probe_design_manifest.json"
+        )
         cache_dir = (
             Path(args.cache_dir).resolve() if args.cache_dir else root / "data" / "cache" / "lenses"
         )
@@ -4967,9 +6913,14 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
         execution_manifest_path = (
             _resolve(config, config.paths.manifest_dir) / "lens_execution_manifest.json"
         )
+        failure_manifest_path = manifest_dir / "lens_failure_manifest.json"
+        compatibility_prefix_path = (
+            manifest_dir / "lens_compatibility_prefix_manifest.json"
+        )
+        release_authorization_path = manifest_dir / "lens_release_authorization.json"
         paid_plan = {
             "schema_version": 1,
-            "protocol_version": "lens-gpu-paid-plan-v1",
+            "protocol_version": "lens-gpu-paid-plan-v2",
             "command_phase": "lens_gpu",
             "config_hash": gate.bindings.config_hash,
             "preregistration_hash": gate.bindings.preregistration_hash,
@@ -4990,6 +6941,15 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
                     "path": _path_payload(position_path, root),
                     "sha256": sha256_file(position_path),
                     "manifest_hash": validated.position_manifest_hash,
+                },
+                "candidate_probe_manifest": {
+                    "path": _path_payload(candidate_probe_path, root),
+                    "sha256": sha256_file(candidate_probe_path),
+                    "manifest_hash": candidate_probe_hash,
+                },
+                "probe_design_manifest": {
+                    "path": _path_payload(probe_design_path, root),
+                    "manifest_hash": probe_design.manifest_hash,
                 },
                 "trace_ids": [trace.trace_id for trace in validated.traces],
                 "sequence_token_hashes": [
@@ -5023,8 +6983,15 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
             },
             "outputs": {
                 "lens_records": _path_payload(artifact, root),
+                "compatibility_prefix_manifest": _path_payload(
+                    compatibility_prefix_path, root
+                ),
                 "compatibility_manifest": _path_payload(compatibility_path, root),
                 "execution_manifest": _path_payload(execution_manifest_path, root),
+                "failure_manifest": _path_payload(failure_manifest_path, root),
+                "release_authorization": _path_payload(
+                    release_authorization_path, root
+                ),
             },
         }
         paid_plan["plan_hash"] = stable_hash(paid_plan)
@@ -5041,6 +7008,18 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
             gate=gate,
             command_phase="lens_gpu",
         )
+        _freeze_or_verify_json(
+            probe_design_path,
+            probe_design.to_manifest(include_hash=True),
+            label="causal fixed-common lens probe design",
+        )
+        release_authorization = _persist_lens_release_authorization(
+            config=config,
+            paid_plan=paid_plan,
+            paid_receipt=paid_receipt,
+            active_gpu_gate=active_gpu_gate,
+            probe_design_path=probe_design_path,
+        )
         compatibility_prefixes = freeze_production_compatibility_prefixes(
             validated,
             four_b_token_ids=encode_frozen_4b_compatibility_prefix(),
@@ -5055,10 +7034,20 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
                 anchor_manifest=anchor_path,
                 position_manifest=position_path,
                 lens_records=artifact,
+                compatibility_prefix_manifest=compatibility_prefix_path,
                 compatibility_manifest=compatibility_path,
                 execution_manifest=execution_manifest_path,
+                failure_manifest=failure_manifest_path,
             ),
             compatibility_prefixes=compatibility_prefixes,
+            probe_design=probe_design,
+            probe_design_manifest_sha256=sha256_file(probe_design_path),
+            release_authorization_manifest_hash=release_authorization[
+                "manifest_hash"
+            ],
+            release_authorization_manifest_sha256=sha256_file(
+                release_authorization_path
+            ),
             smoke_runtime_factory=smoke_factory,
             primary_runtime_factory=primary_factory,
         )
@@ -5069,8 +7058,42 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
     observed_types = sorted({row["lens_type"] for row in rows})
     if observed_types != ["j", "r"]:
         raise CLIError("lens artifact must contain matched J and R records")
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    execution_manifest_path = (
+        execution_manifest_path or manifest_dir / "lens_execution_manifest.json"
+    )
+    if not execution_manifest_path.is_file():
+        raise CLIError("lens execution manifest is required to validate lens rows")
+    execution_payload = read_json(execution_manifest_path)
+    if not isinstance(execution_payload, Mapping):
+        raise CLIError("lens execution manifest must contain an object")
+    execution_manifest_hash = _verify_embedded_hash(
+        execution_payload,
+        field="record_hash",
+        label="lens execution manifest",
+    )
+    probe_design_path = (
+        Path(args.probe_design).resolve()
+        if args.probe_design
+        else manifest_dir / "lens_probe_design_manifest.json"
+    )
+    if not probe_design_path.is_file():
+        raise CLIError("lens probe design manifest is required to validate lens rows")
+    probe_design_payload = read_json(probe_design_path)
+    if not isinstance(probe_design_payload, Mapping):
+        raise CLIError("lens probe design manifest must contain an object")
+    probe_design_hash = _verify_embedded_hash(
+        probe_design_payload,
+        field="manifest_hash",
+        label="lens probe design manifest",
+    )
+    release_authorization = release_authorization or _load_lens_release_authorization(
+        config=config,
+        probe_design_path=probe_design_path,
+    )
+    release_authorization_path = manifest_dir / "lens_release_authorization.json"
     validation = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact": _path_payload(artifact, _project_root(config)),
         "artifact_sha256": sha256_file(artifact),
         "rows": len(rows),
@@ -5078,13 +7101,27 @@ def _command_lens(args: argparse.Namespace) -> dict[str, Any]:
         "lens_types": observed_types,
         "causal_claim": False,
         "synthetic_smoke": all(bool(row.get("synthetic_smoke")) for row in rows),
-    }
-    if paid_plan is not None and paid_receipt is not None:
-        validation["paid_authorization"] = {
+        "execution_manifest": _path_payload(execution_manifest_path, root),
+        "execution_manifest_hash": execution_manifest_hash,
+        "probe_design_manifest_hash": probe_design_hash,
+        "release_authorization": {
+            "path": _path_payload(release_authorization_path, root),
+            "sha256": sha256_file(release_authorization_path),
+            "manifest_hash": release_authorization["manifest_hash"],
+        },
+        "paid_authorization": {
             "command_phase": "lens_gpu",
-            "plan_hash": paid_plan["plan_hash"],
-            "receipt_hash": paid_receipt["receipt_hash"],
-        }
+            "plan_hash": release_authorization["paid_plan"]["plan_hash"],
+            "receipt_hash": release_authorization["paid_receipt"]["receipt_hash"],
+            "approval_bindings_hash": release_authorization[
+                "approval_bindings_hash"
+            ],
+            "active_gpu_session_gate_hash": release_authorization[
+                "active_gpu_session_gate"
+            ]["record_hash"],
+        },
+    }
+    validation["manifest_hash"] = stable_hash(validation)
     output = _resolve(config, config.paths.manifest_dir) / "lens_validation.json"
     _freeze_or_verify_json(output, validation, label="lens validation")
     return {
@@ -5123,19 +7160,1535 @@ def _stage_rate(
     return None if subset.empty else float(subset.iloc[0]["rate"])
 
 
+_PRIMARY_ANALYSIS_ROLLOUT_COUNT = 310
+_PRIMARY_ANALYSIS_ANCHOR_COUNT = 24
+_PRIMARY_ANALYSIS_RESAMPLE_COUNT = 960
+_PRIMARY_ANALYSIS_LENS_TRACE_COUNT = 24
+_PRIMARY_ANALYSIS_LENS_RECORD_COUNT = 30_960
+_PRIMARY_ANALYSIS_LENS_TYPES = ("j", "r")
+_PRIMARY_ANALYSIS_LAYERS = tuple(range(4, 47))
+_LENS_VERDICT_CRITERIA = frozenset(
+    {
+        "generic_jr_direction_corroboration",
+        "direction_signal_present_before_first_estimate",
+        "direction_signal_precedes_accuracy_statement",
+        "objective_signal_increases_after_accuracy_sentence",
+    }
+)
+_PRIMARY_ANALYSIS_LENS_ROW_KEYS = {
+    "trace_id",
+    "prefix_sha256",
+    "model_id",
+    "lens_type",
+    "lens_file_sha256",
+    "target_layer",
+    "layer",
+    "layer_band",
+    "position_name",
+    "token_index",
+    "contrast",
+    "raw_mean_logit_contrast",
+    "signed_mean_logit_contrast",
+    "good_side_direction",
+    "positive_token_ids",
+    "negative_token_ids",
+    "probe_design_hash",
+    "probe_eligibility_record_hash",
+    "probe_eligible",
+    "probe_ineligibility_reason",
+    "collision_evidence_hash",
+    "causal_prefix_token_ids_hash",
+    "causal_prefix_token_count",
+    "forward_input_token_ids_hash",
+    "forward_input_token_count",
+    "evidence_scope",
+    "causal_claim",
+    "schema_version",
+    "record_hash",
+}
+
+
+def _validate_primary_lens_resampling_association_result(
+    result: Mapping[str, Any],
+) -> None:
+    """Enforce the frozen eight-trace exploratory association contract."""
+
+    if (
+        result.get("inference_tier") != "exploratory_observational"
+        or result.get("causal_claim") is not False
+        or result.get("mediation_claim") is not False
+        or result.get("primary_lens") != "J"
+        or result.get("sensitivity_lens") != "R"
+        or result.get("designed_traces_per_direction")
+        != {"above_good": 4, "below_good": 4}
+    ):
+        raise CLIError("primary lens-resampling association violates its frozen scope")
+    trace_effects = result.get("trace_effects")
+    if not isinstance(trace_effects, list) or len(trace_effects) != 8:
+        raise CLIError("primary lens-resampling association must expose all eight trace effects")
+    trace_ids: set[str] = set()
+    directions: Counter[str] = Counter()
+    for index, source in enumerate(trace_effects, start=1):
+        if not isinstance(source, Mapping):
+            raise CLIError(f"lens-resampling trace effect {index} is not an object")
+        trace_id = str(source.get("trace_id", ""))
+        direction = str(source.get("direction", ""))
+        if not trace_id or trace_id in trace_ids or direction not in {
+            "above_good",
+            "below_good",
+        }:
+            raise CLIError("lens-resampling trace effects are duplicated or mis-stratified")
+        trace_ids.add(trace_id)
+        directions[direction] += 1
+        if not {
+            "eligible_pair_count",
+            "measured_pair_count",
+            "missing_pair_count",
+            "d_i",
+            "d_i_lower",
+            "d_i_upper",
+            "j_lens_change",
+            "r_lens_change",
+        }.issubset(source):
+            raise CLIError("lens-resampling trace effect omits outcomes, bounds, or lens values")
+    if directions != Counter({"above_good": 4, "below_good": 4}):
+        raise CLIError("lens-resampling trace effects are not the frozen 4 + 4 strata")
+    status = result.get("status")
+    if status == "available":
+        per_lens = result.get("per_lens")
+        if (
+            result.get("common_trace_count") != 8
+            or result.get("traces_per_direction")
+            != {"above_good": 4, "below_good": 4}
+            or result.get("permutation_count") != 576
+            or result.get("permutation_resolution") != 1 / 576
+            or not isinstance(per_lens, Mapping)
+            or set(per_lens) != {"J", "R"}
+        ):
+            raise CLIError(
+                "available lens-resampling association does not use the frozen 4 + 4 "
+                "common-trace universe and all 576 exact permutations"
+            )
+    elif status == "unavailable":
+        if (
+            not isinstance(result.get("reason"), str)
+            or not result["reason"].strip()
+            or result.get("permutation_count") != 0
+            or result.get("permutation_resolution") is not None
+            or result.get("per_lens") != {}
+        ):
+            raise CLIError(
+                "unavailable lens-resampling association lacks an explicit reason/bounds"
+            )
+    else:
+        raise CLIError("primary lens-resampling association has an invalid status")
+
+
+def _gate_lens_verdict_criteria(
+    values: Mapping[str, bool | None],
+    reasons: Mapping[str, str],
+    *,
+    association: Mapping[str, Any],
+) -> tuple[dict[str, bool | None], dict[str, str], dict[str, Any]]:
+    """Apply the frozen association predicate only to verdict-facing lens inputs."""
+
+    per_lens = association.get("per_lens")
+    exact_universe = (
+        association.get("status") == "available"
+        and association.get("designed_traces_per_direction")
+        == {"above_good": 4, "below_good": 4}
+        and association.get("common_trace_count") == 8
+        and association.get("traces_per_direction")
+        == {"above_good": 4, "below_good": 4}
+        and association.get("permutation_count") == 576
+        and isinstance(per_lens, Mapping)
+        and set(per_lens) == {"J", "R"}
+    )
+    tau_by_lens: dict[str, float | None] = {"J": None, "R": None}
+    if isinstance(per_lens, Mapping):
+        for lens_type in tau_by_lens:
+            payload = per_lens.get(lens_type)
+            raw_tau = payload.get("tau_a") if isinstance(payload, Mapping) else None
+            if (
+                not isinstance(raw_tau, bool)
+                and isinstance(raw_tau, (int, float))
+                and math.isfinite(float(raw_tau))
+            ):
+                tau_by_lens[lens_type] = float(raw_tau)
+    passed = exact_universe and all(
+        value is not None and value > 0 for value in tau_by_lens.values()
+    )
+    reason = (
+        "association corroboration gate passed: exact 4+4/576 universe and strictly "
+        "positive J/R tau-a"
+        if passed
+        else "association corroboration gate failed: requires available exact 4+4/576 "
+        "evidence with strictly positive J and R tau-a"
+    )
+    gate = {
+        "passed": passed,
+        "reason": reason,
+        "predicate": (
+            "status=available; exact 4+4 common trace universe; 576 permutations; "
+            "J tau_a>0; R tau_a>0"
+        ),
+        "p_value_required": False,
+        "leave_one_out_required": False,
+        "tau_a": tau_by_lens,
+    }
+    gated_values = dict(values)
+    gated_reasons = dict(reasons)
+    if not passed:
+        for name in _LENS_VERDICT_CRITERIA:
+            if name in gated_values:
+                gated_values[name] = None
+                raw_reason = gated_reasons.get(name, "raw lens diagnostic unavailable")
+                gated_reasons[name] = f"{reason}; raw diagnostic: {raw_reason}"
+    return gated_values, gated_reasons, gate
+
+
+def _require_mapping_artifact(path: Path, *, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise CLIError(f"{label} is absent at {path}")
+    payload = read_json(path)
+    if not isinstance(payload, Mapping):
+        raise CLIError(f"{label} is not an object")
+    return dict(payload)
+
+
+def _verify_canonical_payload_hash(
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+    fields: Sequence[str] = ("manifest_hash", "record_hash"),
+) -> tuple[str, str]:
+    """Verify one and only one supported content-hash field."""
+
+    present = [field for field in fields if field in payload]
+    if len(present) != 1:
+        raise CLIError(
+            f"{label} must contain exactly one canonical hash field from {list(fields)}"
+        )
+    field = present[0]
+    recorded = payload.get(field)
+    expected = stable_hash({key: value for key, value in payload.items() if key != field})
+    if not isinstance(recorded, str) or recorded != expected:
+        raise CLIError(f"{label} {field} mismatch")
+    return field, recorded
+
+
+def _require_exact_artifact_link(
+    link: Any,
+    *,
+    path: Path,
+    root: Path,
+    label: str,
+    path_field: str = "path",
+    hash_field: str = "sha256",
+) -> None:
+    if not isinstance(link, Mapping):
+        raise CLIError(f"{label} artifact link is not an object")
+    if link.get(path_field) != _path_payload(path, root):
+        raise CLIError(f"{label} artifact path mismatch")
+    if not path.is_file() or link.get(hash_field) != sha256_file(path):
+        raise CLIError(f"{label} artifact SHA-256 mismatch")
+
+
+def _analysis_is_primary(config: RunConfig) -> bool:
+    """The paid vLLM profile is the only profile allowed to claim primary results."""
+
+    return config.execution.backend == "vllm_offline"
+
+
+def _validate_analysis_data_partition(
+    *,
+    primary: bool,
+    rollouts: Sequence[Mapping[str, Any]],
+    resampling_rows: Sequence[Mapping[str, Any]],
+    lens_rows: Sequence[Mapping[str, Any]],
+) -> bool:
+    collections = {
+        "rollouts": rollouts,
+        "resampling": resampling_rows,
+        "lens": lens_rows,
+    }
+    collection_flags: dict[str, bool] = {}
+    for label, rows in collections.items():
+        if not rows:
+            if primary and label == "lens":
+                continue
+            raise CLIError(f"analysis {label} artifact is empty")
+        flags = {bool(row.get("synthetic_smoke", False)) for row in rows}
+        if len(flags) != 1:
+            raise CLIError(f"analysis refuses mixed smoke/primary {label} rows")
+        collection_flags[label] = next(iter(flags))
+    if primary:
+        if any(collection_flags.values()):
+            raise CLIError("primary analysis refuses synthetic smoke rows")
+        return False
+    if not all(collection_flags.values()):
+        raise CLIError(
+            "non-primary analysis requires every row in every artifact to be "
+            "explicitly labelled smoke"
+        )
+    for label, rows in collections.items():
+        for index, row in enumerate(rows, start=1):
+            if row.get("synthetic_smoke") is not True:
+                raise CLIError(
+                    f"analysis {label} row {index} is not explicitly labelled smoke"
+                )
+            expected_hash = stable_hash(
+                {key: value for key, value in row.items() if key != "record_hash"}
+            )
+            if row.get("record_hash") != expected_hash:
+                raise CLIError(
+                    f"analysis {label} row {index} synthetic record_hash mismatch"
+                )
+    return True
+
+
+def _validate_primary_rollout_and_anchor_inventory(
+    *,
+    preregistration: Mapping[str, Any],
+    rollouts: Sequence[Mapping[str, Any]],
+    anchor_payload: Mapping[str, Any],
+    anchor_manifest: AnchorManifest,
+) -> tuple[set[str], dict[str, FrozenAnchor]]:
+    expected_counts = {
+        (task, condition): count
+        for task, conditions in _configured_counts(preregistration).items()
+        for condition, count in conditions.items()
+    }
+    if sum(expected_counts.values()) != _PRIMARY_ANALYSIS_ROLLOUT_COUNT:
+        raise CLIError("preregistration no longer defines the frozen 310-rollout inventory")
+    observed_counts = Counter(
+        (str(row.get("task", "")), str(row.get("condition", ""))) for row in rollouts
+    )
+    if len(rollouts) != _PRIMARY_ANALYSIS_ROLLOUT_COUNT or dict(observed_counts) != expected_counts:
+        raise CLIError("primary analysis requires the exact 310-row task x condition inventory")
+
+    anchors = tuple(anchor_manifest.anchors)
+    if len(anchors) != _PRIMARY_ANALYSIS_ANCHOR_COUNT:
+        raise CLIError("primary analysis requires exactly 24 frozen anchors")
+    anchor_ids = [anchor.anchor_id for anchor in anchors]
+    trace_ids = [anchor.trace_id for anchor in anchors]
+    if len(set(anchor_ids)) != len(anchor_ids) or len(set(trace_ids)) != len(trace_ids):
+        raise CLIError("primary anchors must have unique IDs and distinct base traces")
+    configured_anchors = preregistration.get("anchors", {})
+    expected_classes = tuple(str(value) for value in configured_anchors["sentence_classes"])
+    expected_directions = tuple(
+        str(value) for value in configured_anchors["incentive_directions"]
+    )
+    per_cell = int(configured_anchors["per_class_direction"])
+    expected_cells = {
+        (sentence_class, direction): per_cell
+        for sentence_class in expected_classes
+        for direction in expected_directions
+    }
+    observed_cells = Counter((anchor.sentence_class, anchor.direction) for anchor in anchors)
+    if dict(observed_cells) != expected_cells:
+        raise CLIError("anchor inventory disagrees with the frozen 3 x 2 x 4 design")
+    if (
+        tuple(anchor_manifest.sentence_classes) != expected_classes
+        or tuple(anchor_manifest.directions) != expected_directions
+        or anchor_manifest.per_cell != per_cell
+    ):
+        raise CLIError("anchor manifest design metadata disagrees with preregistration")
+
+    rollout_by_id = {str(row["run_id"]): row for row in rollouts}
+    anchor_by_id = {anchor.anchor_id: anchor for anchor in anchors}
+    for anchor in anchors:
+        source = rollout_by_id.get(anchor.trace_id)
+        if source is None:
+            raise CLIError(f"anchor {anchor.anchor_id} source trace is absent")
+        if source.get("task") != "giraffe" or source.get("condition") != anchor.direction:
+            raise CLIError(f"anchor {anchor.anchor_id} source task/direction mismatch")
+        if anchor.provenance.get("source_rollout_hash") != source.get("record_hash"):
+            raise CLIError(f"anchor {anchor.anchor_id} source rollout hash mismatch")
+    if anchor_payload.get("selection_hash") != anchor_manifest.selection_hash:
+        raise CLIError("anchor selection hash mismatch")
+    return set(trace_ids), anchor_by_id
+
+
+def _validate_primary_resampling_inventory(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    anchor_by_id: Mapping[str, FrozenAnchor],
+) -> None:
+    _validate_resampling_rows(rows)
+    _validate_completed_primary_resampling(rows)
+    if len(rows) != _PRIMARY_ANALYSIS_RESAMPLE_COUNT:
+        raise CLIError("primary analysis requires exactly 960 resampling rows")
+    resample_ids: set[str] = set()
+    for index, row in enumerate(rows, start=1):
+        if bool(row.get("synthetic_smoke", False)):
+            raise CLIError("primary resampling contains synthetic smoke data")
+        resample_id = str(row.get("resample_id", ""))
+        if not resample_id or resample_id in resample_ids:
+            raise CLIError(f"primary resampling row {index} has a duplicate/empty resample_id")
+        resample_ids.add(resample_id)
+        anchor = anchor_by_id.get(str(row.get("anchor_id", "")))
+        if anchor is None:
+            raise CLIError(f"primary resampling row {index} refers to an unknown anchor")
+        if (
+            row.get("base_trace_id") != anchor.trace_id
+            or row.get("sentence_class") != anchor.sentence_class
+            or row.get("condition") != anchor.direction
+        ):
+            raise CLIError(f"primary resampling row {index} disagrees with its frozen anchor")
+
+
+def _authenticate_sampling_supporting_artifacts(
+    *,
+    config: RunConfig,
+    sampling: Mapping[str, Any],
+) -> None:
+    """Authenticate every file hash that the canonical sampling release declares."""
+
+    root = _project_root(config)
+    adjudication = sampling.get("adjudication")
+    if not isinstance(adjudication, Mapping):
+        raise CLIError("sampling manifest lacks primary adjudication evidence")
+
+    def check(container: Mapping[str, Any], path_key: str, sha_key: str, label: str) -> Path:
+        path = _safe_project_artifact(root, container.get(path_key), label=label)
+        if not path.is_file() or container.get(sha_key) != sha256_file(path):
+            raise CLIError(f"{label} SHA-256 mismatch")
+        return path
+
+    check(adjudication, "manifest_path", "manifest_sha256", "behavioral adjudication manifest")
+    check(adjudication, "raw_path", "raw_sha256", "behavioral adjudication raw responses")
+    for key, label in (
+        ("independent_final_manifest", "independent final manifest"),
+        ("independent_final_raw", "independent final raw responses"),
+        ("independent_final_usage", "independent final usage"),
+        ("threshold_manifests", "behavioral threshold manifests"),
+    ):
+        link = adjudication.get(key)
+        if not isinstance(link, Mapping):
+            raise CLIError(f"sampling manifest lacks {label} evidence")
+        check(link, "path", "sha256", label)
+
+    final_consensus = adjudication.get("final_consensus")
+    if not isinstance(final_consensus, Mapping):
+        raise CLIError("sampling manifest lacks all-final consensus evidence")
+    check(final_consensus, "audit_path", "audit_sha256", "behavioral final consensus audit")
+    summary_path = check(
+        final_consensus,
+        "summary_path",
+        "summary_sha256",
+        "behavioral final consensus summary",
+    )
+    consensus_summary = _require_mapping_artifact(
+        summary_path, label="behavioral final consensus summary"
+    )
+    _verify_canonical_payload_hash(
+        consensus_summary, label="behavioral final consensus summary", fields=("manifest_hash",)
+    )
+    if consensus_summary.get("gate_passed") is not True:
+        raise CLIError("behavioral final consensus quality gate did not pass")
+    if final_consensus.get("summary") != consensus_summary:
+        raise CLIError("sampling manifest embeds a different final consensus summary")
+
+    quality_link = adjudication.get("quality_gate")
+    if not isinstance(quality_link, Mapping):
+        raise CLIError("sampling manifest lacks behavioral quality-gate evidence")
+    quality_path = check(quality_link, "path", "sha256", "behavioral quality gate")
+    quality = _require_mapping_artifact(quality_path, label="behavioral quality gate")
+    _verify_canonical_payload_hash(quality, label="behavioral quality gate", fields=("manifest_hash",))
+    if quality.get("gate_passed") is not True or quality_link.get("gate_passed") is not True:
+        raise CLIError("behavioral task x condition quality gate did not pass")
+
+
+def _authenticate_resampling_release(
+    *,
+    config: RunConfig,
+    artifact: Path,
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    root = _project_root(config)
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    execution_path = manifest_dir / "resampling_execution_manifest.json"
+    validation_path = manifest_dir / "resampling_validation.json"
+    execution = _require_mapping_artifact(execution_path, label="resampling execution manifest")
+    _, execution_hash = _verify_canonical_payload_hash(
+        execution, label="resampling execution manifest", fields=("manifest_hash",)
+    )
+    validation = _require_mapping_artifact(validation_path, label="resampling validation manifest")
+    _, validation_hash = _verify_canonical_payload_hash(
+        validation, label="resampling validation manifest", fields=("manifest_hash",)
+    )
+    if (
+        execution.get("status") != "complete"
+        or execution.get("primary_inference") is not True
+        or validation.get("synthetic_smoke") is not False
+    ):
+        raise CLIError("resampling manifests do not certify a completed primary release")
+    _require_exact_artifact_link(
+        execution.get("artifact"), path=artifact, root=root, label="resampling execution"
+    )
+    if (
+        validation.get("artifact") != _path_payload(artifact, root)
+        or validation.get("artifact_sha256") != sha256_file(artifact)
+        or validation.get("execution_manifest") != _path_payload(execution_path, root)
+        or validation.get("execution_manifest_hash") != execution_hash
+    ):
+        raise CLIError("resampling validation/execution artifact links disagree")
+    expected_counts = {
+        "rows": _PRIMARY_ANALYSIS_RESAMPLE_COUNT,
+        "base_traces": _PRIMARY_ANALYSIS_ANCHOR_COUNT,
+        "retain_rows": _PRIMARY_ANALYSIS_RESAMPLE_COUNT // 2,
+        "resample_rows": _PRIMARY_ANALYSIS_RESAMPLE_COUNT // 2,
+    }
+    if execution.get("artifact", {}).get("rows") != _PRIMARY_ANALYSIS_RESAMPLE_COUNT:
+        raise CLIError("resampling execution artifact row count mismatch")
+    for key, expected in expected_counts.items():
+        if validation.get(key) != expected:
+            raise CLIError(f"resampling validation {key} mismatch")
+    quality = execution.get("quality_gate")
+    if not isinstance(quality, Mapping):
+        raise CLIError("resampling execution manifest lacks its quality gate")
+    _verify_canonical_payload_hash(quality, label="resampling quality gate", fields=("manifest_hash",))
+    if quality.get("gate_passed") is not True:
+        raise CLIError("resampling all-final quality gate did not pass")
+    if not isinstance(execution.get("source_generation_manifest_hash"), str):
+        raise CLIError("resampling execution manifest lacks its generation-manifest link")
+    if not isinstance(execution.get("adjudication_manifest_hash"), str):
+        raise CLIError("resampling execution manifest lacks its adjudication-manifest link")
+    return {
+        "resampling_execution_manifest": {
+            "path": _path_payload(execution_path, root),
+            "sha256": sha256_file(execution_path),
+            "manifest_hash": execution_hash,
+        },
+        "resampling_validation_manifest": {
+            "path": _path_payload(validation_path, root),
+            "sha256": sha256_file(validation_path),
+            "manifest_hash": validation_hash,
+        },
+    }
+
+
+def _expected_probe_concepts(preregistration: Mapping[str, Any]) -> dict[str, dict[str, list[Any]]]:
+    lens_config = preregistration.get("lens", {})
+    concept_words = lens_config.get("concept_sets", {})
+    frozen_ids = lens_config.get("concept_token_freeze", {}).get("token_ids", {})
+    concepts: dict[str, dict[str, list[Any]]] = {}
+    if not isinstance(concept_words, Mapping) or not isinstance(frozen_ids, Mapping):
+        raise CLIError("preregistration lacks frozen lens probe concepts")
+    for concept, words in concept_words.items():
+        ids = frozen_ids.get(concept)
+        if not isinstance(words, Mapping) or not isinstance(ids, Mapping):
+            raise CLIError(f"preregistration lens concept {concept!r} is malformed")
+        positive_words = [str(value) for value in words.get("positive", ())]
+        negative_words = [str(value) for value in words.get("negative", ())]
+        positive_ids = [int(value) for value in ids.get("positive", ())]
+        negative_ids = [int(value) for value in ids.get("negative", ())]
+        if not (
+            len(positive_words)
+            == len(negative_words)
+            == len(positive_ids)
+            == len(negative_ids)
+            == 3
+        ):
+            raise CLIError("each frozen lens concept must retain the exact 3 + 3 probes")
+        concepts[str(concept)] = {
+            "positive_words": positive_words,
+            "positive_token_ids": positive_ids,
+            "negative_words": negative_words,
+            "negative_token_ids": negative_ids,
+        }
+    return concepts
+
+
+def _require_recomputed_probe_design(
+    *,
+    observed: Mapping[str, Any],
+    validated_lens_inputs: Any,
+    candidate_probe_manifest_hash: str,
+    candidate_probe_manifest_sha256: str,
+) -> None:
+    """Rebuild every collision/eligibility cell with the pinned tokenizer."""
+
+    try:
+        recomputed = freeze_production_probe_design(
+            validated_lens_inputs,
+            candidate_probe_manifest_hash=candidate_probe_manifest_hash,
+            candidate_probe_manifest_sha256=candidate_probe_manifest_sha256,
+        ).to_manifest(include_hash=True)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise CLIError(
+            f"cannot perform pinned-tokenizer probe-design recomputation: {exc}"
+        ) from exc
+    if dict(observed) != recomputed:
+        raise CLIError(
+            "lens probe design disagrees with pinned-tokenizer recomputation of "
+            "lexical/exact collisions and eligibility"
+        )
+
+
+def _authenticate_probe_design(
+    *,
+    config: RunConfig,
+    preregistration: Mapping[str, Any],
+    validated_lens_inputs: Any,
+    position_manifest_hash: str,
+) -> tuple[dict[str, Any], dict[tuple[str, str, str], dict[str, Any]], dict[str, Any]]:
+    root = _project_root(config)
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    candidate_path = manifest_dir / "lens_probe_token_verification.json"
+    design_path = manifest_dir / "lens_probe_design_manifest.json"
+    candidate = _require_mapping_artifact(candidate_path, label="candidate lens probe manifest")
+    _, candidate_hash = _verify_canonical_payload_hash(
+        candidate, label="candidate lens probe manifest", fields=("manifest_hash",)
+    )
+    design = _require_mapping_artifact(design_path, label="lens probe design manifest")
+    _, design_hash = _verify_canonical_payload_hash(
+        design, label="lens probe design manifest", fields=("manifest_hash",)
+    )
+    _require_recomputed_probe_design(
+        observed=design,
+        validated_lens_inputs=validated_lens_inputs,
+        candidate_probe_manifest_hash=candidate_hash,
+        candidate_probe_manifest_sha256=sha256_file(candidate_path),
+    )
+    expected_concepts = _expected_probe_concepts(preregistration)
+    expected_candidate_records = [
+        {
+            "concept": concept,
+            "polarity": polarity,
+            "single_token": True,
+            "token_id": token_id,
+            "word": word,
+        }
+        for concept, concept_spec in expected_concepts.items()
+        for polarity in ("positive", "negative")
+        for word, token_id in zip(
+            concept_spec[f"{polarity}_words"],
+            concept_spec[f"{polarity}_token_ids"],
+            strict=True,
+        )
+    ]
+    if (
+        candidate.get("schema_version") != 1
+        or candidate.get("model_id") != config.model.id
+        or candidate.get("tokenizer_revision") != config.model.revision
+        or candidate.get("trust_remote_code") is not False
+        or candidate.get("all_exact_single_token") is not True
+        or candidate.get("probe_count") != len(expected_candidate_records)
+        or candidate.get("records") != expected_candidate_records
+    ):
+        raise CLIError("candidate lens probe manifest disagrees with frozen 3 + 3 probes")
+    frozen_contract = {
+        "schema_version": 1,
+        "protocol_version": "fixed-common-probes-causal-cell-eligibility-v1",
+        "model_id": config.model.id,
+        "tokenizer_id": config.model.id,
+        "tokenizer_revision": config.model.revision,
+        "trust_remote_code": False,
+        "candidate_probe_manifest_hash": candidate_hash,
+        "candidate_probe_manifest_sha256": sha256_file(candidate_path),
+        "anchor_manifest_hash": validated_lens_inputs.anchor_manifest_hash,
+        "anchor_selection_hash": validated_lens_inputs.anchor_selection_hash,
+        "rollout_manifest_hash": validated_lens_inputs.rollout_manifest_hash,
+        "position_manifest_hash": position_manifest_hash,
+        "position_order": list(POSITION_ORDER),
+        "causal_prefix_rule": "combined_token_ids_zero_through_position_inclusive",
+        "collision_checks": ["exact_token_id", "decoded_casefolded_lexical_word_boundary"],
+        "collision_action": "whole_trace_position_concept_cell_ineligible",
+        "individual_probe_filtering": False,
+        "empty_polarity_policy": "abort_before_any_model_forward",
+        "forward_input_rule": "combined_token_ids_zero_through_max_authenticated_position_inclusive",
+        "selection_inputs": [
+            "frozen_probe_candidates",
+            "exact_combined_token_ids",
+            "authenticated_position_indices",
+        ],
+        "forbidden_selection_inputs": [
+            "final_estimate",
+            "final_good_side",
+            "resampling_outcomes",
+            "lens_logits",
+        ],
+        "concepts": expected_concepts,
+    }
+    for key, expected in frozen_contract.items():
+        if design.get(key) != expected:
+            raise CLIError(f"lens probe design changed frozen field {key}")
+
+    traces = tuple(validated_lens_inputs.traces)
+    cells = design.get("cells")
+    expected_cell_count = len(traces) * len(POSITION_ORDER) * len(expected_concepts)
+    if not isinstance(cells, list) or len(cells) != expected_cell_count:
+        raise CLIError("lens probe design must contain the exact 24 x 5 x 3 cell inventory")
+    if design.get("cell_count") != expected_cell_count:
+        raise CLIError("lens probe design cell_count mismatch")
+    expected_order = [
+        (trace.trace_id, position, concept)
+        for trace in traces
+        for position in POSITION_ORDER
+        for concept in expected_concepts
+    ]
+    by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    all_probe_ids = {
+        concept: {
+            *payload["positive_token_ids"],
+            *payload["negative_token_ids"],
+        }
+        for concept, payload in expected_concepts.items()
+    }
+    trace_by_id = {trace.trace_id: trace for trace in traces}
+    for index, (source, expected_key) in enumerate(zip(cells, expected_order, strict=True), start=1):
+        if not isinstance(source, Mapping):
+            raise CLIError(f"lens probe design cell {index} is not an object")
+        cell = dict(source)
+        required_keys = {
+            "trace_id",
+            "position_name",
+            "concept",
+            "token_index",
+            "causal_prefix_token_count",
+            "causal_prefix_token_ids_hash",
+            "probe_eligible",
+            "probe_ineligibility_reason",
+            "collisions",
+            "collision_evidence_hash",
+            "record_hash",
+        }
+        if set(cell) != required_keys:
+            raise CLIError(f"lens probe design cell {index} has a noncanonical schema")
+        key = (str(cell["trace_id"]), str(cell["position_name"]), str(cell["concept"]))
+        if key != expected_key or key in by_key:
+            raise CLIError("lens probe design cells are duplicated or out of frozen order")
+        _verify_canonical_payload_hash(cell, label=f"lens probe design cell {index}", fields=("record_hash",))
+        trace = trace_by_id[key[0]]
+        token_index = trace.position_indices[key[1]]
+        prefix = trace.sequence_token_ids[: token_index + 1]
+        if (
+            cell.get("token_index") != token_index
+            or cell.get("causal_prefix_token_count") != len(prefix)
+            or cell.get("causal_prefix_token_ids_hash")
+            != token_stream_hash(prefix, stream="lens_causal_prefix")
+        ):
+            raise CLIError(f"lens probe design cell {index} causal-prefix evidence mismatch")
+        collisions = cell.get("collisions")
+        if not isinstance(collisions, list):
+            raise CLIError(f"lens probe design cell {index} collisions must be a list")
+        exact_colliding_ids = all_probe_ids[key[2]].intersection(prefix)
+        declared_exact_ids: set[int] = set()
+        declared_collisions: set[tuple[str, str, int]] = set()
+        concept_spec = expected_concepts[key[2]]
+        allowed_collisions = {
+            (polarity, word, token_id)
+            for polarity in ("positive", "negative")
+            for word, token_id in zip(
+                concept_spec[f"{polarity}_words"],
+                concept_spec[f"{polarity}_token_ids"],
+                strict=True,
+            )
+        }
+        for collision in collisions:
+            if not isinstance(collision, Mapping) or set(collision) != {
+                "polarity",
+                "word",
+                "token_id",
+                "exact_token_id_present",
+                "lexical_word_present",
+            }:
+                raise CLIError(f"lens probe design cell {index} has invalid collision evidence")
+            if collision.get("polarity") not in {"positive", "negative"}:
+                raise CLIError(f"lens probe design cell {index} collision polarity is invalid")
+            collision_identity = (
+                str(collision["polarity"]),
+                str(collision["word"]),
+                int(collision["token_id"]),
+            )
+            if (
+                collision_identity not in allowed_collisions
+                or collision_identity in declared_collisions
+            ):
+                raise CLIError(f"lens probe design cell {index} collision is not frozen/unique")
+            declared_collisions.add(collision_identity)
+            exact_present = int(collision["token_id"]) in prefix
+            if collision.get("exact_token_id_present") is not exact_present:
+                raise CLIError(f"lens probe design cell {index} token collision flag mismatch")
+            if exact_present:
+                declared_exact_ids.add(int(collision["token_id"]))
+            if not bool(collision.get("exact_token_id_present")) and not bool(
+                collision.get("lexical_word_present")
+            ):
+                raise CLIError(f"lens probe design cell {index} contains a false collision")
+        if declared_exact_ids != exact_colliding_ids:
+            raise CLIError(f"lens probe design cell {index} exact-token collision mismatch")
+        eligible = bool(cell.get("probe_eligible"))
+        if eligible:
+            if collisions or cell.get("probe_ineligibility_reason") is not None or cell.get(
+                "collision_evidence_hash"
+            ) is not None:
+                raise CLIError(f"eligible lens probe design cell {index} carries collision evidence")
+        else:
+            if (
+                not collisions
+                or cell.get("probe_ineligibility_reason") != "causal_prefix_probe_collision"
+                or cell.get("collision_evidence_hash") != stable_hash(collisions)
+            ):
+                raise CLIError(f"ineligible lens probe design cell {index} is not authenticated")
+        if eligible == bool(collisions):
+            raise CLIError(f"lens probe design cell {index} eligibility/collision mismatch")
+        by_key[key] = cell
+    eligible_count = sum(bool(cell["probe_eligible"]) for cell in by_key.values())
+    if (
+        design.get("eligible_cell_count") != eligible_count
+        or design.get("ineligible_cell_count") != expected_cell_count - eligible_count
+    ):
+        raise CLIError("lens probe design eligible/ineligible counts mismatch")
+    evidence = {
+        "candidate_probe_manifest": {
+            "path": _path_payload(candidate_path, root),
+            "sha256": sha256_file(candidate_path),
+            "manifest_hash": candidate_hash,
+        },
+        "lens_probe_design_manifest": {
+            "path": _path_payload(design_path, root),
+            "sha256": sha256_file(design_path),
+            "manifest_hash": design_hash,
+        },
+    }
+    return design, by_key, evidence
+
+
+def _validate_primary_lens_grid(
+    *,
+    config: RunConfig,
+    preregistration: Mapping[str, Any],
+    raw_rows: Sequence[Mapping[str, Any]],
+    validated_lens_inputs: Any,
+    probe_design: Mapping[str, Any],
+    probe_cells: Mapping[tuple[str, str, str], Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(raw_rows) != _PRIMARY_ANALYSIS_LENS_RECORD_COUNT:
+        raise CLIError("primary lens artifact requires the exact 30,960-row Cartesian grid")
+    expected_concepts = _expected_probe_concepts(preregistration)
+    traces = tuple(validated_lens_inputs.traces)
+    expected_grid = {
+        (trace.trace_id, lens_type, layer, position, concept)
+        for trace in traces
+        for lens_type in ("J", "R")
+        for layer in _PRIMARY_ANALYSIS_LAYERS
+        for position in POSITION_ORDER
+        for concept in expected_concepts
+    }
+    observed: set[tuple[str, str, int, str, str]] = set()
+    eligible_rows: list[dict[str, Any]] = []
+    trace_by_id = {trace.trace_id: trace for trace in traces}
+    lens_hashes = {"J": config.lenses.j_sha256, "R": config.lenses.r_sha256}
+    eligible_count = 0
+    for index, source in enumerate(raw_rows, start=1):
+        row = dict(source)
+        if set(row) != _PRIMARY_ANALYSIS_LENS_ROW_KEYS:
+            raise CLIError(f"primary lens row {index} has a noncanonical schema")
+        if row.get("record_hash") != stable_hash(
+            {key: value for key, value in row.items() if key != "record_hash"}
+        ):
+            raise CLIError(f"primary lens row {index} record_hash mismatch")
+        if row.get("schema_version") != 2:
+            raise CLIError(f"primary lens row {index} does not use canonical schema v2")
+        trace_id = str(row.get("trace_id", ""))
+        lens_type = str(row.get("lens_type", "")).upper()
+        try:
+            layer = int(row.get("layer"))
+        except (TypeError, ValueError) as exc:
+            raise CLIError(f"primary lens row {index} has an invalid layer") from exc
+        position = str(row.get("position_name", ""))
+        concept = str(row.get("contrast", ""))
+        key = (trace_id, lens_type, layer, position, concept)
+        if key not in expected_grid or key in observed:
+            raise CLIError(f"primary lens row {index} is outside or duplicates the frozen grid")
+        observed.add(key)
+        trace = trace_by_id[trace_id]
+        cell = probe_cells[(trace_id, position, concept)]
+        token_index = trace.position_indices[position]
+        forward_end = max(trace.position_indices.values()) + 1
+        forward_ids = trace.sequence_token_ids[:forward_end]
+        expected_prefix_sha256 = hashlib.sha256(
+            json.dumps(list(forward_ids), separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+        if (
+            row.get("probe_design_hash") != probe_design["manifest_hash"]
+            or row.get("probe_eligibility_record_hash") != cell["record_hash"]
+            or row.get("probe_eligible") is not cell["probe_eligible"]
+            or row.get("probe_ineligibility_reason") != cell["probe_ineligibility_reason"]
+            or row.get("collision_evidence_hash") != cell["collision_evidence_hash"]
+            or row.get("causal_prefix_token_ids_hash")
+            != cell["causal_prefix_token_ids_hash"]
+            or row.get("causal_prefix_token_count") != cell["causal_prefix_token_count"]
+            or row.get("forward_input_token_ids_hash")
+            != token_stream_hash(forward_ids, stream="lens_forward_input")
+            or row.get("forward_input_token_count") != len(forward_ids)
+            or row.get("prefix_sha256") != expected_prefix_sha256
+        ):
+            raise CLIError(f"primary lens row {index} probe-design linkage mismatch")
+        concept_spec = expected_concepts[concept]
+        expected_direction = trace.good_side_direction
+        expected_band = "early" if layer <= 18 else ("middle" if layer <= 32 else "late")
+        if (
+            row.get("model_id") != config.model.id
+            or row.get("lens_file_sha256") != lens_hashes[lens_type]
+            or row.get("target_layer") != int(preregistration["lens"]["expected_target_layer"])
+            or row.get("layer_band") != expected_band
+            or row.get("token_index") != token_index
+            or row.get("good_side_direction") != expected_direction
+            or row.get("positive_token_ids") != concept_spec["positive_token_ids"]
+            or row.get("negative_token_ids") != concept_spec["negative_token_ids"]
+            or row.get("evidence_scope") != "observational_readout"
+            or row.get("causal_claim") is not False
+            or bool(row.get("synthetic_smoke", False))
+        ):
+            raise CLIError(f"primary lens row {index} violates model/lens/probe pins")
+        raw_value = row.get("raw_mean_logit_contrast")
+        signed_value = row.get("signed_mean_logit_contrast")
+        eligible = bool(cell["probe_eligible"])
+        if eligible:
+            try:
+                raw_number = float(raw_value)
+                signed_number = float(signed_value)
+            except (TypeError, ValueError) as exc:
+                raise CLIError(f"eligible primary lens row {index} lacks finite contrasts") from exc
+            if not math.isfinite(raw_number) or not math.isfinite(signed_number):
+                raise CLIError(f"eligible primary lens row {index} lacks finite contrasts")
+            expected_signed = (
+                raw_number * expected_direction if concept == "direction" else raw_number
+            )
+            if not math.isclose(
+                signed_number,
+                expected_signed,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise CLIError(f"eligible primary lens row {index} has a mis-signed contrast")
+            eligible_count += 1
+            eligible_rows.append(row)
+        elif raw_value is not None or signed_value is not None:
+            raise CLIError(f"ineligible primary lens row {index} must store null contrasts")
+    if observed != expected_grid:
+        raise CLIError("primary lens grid is truncated or contains unexpected cells")
+    expected_eligible_rows = int(probe_design["eligible_cell_count"]) * (
+        len(_PRIMARY_ANALYSIS_LENS_TYPES) * len(_PRIMARY_ANALYSIS_LAYERS)
+    )
+    if eligible_count != expected_eligible_rows:
+        raise CLIError("primary lens row eligibility count disagrees with probe design")
+    return eligible_rows
+
+
+def _load_lens_compatibility_manifest(
+    *,
+    config: RunConfig,
+    path: Path,
+    prefix_path: Path,
+    validated_lens_inputs: Any,
+    require_ready: bool,
+) -> tuple[dict[str, Any], str]:
+    compatibility = _require_mapping_artifact(path, label="lens compatibility manifest")
+    _, compatibility_hash = _verify_canonical_payload_hash(
+        compatibility, label="lens compatibility manifest", fields=("record_hash",)
+    )
+    expected_compatibility_keys = {
+        "attempts",
+        "primary_ready",
+        "transformers_revision",
+        "jlens_revision",
+        "maximum_122b_attempts",
+        "fallback_model_used",
+        "fallback_policy",
+        "schema_version",
+        "record_hash",
+    }
+    if set(compatibility) != expected_compatibility_keys:
+        raise CLIError("lens compatibility manifest has a noncanonical schema")
+
+    prefix_manifest = _require_mapping_artifact(
+        prefix_path, label="lens compatibility prefix manifest"
+    )
+    _verify_canonical_payload_hash(
+        prefix_manifest,
+        label="lens compatibility prefix manifest",
+        fields=("record_hash",),
+    )
+    try:
+        expected_prefix_manifest = freeze_production_compatibility_prefixes(
+            validated_lens_inputs,
+            four_b_token_ids=encode_frozen_4b_compatibility_prefix(),
+        ).to_manifest().to_dict(include_hash=True)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise CLIError(f"cannot recompute exact compatibility prefixes: {exc}") from exc
+    if prefix_manifest != expected_prefix_manifest:
+        raise CLIError(
+            "lens compatibility prefix manifest disagrees with exact prefix recomputation"
+        )
+
+    attempts = compatibility.get("attempts")
+    if not isinstance(attempts, list) or not all(
+        isinstance(attempt, Mapping) for attempt in attempts
+    ):
+        raise CLIError("lens compatibility manifest has invalid attempts")
+    attempt_keys = {
+        "ordinal",
+        "stage",
+        "strategy",
+        "model_id",
+        "model_revision",
+        "prefix_token_count",
+        "prefix_token_ids_hash",
+        "status",
+        "details",
+        "error_type",
+        "error_message",
+    }
+    expected_prefix_by_attempt = {
+        ("4b_smoke", "pinned_text_only_single_forward"): prefix_manifest["four_b"],
+        (
+            "122b_preflight",
+            "version_fixed_full_prefix",
+        ): prefix_manifest["primary_full"],
+        (
+            "122b_preflight",
+            "version_fixed_shortened_prefix",
+        ): prefix_manifest["primary_short"],
+    }
+    seen_attempts: set[tuple[str, str]] = set()
+    for index, attempt in enumerate(attempts, start=1):
+        if set(attempt) != attempt_keys:
+            raise CLIError(f"lens compatibility attempt {index} has a noncanonical schema")
+        identity = (str(attempt.get("stage")), str(attempt.get("strategy")))
+        expected_prefix = expected_prefix_by_attempt.get(identity)
+        if expected_prefix is None or identity in seen_attempts:
+            raise CLIError(
+                f"lens compatibility attempt {index} has an unknown/duplicate strategy"
+            )
+        seen_attempts.add(identity)
+        if (
+            attempt.get("prefix_token_count") != expected_prefix["token_count"]
+            or attempt.get("prefix_token_ids_hash") != expected_prefix["token_ids_hash"]
+        ):
+            raise CLIError(
+                f"lens compatibility attempt {index} disagrees with its exact prefix"
+            )
+        status = attempt.get("status")
+        details = attempt.get("details")
+        if status == "passed":
+            if (
+                not isinstance(details, Mapping)
+                or attempt.get("error_type") is not None
+                or attempt.get("error_message") is not None
+            ):
+                raise CLIError(f"lens compatibility attempt {index} passed schema is invalid")
+        elif status == "failed":
+            if (
+                details != {}
+                or not isinstance(attempt.get("error_type"), str)
+                or not isinstance(attempt.get("error_message"), str)
+            ):
+                raise CLIError(f"lens compatibility attempt {index} failure schema is invalid")
+        else:
+            raise CLIError(f"lens compatibility attempt {index} status is invalid")
+    smoke = [attempt for attempt in attempts if attempt.get("stage") == "4b_smoke"]
+    primary = [attempt for attempt in attempts if attempt.get("stage") == "122b_preflight"]
+    expected_strategies = (
+        "version_fixed_full_prefix",
+        "version_fixed_shortened_prefix",
+    )
+    if (
+        compatibility.get("schema_version") != 1
+        or compatibility.get("transformers_revision") != TRANSFORMERS_REVISION
+        or compatibility.get("jlens_revision") != JLENS_REVISION
+        or compatibility.get("maximum_122b_attempts") != 2
+        or compatibility.get("fallback_model_used") is not False
+        or compatibility.get("fallback_policy")
+        != "27B_methodology_support_only_not_122B_substitute"
+        or len(smoke) != 1
+        or smoke[0].get("ordinal") != 1
+        or smoke[0].get("model_id") != SMOKE_MODEL_ID
+        or smoke[0].get("model_revision") != SMOKE_MODEL_REVISION
+        or smoke[0].get("status") != "passed"
+        or not 1 <= len(primary) <= 2
+        or tuple(attempt.get("ordinal") for attempt in primary)
+        != tuple(range(1, len(primary) + 1))
+        or tuple(attempt.get("strategy") for attempt in primary)
+        != expected_strategies[: len(primary)]
+        or any(
+            attempt.get("model_id") != config.model.id
+            or attempt.get("model_revision") != config.model.revision
+            for attempt in primary
+        )
+    ):
+        raise CLIError("lens compatibility manifest violates frozen software/model policy")
+    if require_ready:
+        if compatibility.get("primary_ready") is not True or primary[-1].get("status") != "passed":
+            raise CLIError("lens compatibility manifest does not certify a ready 122B runtime")
+        if any(attempt.get("status") != "failed" for attempt in primary[:-1]):
+            raise CLIError("lens compatibility attempts are not in bounded fail-then-pass order")
+    elif (
+        compatibility.get("primary_ready") is not False
+        or len(primary) != 2
+        or any(attempt.get("status") != "failed" for attempt in primary)
+    ):
+        raise CLIError("lens compatibility manifest does not certify two bounded failures")
+    return compatibility, compatibility_hash
+
+
+def _authenticate_lens_release(
+    *,
+    config: RunConfig,
+    artifact: Path,
+    raw_rows: Sequence[Mapping[str, Any]],
+    validated_lens_inputs: Any,
+    probe_design: Mapping[str, Any],
+    eligible_row_count: int,
+) -> dict[str, dict[str, Any]]:
+    root = _project_root(config)
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    execution_path = manifest_dir / "lens_execution_manifest.json"
+    validation_path = manifest_dir / "lens_validation.json"
+    compatibility_path = manifest_dir / "lens_compatibility_manifest.json"
+    prefix_path = manifest_dir / "lens_compatibility_prefix_manifest.json"
+    failure_path = manifest_dir / "lens_failure_manifest.json"
+    if failure_path.exists():
+        raise CLIError(
+            "successful 122B lens release refuses a coexisting terminal failure manifest"
+        )
+    _, compatibility_hash = _load_lens_compatibility_manifest(
+        config=config,
+        path=compatibility_path,
+        prefix_path=prefix_path,
+        validated_lens_inputs=validated_lens_inputs,
+        require_ready=True,
+    )
+    prefix = _require_mapping_artifact(
+        prefix_path, label="lens compatibility prefix manifest"
+    )
+    _, prefix_hash = _verify_canonical_payload_hash(
+        prefix,
+        label="lens compatibility prefix manifest",
+        fields=("record_hash",),
+    )
+    execution = _require_mapping_artifact(execution_path, label="lens execution manifest")
+    _, execution_hash = _verify_canonical_payload_hash(
+        execution, label="lens execution manifest", fields=("record_hash",)
+    )
+    validation = _require_mapping_artifact(validation_path, label="lens validation manifest")
+    _, validation_hash = _verify_canonical_payload_hash(
+        validation, label="lens validation manifest", fields=("manifest_hash",)
+    )
+    design_path = manifest_dir / "lens_probe_design_manifest.json"
+    candidate_path = manifest_dir / "lens_probe_token_verification.json"
+    release_authorization_path = manifest_dir / "lens_release_authorization.json"
+    release_authorization = _load_lens_release_authorization(
+        config=config,
+        probe_design_path=design_path,
+    )
+    if (
+        execution.get("schema_version") != 3
+        or execution.get("record_schema_version") != 2
+        or execution.get("record_count") != _PRIMARY_ANALYSIS_LENS_RECORD_COUNT
+        or execution.get("trace_count") != _PRIMARY_ANALYSIS_LENS_TRACE_COUNT
+        or execution.get("layers") != list(_PRIMARY_ANALYSIS_LAYERS)
+        or execution.get("primary_model_revision") != config.model.revision
+        or execution.get("anchor_manifest_hash") != validated_lens_inputs.anchor_manifest_hash
+        or execution.get("anchor_selection_hash") != validated_lens_inputs.anchor_selection_hash
+        or execution.get("position_manifest_hash") != validated_lens_inputs.position_manifest_hash
+        or execution.get("rollout_manifest_hash") != validated_lens_inputs.rollout_manifest_hash
+        or execution.get("compatibility_prefix_manifest_hash") != prefix_hash
+        or execution.get("compatibility_prefix_manifest_sha256")
+        != sha256_file(prefix_path)
+        or execution.get("compatibility_manifest_hash") != compatibility_hash
+        or execution.get("probe_design_manifest_hash") != probe_design["manifest_hash"]
+        or execution.get("probe_design_manifest_sha256") != sha256_file(design_path)
+        or execution.get("candidate_probe_manifest_hash")
+        != probe_design["candidate_probe_manifest_hash"]
+        or execution.get("candidate_probe_manifest_sha256") != sha256_file(candidate_path)
+        or execution.get("probe_protocol_version") != probe_design["protocol_version"]
+        or execution.get("probe_cell_count") != probe_design["cell_count"]
+        or execution.get("eligible_probe_cell_count") != probe_design["eligible_cell_count"]
+        or execution.get("ineligible_probe_cell_count") != probe_design["ineligible_cell_count"]
+        or execution.get("eligible_record_count") != eligible_row_count
+        or execution.get("ineligible_record_count")
+        != _PRIMARY_ANALYSIS_LENS_RECORD_COUNT - eligible_row_count
+        or execution.get("analysis_forward_rule")
+        != "max_authenticated_position_inclusive"
+        or execution.get("release_authorization_manifest_hash")
+        != release_authorization["manifest_hash"]
+        or execution.get("release_authorization_manifest_sha256")
+        != sha256_file(release_authorization_path)
+        or execution.get("lens_records_sha256") != sha256_file(artifact)
+        or execution.get("evidence_scope") != "observational_readout"
+        or execution.get("causal_claim") is not False
+    ):
+        raise CLIError("lens execution manifest disagrees with frozen inputs or complete grid")
+    declared_records_path = execution.get("lens_records_path")
+    direct_path_match = declared_records_path in {
+        _path_payload(artifact, root),
+        str(artifact),
+    }
+    remote_path_match = False
+    if isinstance(declared_records_path, str):
+        declared_path = Path(declared_records_path)
+        remote_path_match = (
+            declared_path.is_absolute()
+            and declared_path.name == artifact.name
+            and (
+                not declared_path.exists()
+                or declared_path.resolve() == artifact.resolve()
+            )
+        )
+    if not direct_path_match and not remote_path_match:
+        raise CLIError("lens execution manifest records path mismatch")
+    if (
+        validation.get("schema_version") != 2
+        or validation.get("artifact") != _path_payload(artifact, root)
+        or validation.get("artifact_sha256") != sha256_file(artifact)
+        or validation.get("rows") != _PRIMARY_ANALYSIS_LENS_RECORD_COUNT
+        or validation.get("trace_count") != _PRIMARY_ANALYSIS_LENS_TRACE_COUNT
+        or validation.get("lens_types") != list(_PRIMARY_ANALYSIS_LENS_TYPES)
+        or validation.get("causal_claim") is not False
+        or validation.get("synthetic_smoke") is not False
+        or validation.get("execution_manifest") != _path_payload(execution_path, root)
+        or validation.get("execution_manifest_hash") != execution_hash
+        or validation.get("probe_design_manifest_hash") != probe_design["manifest_hash"]
+        or validation.get("release_authorization")
+        != {
+            "path": _path_payload(release_authorization_path, root),
+            "sha256": sha256_file(release_authorization_path),
+            "manifest_hash": release_authorization["manifest_hash"],
+        }
+        or validation.get("paid_authorization")
+        != {
+            "command_phase": "lens_gpu",
+            "plan_hash": release_authorization["paid_plan"]["plan_hash"],
+            "receipt_hash": release_authorization["paid_receipt"]["receipt_hash"],
+            "approval_bindings_hash": release_authorization[
+                "approval_bindings_hash"
+            ],
+            "active_gpu_session_gate_hash": release_authorization[
+                "active_gpu_session_gate"
+            ]["record_hash"],
+        }
+    ):
+        raise CLIError("lens validation manifest disagrees with execution/artifact evidence")
+    return {
+        "lens_compatibility_prefix_manifest": {
+            "path": _path_payload(prefix_path, root),
+            "sha256": sha256_file(prefix_path),
+            "record_hash": prefix_hash,
+        },
+        "lens_compatibility_manifest": {
+            "path": _path_payload(compatibility_path, root),
+            "sha256": sha256_file(compatibility_path),
+            "record_hash": compatibility_hash,
+        },
+        "lens_release_authorization": {
+            "path": _path_payload(release_authorization_path, root),
+            "sha256": sha256_file(release_authorization_path),
+            "manifest_hash": release_authorization["manifest_hash"],
+        },
+        "lens_execution_manifest": {
+            "path": _path_payload(execution_path, root),
+            "sha256": sha256_file(execution_path),
+            "record_hash": execution_hash,
+        },
+        "lens_validation_manifest": {
+            "path": _path_payload(validation_path, root),
+            "sha256": sha256_file(validation_path),
+            "manifest_hash": validation_hash,
+        },
+    }
+
+
+def _authenticate_lens_failure_release(
+    *,
+    config: RunConfig,
+    validated_lens_inputs: Any,
+    probe_design: Mapping[str, Any],
+    lens_artifact: Path,
+) -> dict[str, dict[str, Any]]:
+    """Validate the sole behavior-only alternate after two bounded 122B failures."""
+
+    root = _project_root(config)
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    failure_path = manifest_dir / "lens_failure_manifest.json"
+    compatibility_path = manifest_dir / "lens_compatibility_manifest.json"
+    prefix_path = manifest_dir / "lens_compatibility_prefix_manifest.json"
+    execution_path = manifest_dir / "lens_execution_manifest.json"
+    validation_path = manifest_dir / "lens_validation.json"
+    design_path = manifest_dir / "lens_probe_design_manifest.json"
+    candidate_path = manifest_dir / "lens_probe_token_verification.json"
+    if lens_artifact.exists() or execution_path.exists() or validation_path.exists():
+        raise CLIError(
+            "122B lens-failure mode refuses lens records, execution, or validation artifacts"
+        )
+    _, compatibility_hash = _load_lens_compatibility_manifest(
+        config=config,
+        path=compatibility_path,
+        prefix_path=prefix_path,
+        validated_lens_inputs=validated_lens_inputs,
+        require_ready=False,
+    )
+    prefix = _require_mapping_artifact(
+        prefix_path, label="lens compatibility prefix manifest"
+    )
+    _, prefix_hash = _verify_canonical_payload_hash(
+        prefix,
+        label="lens compatibility prefix manifest",
+        fields=("record_hash",),
+    )
+    release_authorization_path = manifest_dir / "lens_release_authorization.json"
+    release_authorization = _load_lens_release_authorization(
+        config=config,
+        probe_design_path=design_path,
+    )
+
+    failure = _require_mapping_artifact(failure_path, label="lens failure manifest")
+    _, failure_hash = _verify_canonical_payload_hash(
+        failure, label="lens failure manifest", fields=("record_hash",)
+    )
+    expected = {
+        "schema_version": 2,
+        "status": "primary_122b_lens_unavailable",
+        "failure_stage": "ordered_122b_compatibility_gate",
+        "failure_policy": "two_bounded_version_fixed_attempts_then_behavior_only",
+        "primary_model_id": config.model.id,
+        "primary_model_revision": config.model.revision,
+        "anchor_manifest_hash": validated_lens_inputs.anchor_manifest_hash,
+        "anchor_selection_hash": validated_lens_inputs.anchor_selection_hash,
+        "position_manifest_hash": validated_lens_inputs.position_manifest_hash,
+        "rollout_manifest_hash": validated_lens_inputs.rollout_manifest_hash,
+        "probe_design_manifest_hash": probe_design["manifest_hash"],
+        "probe_design_manifest_sha256": sha256_file(design_path),
+        "candidate_probe_manifest_hash": probe_design["candidate_probe_manifest_hash"],
+        "candidate_probe_manifest_sha256": sha256_file(candidate_path),
+        "probe_protocol_version": probe_design["protocol_version"],
+        "compatibility_prefix_manifest_hash": prefix_hash,
+        "compatibility_prefix_manifest_sha256": sha256_file(prefix_path),
+        "compatibility_manifest_hash": compatibility_hash,
+        "compatibility_manifest_sha256": sha256_file(compatibility_path),
+        "release_authorization_manifest_hash": release_authorization["manifest_hash"],
+        "release_authorization_manifest_sha256": sha256_file(
+            release_authorization_path
+        ),
+        "attempt_count_122b": 2,
+        "attempt_strategies": [
+            "version_fixed_full_prefix",
+            "version_fixed_shortened_prefix",
+        ],
+        "all_122b_attempts_failed": True,
+        "lens_records_absent": True,
+        "execution_manifest_absent": True,
+        "analysis_mode": "behavior_only",
+        "lens_evidence_status": "unavailable_not_zero",
+        "lens_claim_eligibility": False,
+        "fallback_27b_policy": "methodology_support_only_not_122b_substitute",
+        "fallback_27b_used_as_primary": False,
+        "causal_claim": False,
+    }
+    for key, value in expected.items():
+        if failure.get(key) != value:
+            raise CLIError(f"lens failure manifest changed canonical field {key}")
+    if set(failure) != {*expected, "record_hash"}:
+        raise CLIError("lens failure manifest has a noncanonical schema")
+    return {
+        "lens_compatibility_prefix_manifest": {
+            "path": _path_payload(prefix_path, root),
+            "sha256": sha256_file(prefix_path),
+            "record_hash": prefix_hash,
+        },
+        "lens_compatibility_manifest": {
+            "path": _path_payload(compatibility_path, root),
+            "sha256": sha256_file(compatibility_path),
+            "record_hash": compatibility_hash,
+        },
+        "lens_release_authorization": {
+            "path": _path_payload(release_authorization_path, root),
+            "sha256": sha256_file(release_authorization_path),
+            "manifest_hash": release_authorization["manifest_hash"],
+        },
+        "lens_failure_manifest": {
+            "path": _path_payload(failure_path, root),
+            "sha256": sha256_file(failure_path),
+            "record_hash": failure_hash,
+        },
+    }
+
+
+def _validate_primary_analysis_evidence(
+    *,
+    config: RunConfig,
+    preregistration: Mapping[str, Any],
+    rollout_path: Path,
+    resampling_path: Path,
+    lens_path: Path,
+    resampling_rows: Sequence[Mapping[str, Any]],
+    raw_lens_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Fail closed before statistics, figures, or report artifacts can be written."""
+
+    root = _project_root(config)
+    manifest_dir = _resolve(config, config.paths.manifest_dir)
+    sampling_path = manifest_dir / "sampling_manifest.json"
+    anchor_path = manifest_dir / "anchor_manifest.json"
+    rollouts, sampling = _load_authenticated_behavioral_rollouts(
+        config=config,
+        preregistration=preregistration,
+        rollout_path=rollout_path,
+        sampling_manifest_path=sampling_path,
+    )
+    _authenticate_sampling_supporting_artifacts(config=config, sampling=sampling)
+    anchor_payload, anchor_manifest = _load_authenticated_anchor_output(
+        anchor_path,
+        config=config,
+        rollout_rows=rollouts,
+        require_primary_provenance=True,
+    )
+    trace_ids, anchor_by_id = _validate_primary_rollout_and_anchor_inventory(
+        preregistration=preregistration,
+        rollouts=rollouts,
+        anchor_payload=anchor_payload,
+        anchor_manifest=anchor_manifest,
+    )
+    _validate_primary_resampling_inventory(resampling_rows, anchor_by_id=anchor_by_id)
+    evidence = _authenticate_resampling_release(
+        config=config,
+        artifact=resampling_path,
+        rows=resampling_rows,
+    )
+
+    position_path = manifest_dir / "lens_positions.jsonl"
+    position_summary_path = manifest_dir / "lens_position_manifest.json"
+    _validate_completed_positions(
+        config=config,
+        rollout_path=rollout_path,
+        anchor_path=anchor_path,
+        output=position_path,
+        summary_path=position_summary_path,
+    )
+    position_summary = _require_mapping_artifact(
+        position_summary_path, label="lens position manifest"
+    )
+    try:
+        validated_lens_inputs = validate_frozen_lens_inputs(
+            rollouts=rollouts,
+            anchor_manifest=anchor_payload,
+            position_records=read_jsonl(position_path),
+        )
+    except Exception as exc:
+        raise CLIError(f"authenticated lens input join failed: {exc}") from exc
+    if {trace.trace_id for trace in validated_lens_inputs.traces} != trace_ids:
+        raise CLIError("lens trace IDs do not exactly match the 24 frozen anchor traces")
+    probe_design, probe_cells, probe_evidence = _authenticate_probe_design(
+        config=config,
+        preregistration=preregistration,
+        validated_lens_inputs=validated_lens_inputs,
+        position_manifest_hash=validated_lens_inputs.position_manifest_hash,
+    )
+    evidence.update(probe_evidence)
+    if raw_lens_rows:
+        eligible_raw_lens_rows = _validate_primary_lens_grid(
+            config=config,
+            preregistration=preregistration,
+            raw_rows=raw_lens_rows,
+            validated_lens_inputs=validated_lens_inputs,
+            probe_design=probe_design,
+            probe_cells=probe_cells,
+        )
+        evidence.update(
+            _authenticate_lens_release(
+                config=config,
+                artifact=lens_path,
+                raw_rows=raw_lens_rows,
+                validated_lens_inputs=validated_lens_inputs,
+                probe_design=probe_design,
+                eligible_row_count=len(eligible_raw_lens_rows),
+            )
+        )
+    else:
+        eligible_raw_lens_rows = []
+        evidence.update(
+            _authenticate_lens_failure_release(
+                config=config,
+                validated_lens_inputs=validated_lens_inputs,
+                probe_design=probe_design,
+                lens_artifact=lens_path,
+            )
+        )
+    evidence.update(
+        {
+            "sampling_manifest": {
+                "path": _path_payload(sampling_path, root),
+                "sha256": sha256_file(sampling_path),
+                "manifest_hash": sampling["manifest_hash"],
+            },
+            "anchor_manifest": {
+                "path": _path_payload(anchor_path, root),
+                "sha256": sha256_file(anchor_path),
+                "manifest_hash": anchor_payload["manifest_hash"],
+                "selection_hash": anchor_manifest.selection_hash,
+            },
+            "lens_positions": {
+                "path": _path_payload(position_path, root),
+                "sha256": sha256_file(position_path),
+                "manifest_hash": validated_lens_inputs.position_manifest_hash,
+            },
+            "lens_position_manifest": {
+                "path": _path_payload(position_summary_path, root),
+                "sha256": sha256_file(position_summary_path),
+                "manifest_hash": position_summary["manifest_hash"],
+            },
+        }
+    )
+    return rollouts, eligible_raw_lens_rows, evidence
+
+
 def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) -> dict[str, Any]:
     root = _project_root(config)
     rollout_path = _resolve(config, config.paths.raw_dir) / "rollouts.jsonl"
     resampling_path = _resolve(config, config.paths.interim_dir) / "resampling.jsonl"
     lens_path = _resolve(config, config.paths.interim_dir) / "lens.jsonl"
-    missing = [path for path in (rollout_path, resampling_path, lens_path) if not path.is_file()]
+    primary_analysis = _analysis_is_primary(config)
+    required_paths = (rollout_path, resampling_path) if primary_analysis else (
+        rollout_path,
+        resampling_path,
+        lens_path,
+    )
+    missing = [path for path in required_paths if not path.is_file()]
     if missing:
         raise CLIError("analysis inputs are absent: " + ", ".join(str(path) for path in missing))
 
     rollouts = read_jsonl(rollout_path)
     resampling_rows = read_jsonl(resampling_path)
-    _validate_resampling_rows(resampling_rows)
-    lens_rows = _normalize_lens_rows(read_jsonl(lens_path))
+    raw_lens_rows = read_jsonl(lens_path) if lens_path.is_file() else []
+    synthetic_smoke = _validate_analysis_data_partition(
+        primary=primary_analysis,
+        rollouts=rollouts,
+        resampling_rows=resampling_rows,
+        lens_rows=raw_lens_rows,
+    )
+    evidence_manifests: dict[str, dict[str, Any]] = {}
+    if primary_analysis:
+        rollouts, eligible_lens_rows, evidence_manifests = _validate_primary_analysis_evidence(
+            config=config,
+            preregistration=preregistration,
+            rollout_path=rollout_path,
+            resampling_path=resampling_path,
+            lens_path=lens_path,
+            resampling_rows=resampling_rows,
+            raw_lens_rows=raw_lens_rows,
+        )
+        lens_rows = _normalize_lens_rows(eligible_lens_rows) if eligible_lens_rows else []
+    else:
+        _validate_resampling_rows(resampling_rows)
+        lens_rows = _normalize_lens_rows(raw_lens_rows)
+
+    # Nothing below this line may run until the complete evidence boundary has
+    # passed. In particular, bootstrap RNG, statistics, figures, and writes all
+    # happen strictly after the primary gate.
     parse_rate = validate_parse_rate(
         rollouts,
         minimum=float(
@@ -5160,7 +8713,6 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
     # defining containment invariant.
     behavior["ci_low"] = behavior[["ci_low", "rate"]].min(axis=1)
     behavior["ci_high"] = behavior[["ci_high", "rate"]].max(axis=1)
-    synthetic_smoke = all(bool(row.get("synthetic_smoke")) for row in resampling_rows)
     if synthetic_smoke:
         primary_resampling = [
             row
@@ -5212,18 +8764,58 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
         name: assessment.inference_tier for name, assessment in criterion_by_name.items()
     }
 
+    if "lens_execution_manifest" in evidence_manifests:
+        lens_resampling_association = accuracy_anchor_lens_resampling_association(
+            resampling_rows,
+            lens_rows,
+            minimum_pairs_per_trace=int(
+                resampling_config.get("minimum_divergent_resamples_per_anchor", 8)
+            ),
+            required_traces_per_direction=4,
+        )
+        _validate_primary_lens_resampling_association_result(
+            lens_resampling_association
+        )
+    else:
+        if "lens_failure_manifest" in evidence_manifests:
+            association_reason = (
+                "primary 122B lens unavailable after the authenticated two-attempt "
+                "compatibility gate"
+            )
+        else:
+            association_reason = (
+                "deterministic smoke evidence is not eligible for the primary "
+                "lens-resampling association"
+            )
+        lens_resampling_association = {
+            "status": "unavailable",
+            "reason": association_reason,
+            "inference_tier": "exploratory_observational",
+            "causal_claim": False,
+            "mediation_claim": False,
+            "primary_lens": "J",
+            "sensitivity_lens": "R",
+            "trace_effects": [],
+            "common_trace_count": 0,
+            "traces_per_direction": {"above_good": 0, "below_good": 0},
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+
     figure_dir = _resolve(config, config.paths.figure_dir)
-    figures = {
+    figure_paths = {
         "first_vs_final_bias": plot_first_vs_final_bias(
             behavior, figure_dir / "first_vs_final_bias.png"
         ),
         "sentence_causal_effect_forest": plot_sentence_effect_forest(
             effects, figure_dir / "sentence_causal_effect_forest.png"
         ),
-        "lens_layer_position_heatmap": plot_lens_heatmap(
-            lens_frame, figure_dir / "lens_layer_position_heatmap.png"
-        ),
     }
+    if lens_rows:
+        figure_paths["lens_layer_position_heatmap"] = plot_lens_heatmap(
+            lens_frame, figure_dir / "lens_layer_position_heatmap.png"
+        )
 
     first_above = _stage_rate(behavior, task="giraffe", condition="above_good", stage="first")
     first_below = _stage_rate(behavior, task="giraffe", condition="below_good", stage="first")
@@ -5231,8 +8823,19 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
     final_below = _stage_rate(behavior, task="giraffe", condition="below_good", stage="final")
     baseline_final = _stage_rate(behavior, task="giraffe", condition="baseline", stage="final")
     neutral_final = _stage_rate(behavior, task="giraffe", condition="threshold_only", stage="final")
-    derived_criteria = {name: assessment.value for name, assessment in criterion_by_name.items()}
-    criterion_reasons = {name: assessment.reason for name, assessment in criterion_by_name.items()}
+    raw_derived_criteria = {
+        name: assessment.value for name, assessment in criterion_by_name.items()
+    }
+    raw_criterion_reasons = {
+        name: assessment.reason for name, assessment in criterion_by_name.items()
+    }
+    derived_criteria, criterion_reasons, lens_corroboration_gate = (
+        _gate_lens_verdict_criteria(
+            raw_derived_criteria,
+            raw_criterion_reasons,
+            association=lens_resampling_association,
+        )
+    )
     verdicts = adjudicate_hypotheses(
         effects=effects,
         local_direction_gap_first=(
@@ -5250,30 +8853,30 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
             if neutral_final is not None and baseline_final is not None
             else None
         ),
-        coffee_same_sign=criterion_by_name["independent_task_same_direction"].value,
-        lens_corroborates=criterion_by_name["generic_jr_direction_corroboration"].value,
-        pre_estimate_direction_signal=criterion_by_name[
+        coffee_same_sign=derived_criteria["independent_task_same_direction"],
+        lens_corroborates=derived_criteria["generic_jr_direction_corroboration"],
+        pre_estimate_direction_signal=derived_criteria[
             "direction_signal_present_before_first_estimate"
-        ].value,
-        accuracy_moves_toward_baseline=criterion_by_name[
+        ],
+        accuracy_moves_toward_baseline=derived_criteria[
             "accuracy_sentence_moves_toward_neutral_baseline"
-        ].value,
-        objective_signal_after_accuracy=criterion_by_name[
+        ],
+        objective_signal_after_accuracy=derived_criteria[
             "objective_signal_increases_after_accuracy_sentence"
-        ].value,
-        pre_statement_direction_signal=criterion_by_name[
+        ],
+        pre_statement_direction_signal=derived_criteria[
             "direction_signal_precedes_accuracy_statement"
-        ].value,
-        threshold_only_matches_motivated_shift=criterion_by_name[
+        ],
+        threshold_only_matches_motivated_shift=derived_criteria[
             "threshold_only_matches_motivated_shift"
-        ].value,
-        value_specificity_weak=criterion_by_name[
+        ],
+        value_specificity_weak=derived_criteria[
             "moral_direction_interaction_is_practically_weak"
-        ].value,
-        pooled_good_side_revision=criterion_by_name["pooled_good_side_revision_is_positive"].value,
-        pooled_good_side_stopping=criterion_by_name[
+        ],
+        pooled_good_side_revision=derived_criteria["pooled_good_side_revision_is_positive"],
+        pooled_good_side_stopping=derived_criteria[
             "pooled_stopping_after_good_crossing_is_prevalent"
-        ].value,
+        ],
         derived_criteria=derived_criteria,
         criterion_reasons=criterion_reasons,
         criterion_inference_tiers=criterion_inference_tiers,
@@ -5301,7 +8904,7 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
         report_dir / "hypothesis_verdicts.jsonl", _frame_records(verdict_frame)
     )
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": config.profile,
         "synthetic_smoke": synthetic_smoke,
         "final_measurement_rate": parse_rate,
@@ -5310,10 +8913,31 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
         ),
         "rollout_rows": len(rollouts),
         "resampling_rows": len(resampling_rows),
-        "lens_rows": len(lens_rows),
+        "lens_rows": len(raw_lens_rows),
+        "lens_eligible_rows": len(lens_rows),
+        "lens_evidence_status": (
+            "synthetic_smoke"
+            if synthetic_smoke
+            else (
+                "available_122b"
+                if "lens_execution_manifest" in evidence_manifests
+                else "unavailable_not_zero"
+            )
+        ),
+        "lens_heatmap_omitted_reason": (
+            None
+            if lens_rows
+            else (
+                "authenticated 122B compatibility failure; no lens logits were analyzed"
+                if "lens_failure_manifest" in evidence_manifests
+                else "no causally eligible probe cells were available for a lens heatmap"
+            )
+        ),
         "cluster_effects": _frame_records(effects),
         "hypothesis_criteria": criterion_rows,
         "hypothesis_verdicts": _frame_records(verdict_frame),
+        "lens_resampling_association": lens_resampling_association,
+        "lens_corroboration_gate": lens_corroboration_gate,
         "inputs": {
             "rollouts": {
                 "path": _path_payload(rollout_path, root),
@@ -5323,19 +8947,56 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
                 "path": _path_payload(resampling_path, root),
                 "sha256": sha256_file(resampling_path),
             },
-            "lens": {"path": _path_payload(lens_path, root), "sha256": sha256_file(lens_path)},
+            **(
+                {
+                    "lens": {
+                        "path": _path_payload(lens_path, root),
+                        "sha256": sha256_file(lens_path),
+                    }
+                }
+                if lens_path.is_file()
+                else {}
+            ),
+            **evidence_manifests,
         },
         "tables": {
-            "behavioral_estimands": _path_payload(behavioral_estimands_path, root),
-            "behavior": _path_payload(behavior_path, root),
-            "missingness": _path_payload(missingness_path, root),
-            "timing": _path_payload(timing_path, root),
-            "process": _path_payload(process_path, root),
-            "effects": _path_payload(effects_path, root),
-            "criteria": _path_payload(criteria_path, root),
-            "verdicts": _path_payload(verdicts_path, root),
+            "behavioral_estimands": {
+                "path": _path_payload(behavioral_estimands_path, root),
+                "sha256": sha256_file(behavioral_estimands_path),
+            },
+            "behavior": {
+                "path": _path_payload(behavior_path, root),
+                "sha256": sha256_file(behavior_path),
+            },
+            "missingness": {
+                "path": _path_payload(missingness_path, root),
+                "sha256": sha256_file(missingness_path),
+            },
+            "timing": {
+                "path": _path_payload(timing_path, root),
+                "sha256": sha256_file(timing_path),
+            },
+            "process": {
+                "path": _path_payload(process_path, root),
+                "sha256": sha256_file(process_path),
+            },
+            "effects": {
+                "path": _path_payload(effects_path, root),
+                "sha256": sha256_file(effects_path),
+            },
+            "criteria": {
+                "path": _path_payload(criteria_path, root),
+                "sha256": sha256_file(criteria_path),
+            },
+            "verdicts": {
+                "path": _path_payload(verdicts_path, root),
+                "sha256": sha256_file(verdicts_path),
+            },
         },
-        "figures": {name: _path_payload(path, root) for name, path in figures.items()},
+        "figures": {
+            name: {"path": _path_payload(path, root), "sha256": sha256_file(path)}
+            for name, path in figure_paths.items()
+        },
         "lens_is_observational_only": True,
     }
     summary["analysis_hash"] = stable_hash(summary)
@@ -5345,7 +9006,7 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
         "status": "complete",
         "summary": _path_payload(summary_path, root),
         "final_measurement_rate": parse_rate,
-        "figures": summary["figures"],
+        "figures": {name: value["path"] for name, value in summary["figures"].items()},
         "analysis_hash": summary["analysis_hash"],
     }
 
@@ -5353,6 +9014,257 @@ def _analyze_artifacts(config: RunConfig, preregistration: Mapping[str, Any]) ->
 def _command_analyze(args: argparse.Namespace) -> dict[str, Any]:
     config = load_run_config(args.config)
     return _analyze_artifacts(config, load_preregistration(config))
+
+
+def _require_recomputed_lens_resampling_association(
+    *,
+    association: Mapping[str, Any],
+    resampling_path: Path,
+    lens_path: Path,
+    minimum_pairs_per_trace: int,
+) -> dict[str, Any]:
+    """Recompute the exploratory result from the exact linked raw artifacts."""
+
+    try:
+        recomputed = accuracy_anchor_lens_resampling_association(
+            read_jsonl(resampling_path),
+            read_jsonl(lens_path),
+            minimum_pairs_per_trace=minimum_pairs_per_trace,
+            required_traces_per_direction=4,
+        )
+        _validate_primary_lens_resampling_association_result(recomputed)
+    except (OSError, TypeError, ValueError) as exc:
+        raise CLIError(f"lens association raw-input recomputation failed: {exc}") from exc
+    if dict(association) != recomputed:
+        raise CLIError(
+            "lens association disagrees with raw-input recomputation from linked artifacts"
+        )
+    return recomputed
+
+
+def _validate_analysis_summary_bundle(
+    config: RunConfig,
+    summary_path: Path,
+) -> dict[str, Any]:
+    """Authenticate the summary and every artifact it can expose to a report."""
+
+    summary = _require_mapping_artifact(summary_path, label="analysis summary")
+    recorded_hash = summary.get("analysis_hash")
+    if recorded_hash != stable_hash(
+        {key: value for key, value in summary.items() if key != "analysis_hash"}
+    ):
+        raise CLIError("analysis summary analysis_hash mismatch")
+    if summary.get("schema_version") != 2:
+        raise CLIError("analysis summary does not use the authenticated hash-inventory schema")
+    if summary.get("profile") != config.profile:
+        raise CLIError("analysis summary belongs to a different run profile")
+    primary = _analysis_is_primary(config)
+    if primary and summary.get("synthetic_smoke") is not False:
+        raise CLIError("primary report refuses a smoke analysis summary")
+    if not primary and summary.get("synthetic_smoke") is not True:
+        raise CLIError("smoke report refuses an unlabelled primary analysis summary")
+    if primary and (
+        summary.get("rollout_rows") != _PRIMARY_ANALYSIS_ROLLOUT_COUNT
+        or summary.get("resampling_rows") != _PRIMARY_ANALYSIS_RESAMPLE_COUNT
+    ):
+        raise CLIError("analysis summary inventory is not the frozen primary inventory")
+    lens_status = summary.get("lens_evidence_status")
+    if primary and lens_status == "available_122b" and summary.get(
+        "lens_rows"
+    ) != _PRIMARY_ANALYSIS_LENS_RECORD_COUNT:
+        raise CLIError("analysis summary has a truncated primary lens inventory")
+    if primary and lens_status == "unavailable_not_zero" and summary.get("lens_rows") != 0:
+        raise CLIError("lens-failure summary must not contain lens rows")
+    if primary and lens_status not in {"available_122b", "unavailable_not_zero"}:
+        raise CLIError("primary analysis summary has an invalid lens evidence status")
+    if not primary and lens_status != "synthetic_smoke":
+        raise CLIError("smoke analysis summary has an invalid lens evidence status")
+    association = summary.get("lens_resampling_association")
+    if not isinstance(association, Mapping):
+        raise CLIError("analysis summary lacks the lens-resampling association result")
+    if (
+        association.get("inference_tier") != "exploratory_observational"
+        or association.get("causal_claim") is not False
+        or association.get("mediation_claim") is not False
+        or association.get("primary_lens") != "J"
+        or association.get("sensitivity_lens") != "R"
+    ):
+        raise CLIError("lens-resampling association overstates its evidentiary scope")
+    if lens_status == "unavailable_not_zero":
+        expected_unavailable = {
+            "status": "unavailable",
+            "reason": (
+                "primary 122B lens unavailable after the authenticated two-attempt "
+                "compatibility gate"
+            ),
+            "inference_tier": "exploratory_observational",
+            "causal_claim": False,
+            "mediation_claim": False,
+            "primary_lens": "J",
+            "sensitivity_lens": "R",
+            "trace_effects": [],
+            "common_trace_count": 0,
+            "traces_per_direction": {"above_good": 0, "below_good": 0},
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+        if association != expected_unavailable:
+            raise CLIError(
+                "lens-failure analysis must record unavailable association evidence "
+                "without pseudo-values"
+            )
+    elif lens_status == "synthetic_smoke":
+        expected_smoke = {
+            "status": "unavailable",
+            "reason": (
+                "deterministic smoke evidence is not eligible for the primary "
+                "lens-resampling association"
+            ),
+            "inference_tier": "exploratory_observational",
+            "causal_claim": False,
+            "mediation_claim": False,
+            "primary_lens": "J",
+            "sensitivity_lens": "R",
+            "trace_effects": [],
+            "common_trace_count": 0,
+            "traces_per_direction": {"above_good": 0, "below_good": 0},
+            "permutation_count": 0,
+            "permutation_resolution": None,
+            "per_lens": {},
+        }
+        if association != expected_smoke:
+            raise CLIError("smoke analysis cannot expose a primary lens association")
+    elif lens_status == "available_122b":
+        _validate_primary_lens_resampling_association_result(association)
+
+    root = _project_root(config)
+
+    def validate_section(name: str) -> dict[str, Mapping[str, Any]]:
+        section = summary.get(name)
+        if not isinstance(section, Mapping) or not section:
+            raise CLIError(f"analysis summary has no {name} hash inventory")
+        validated: dict[str, Mapping[str, Any]] = {}
+        for label, source in section.items():
+            if not isinstance(source, Mapping):
+                raise CLIError(f"analysis summary {name}.{label} is not a hashed artifact link")
+            path = _safe_project_artifact(
+                root, source.get("path"), label=f"analysis {name}.{label}"
+            )
+            if not path.is_file() or source.get("sha256") != sha256_file(path):
+                raise CLIError(f"analysis {name}.{label} SHA-256 mismatch")
+            validated[str(label)] = source
+        return validated
+
+    inputs = validate_section("inputs")
+    tables = validate_section("tables")
+    figures = validate_section("figures")
+    if set(tables) != {
+        "behavioral_estimands",
+        "behavior",
+        "missingness",
+        "timing",
+        "process",
+        "effects",
+        "criteria",
+        "verdicts",
+    }:
+        raise CLIError("analysis summary table inventory is incomplete or unexpected")
+    expected_figures = {
+        "first_vs_final_bias",
+        "sentence_causal_effect_forest",
+    }
+    if int(summary.get("lens_eligible_rows", 0)) > 0:
+        expected_figures.add("lens_layer_position_heatmap")
+    if set(figures) != expected_figures:
+        raise CLIError("analysis summary figure inventory is incomplete or unexpected")
+    required_raw_inputs = {"rollouts", "resampling"}
+    if lens_status != "unavailable_not_zero":
+        required_raw_inputs.add("lens")
+    if not required_raw_inputs.issubset(inputs):
+        raise CLIError("analysis summary raw-input inventory is incomplete")
+    expected_gate = _gate_lens_verdict_criteria(
+        {}, {}, association=association
+    )[2]
+    if summary.get("lens_corroboration_gate") != expected_gate:
+        raise CLIError(
+            "analysis summary lens corroboration gate disagrees with its frozen predicate"
+        )
+    if not expected_gate["passed"]:
+        verdict_rows = summary.get("hypothesis_verdicts")
+        if not isinstance(verdict_rows, list):
+            raise CLIError("analysis summary hypothesis verdicts are malformed")
+        for index, verdict in enumerate(verdict_rows, start=1):
+            if not isinstance(verdict, Mapping):
+                raise CLIError(f"analysis hypothesis verdict {index} is not an object")
+            descriptive = verdict.get("descriptive_criterion_values", {})
+            if not isinstance(descriptive, Mapping):
+                raise CLIError(
+                    f"analysis hypothesis verdict {index} lacks descriptive criteria"
+                )
+            if any(
+                descriptive.get(name) is not None
+                for name in _LENS_VERDICT_CRITERIA.intersection(descriptive)
+            ):
+                raise CLIError(
+                    "verdict-facing lens criterion is not unknown after corroboration "
+                    "gate failure"
+                )
+    if primary and lens_status == "available_122b":
+        resampling_input_path = _safe_project_artifact(
+            root,
+            inputs["resampling"].get("path"),
+            label="analysis inputs.resampling",
+        )
+        lens_input_path = _safe_project_artifact(
+            root,
+            inputs["lens"].get("path"),
+            label="analysis inputs.lens",
+        )
+        preregistration = load_preregistration(config)
+        resampling_config = preregistration.get("resampling", {})
+        _require_recomputed_lens_resampling_association(
+            association=association,
+            resampling_path=resampling_input_path,
+            lens_path=lens_input_path,
+            minimum_pairs_per_trace=int(
+                resampling_config.get("minimum_divergent_resamples_per_anchor", 8)
+            ),
+        )
+    if primary:
+        required_evidence = {
+            "sampling_manifest",
+            "anchor_manifest",
+            "resampling_execution_manifest",
+            "resampling_validation_manifest",
+            "candidate_probe_manifest",
+            "lens_probe_design_manifest",
+            "lens_positions",
+            "lens_position_manifest",
+        }
+        if lens_status == "available_122b":
+            required_evidence.update(
+                {
+                    "lens_compatibility_prefix_manifest",
+                    "lens_compatibility_manifest",
+                    "lens_release_authorization",
+                    "lens_execution_manifest",
+                    "lens_validation_manifest",
+                }
+            )
+        else:
+            required_evidence.update(
+                {
+                    "lens_compatibility_prefix_manifest",
+                    "lens_compatibility_manifest",
+                    "lens_release_authorization",
+                    "lens_failure_manifest",
+                }
+            )
+        missing = required_evidence.difference(inputs)
+        if missing:
+            raise CLIError(f"analysis summary omits primary evidence manifests: {sorted(missing)}")
+    return summary
 
 
 def _result_context(config: RunConfig, summary: Mapping[str, Any]) -> dict[str, Any]:
@@ -5371,16 +9283,30 @@ def _result_context(config: RunConfig, summary: Mapping[str, Any]) -> dict[str, 
         "cluster_effects": summary["cluster_effects"],
         "hypothesis_criteria": summary.get("hypothesis_criteria", []),
         "hypothesis_verdicts": summary["hypothesis_verdicts"],
-        "figures": summary["figures"],
+        "lens_evidence_status": summary.get("lens_evidence_status"),
+        "lens_heatmap_omitted_reason": summary.get("lens_heatmap_omitted_reason"),
+        "lens_resampling_association": summary.get("lens_resampling_association"),
+        "figures": {name: value["path"] for name, value in summary["figures"].items()},
         "reproducibility": {
             "analysis_hash": summary["analysis_hash"],
             "inputs": summary["inputs"],
+            "tables": summary["tables"],
+            "figures": summary["figures"],
             "lens_is_observational_only": True,
         },
     }
 
 
 def _context_markdown(context: Mapping[str, Any]) -> str:
+    def nullable_decimal(value: Any) -> str:
+        if value is None:
+            return "NA (not estimable)"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "NA (not estimable)"
+        return f"{number:.3f}" if math.isfinite(number) else "NA (not estimable)"
+
     lines = [
         f"# {context['title']}",
         "",
@@ -5399,10 +9325,17 @@ def _context_markdown(context: Mapping[str, Any]) -> str:
         "|---|---:|---:|---:|---|",
     ]
     for row in context["cluster_effects"]:
+        estimate = nullable_decimal(row.get("estimate"))
+        ci_low = nullable_decimal(row.get("ci_low"))
+        ci_high = nullable_decimal(row.get("ci_high"))
+        interval = (
+            "NA (not estimable)"
+            if "NA (not estimable)" in {ci_low, ci_high}
+            else f"[{ci_low}, {ci_high}]"
+        )
         lines.append(
-            "| {sentence_class} | {direction} | {estimate:.3f} | [{ci_low:.3f}, {ci_high:.3f}] | {conclusion} |".format(
-                **row
-            )
+            f"| {row['sentence_class']} | {row['direction']} | {estimate} | "
+            f"{interval} | {row['conclusion']} |"
         )
     lines.extend(["", "## Hypothesis adjudication", ""])
     for row in context["hypothesis_verdicts"]:
@@ -5412,6 +9345,27 @@ def _context_markdown(context: Mapping[str, Any]) -> str:
     lines.extend(["", "## Core figures", ""])
     for name, path in context["figures"].items():
         lines.append(f"- {name}: `{path}`")
+    if context.get("lens_evidence_status") == "unavailable_not_zero":
+        lines.extend(
+            [
+                "",
+                "122B lens evidence: unavailable (not zero). The bounded compatibility gate "
+                "failed twice, so lens criteria remain unknown and the heatmap is omitted.",
+            ]
+        )
+    association = context.get("lens_resampling_association", {})
+    lines.extend(["", "## Exploratory lens-resampling association", ""])
+    if isinstance(association, Mapping) and association.get("status") == "available":
+        for lens_type in ("J", "R"):
+            result = association.get("per_lens", {}).get(lens_type, {})
+            lines.append(
+                f"- {lens_type}: stratified Kendall tau-a "
+                f"{float(result['tau_a']):.3f}; exact two-sided p "
+                f"{float(result['exact_two_sided_p']):.3f}"
+            )
+    else:
+        reason = association.get("reason", "association evidence unavailable")
+        lines.append(f"- unavailable — {reason}")
     lines.extend(
         [
             "",
@@ -5430,7 +9384,7 @@ def _command_report(args: argparse.Namespace) -> dict[str, Any]:
     summary_path = report_dir / "analysis_summary.json"
     if not summary_path.is_file():
         raise CLIError(f"analysis summary is absent at {summary_path}; run analyze first")
-    summary = read_json(summary_path)
+    summary = _validate_analysis_summary_bundle(config, summary_path)
     context = _result_context(config, summary)
     context_path = write_json(report_dir / "result_context.json", context)
     markdown_path = report_dir / "result_context.md"
@@ -5529,6 +9483,21 @@ def _smoke_anchor_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
 def _uniform_hash_fraction(value: Mapping[str, Any]) -> float:
     digest = stable_hash(value).split(":", 1)[1]
     return int(digest[:13], 16) / float(16**13)
+
+
+def _authenticate_smoke_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add the non-primary marker before content-addressing each smoke row."""
+
+    authenticated: list[dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        row.pop("record_hash", None)
+        row["synthetic_smoke"] = True
+        row["record_hash"] = stable_hash(row)
+        authenticated.append(row)
+    return authenticated
 
 
 def _smoke_resampling_rows(
@@ -5650,7 +9619,7 @@ def _command_smoke(args: argparse.Namespace) -> dict[str, Any]:
         counts=_smoke_counts(),
         primary_inference=False,
     )
-    rollouts = list(execution.rows)
+    rollouts = _authenticate_smoke_rows(execution.rows)
     thresholds = execution.thresholds
     rollout_path = _resolve(config, config.paths.raw_dir) / "rollouts.jsonl"
     write_jsonl(rollout_path, rollouts)
@@ -5679,10 +9648,12 @@ def _command_smoke(args: argparse.Namespace) -> dict[str, Any]:
     anchor_path = _resolve(config, config.paths.manifest_dir) / "anchor_manifest.json"
     anchor_manifest = _freeze_anchor_file(config, preregistration, candidate_path, anchor_path)
 
-    resampling_rows = _smoke_resampling_rows(anchor_manifest, rollouts)
+    resampling_rows = _authenticate_smoke_rows(
+        _smoke_resampling_rows(anchor_manifest, rollouts)
+    )
     resampling_path = _resolve(config, config.paths.interim_dir) / "resampling.jsonl"
     write_jsonl(resampling_path, resampling_rows)
-    lens_rows = _smoke_lens_rows(anchor_manifest)
+    lens_rows = _authenticate_smoke_rows(_smoke_lens_rows(anchor_manifest))
     lens_path = _resolve(config, config.paths.interim_dir) / "lens.jsonl"
     write_jsonl(lens_path, lens_rows)
 
@@ -5982,6 +9953,8 @@ def build_parser() -> argparse.ArgumentParser:
     lens.add_argument("--rollouts")
     lens.add_argument("--anchors")
     lens.add_argument("--positions")
+    lens.add_argument("--probe-candidates")
+    lens.add_argument("--probe-design")
     lens.add_argument("--cache-dir")
     lens.add_argument("--per-gpu-memory-gib", type=int, default=76)
     lens.set_defaults(handler=_command_lens)

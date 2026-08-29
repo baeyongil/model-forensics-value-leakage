@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "extract_gpu_bootstrap_inputs.py"
+GPU_LOCK = SCRIPT.parents[1] / "config" / "gpu_lock.yaml"
 SPEC = importlib.util.spec_from_file_location("extract_gpu_bootstrap_inputs", SCRIPT)
 assert SPEC and SPEC.loader
 extractor = importlib.util.module_from_spec(SPEC)
@@ -78,3 +79,45 @@ def test_exact_wheel_url_remains_query_free() -> None:
             "https://files.pythonhosted.org/vllm.whl?download=1",
             field="vLLM wheel URL",
         )
+
+
+def test_gpu_lock_extracts_content_addressed_semantic_runtime() -> None:
+    lock = extractor.load_gpu_lock(GPU_LOCK)
+
+    assert lock["semantic_wheel_url"].endswith(
+        "sentence_transformers-5.7.0-py3-none-any.whl"
+    )
+    assert len(lock["semantic_wheel_sha256"]) == 64
+    assert lock["semantic_distribution_version"] == "5.7.0"
+    assert lock["semantic_stack_lock_hash"].startswith("sha256:")
+    assert lock["bootstrap_constraints_path"] == "config/gpu_bootstrap_constraints.txt"
+    assert len(lock["bootstrap_constraints_sha256"]) == 64
+    assert lock["bootstrap_distribution_lock_hash"].startswith("sha256:")
+
+
+def test_gpu_lock_fails_closed_when_one_semantic_version_drifts(tmp_path: Path) -> None:
+    drifted = tmp_path / "gpu_lock.yaml"
+    drifted.write_text(
+        GPU_LOCK.read_text(encoding="utf-8").replace(
+            '    scipy: "1.18.1"',
+            '    scipy: "1.18.0"',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(extractor.BootstrapInputError, match="stack hash mismatch"):
+        extractor.load_gpu_lock(drifted)
+
+
+def test_gpu_lock_fails_closed_when_bootstrap_inventory_drifts(tmp_path: Path) -> None:
+    drifted = tmp_path / "gpu_lock.yaml"
+    drifted.write_text(
+        GPU_LOCK.read_text(encoding="utf-8").replace(
+            '    accelerate: "1.12.0"',
+            '    accelerate: "1.11.0"',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(extractor.BootstrapInputError, match="bootstrap environment"):
+        extractor.load_gpu_lock(drifted)

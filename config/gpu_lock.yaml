@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 resolved_at_utc: "2026-08-29T18:26:00Z"
 source_repositories:
   jacobian_lens:
@@ -18,6 +18,50 @@ source_repositories:
     bundled_cuda: "13.0"
     torch: "2.13.0"
     transformers_requirement: ">=5.5.3"
+semantic_runtime:
+  protocol_version: pinned-sentence-transformer-runtime-v2
+  semantic_wheel_url: >-
+    https://files.pythonhosted.org/packages/e8/c8/f63d99e354532f5b83e735dd1e001bda92495fbfde934f65d924abf2b071/sentence_transformers-5.7.0-py3-none-any.whl
+  semantic_wheel_sha256: b78141da3d8137e70d965866e2ca43190b9266f3d4d8752e250ded75e7136730
+  semantic_distribution_version: "5.7.0"
+  semantic_model_id: sentence-transformers/all-MiniLM-L6-v2
+  semantic_model_revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+  required_distribution_versions:
+    huggingface-hub: "1.29.0"
+    numpy: "2.5.2"
+    scikit-learn: "1.9.0"
+    scipy: "1.18.1"
+    sentence-transformers: "5.7.0"
+    tokenizers: "0.23.1"
+    torch: "2.13.0"
+    transformers: "5.16.0.dev0"
+  stack_lock_hash: sha256:a9f7895f7ce028bc251dc4e450c8b1ae5e9e3636095a20b880f337cee4ed5e08
+bootstrap_environment:
+  bootstrap_protocol_version: exact-direct-bootstrap-v1
+  constraints_path: config/gpu_bootstrap_constraints.txt
+  constraints_sha256: eac31466ffe0668c030ef18bb2e88444ad2ff264733ae2526787db30148db662
+  required_distribution_versions:
+    accelerate: "1.12.0"
+    huggingface-hub: "1.29.0"
+    jlens: "0.1.0"
+    matplotlib: "3.10.8"
+    numpy: "2.5.2"
+    pandas: "3.0.3"
+    pydantic: "2.12.5"
+    PyYAML: "6.0.3"
+    safetensors: "0.7.0"
+    scikit-learn: "1.9.0"
+    scipy: "1.18.1"
+    sentence-transformers: "5.7.0"
+    setuptools: "80.9.0"
+    tokenizers: "0.23.1"
+    torch: "2.13.0"
+    transformers: "5.16.0.dev0"
+    vllm: "0.28.0"
+    wheel: "0.46.3"
+  distribution_lock_hash: sha256:34bf13cce556796f0f725a967b509258571bcab910d2ec55a6b3edf76db8515a
+  transitive_artifact_hashes_complete: false
+  first_install_trust_boundary: pinned_container_plus_pypi_tls
 container_image:
   reference: runpod/pytorch@sha256:e855789ff7e4b1ad76698171b1974a99a5c48c5b3e80a908976987938b090992
   tag_observed: 1.0.7-cu1300-torch291-ubuntu2404
@@ -26,7 +70,8 @@ container_image:
   config_sha256: 18d90716b6bb9f4bed820c08e5b80cf6e0a99eb14e611b3446db82729b2d0b18
 notes:
   - The stable vLLM wheel URL and SHA-256 were resolved from the official PyPI JSON API.
-  - Exact installed distributions and hashes are captured again on the GPU host.
+  - Exact top-level bootstrap distribution versions are checked after installation; transitive PyPI wheels are not hash-locked and remain an explicitly recorded first-install trust boundary.
+  - The semantic eligibility stack is installed from the exact 5.7.0 wheel and version lock; every SHA-256-bearing installed RECORD file plus Transformers PEP-610 source identity is authenticated before primary eligibility and again on re-arm.
   - The GPU host must satisfy the official CUDA 13 driver/compatibility requirements.
   - The SSH-capable official RunPod CUDA 13 image is pinned by its linux/amd64 OCI manifest digest; the exact vLLM wheel is installed and verified separately.
   - VLLM_ENABLE_CUDA_COMPATIBILITY=1 is required on the currently available H100 hosts, whose catalog CUDA capability is 12.8.

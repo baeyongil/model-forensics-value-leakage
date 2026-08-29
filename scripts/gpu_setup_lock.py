@@ -26,6 +26,12 @@ def main() -> int:
     parser.add_argument("--vllm-wheel-sha256", required=True)
     parser.add_argument("--transformers-commit", required=True)
     parser.add_argument("--jlens-commit", required=True)
+    parser.add_argument("--semantic-wheel-url", required=True)
+    parser.add_argument("--semantic-wheel-sha256", required=True)
+    parser.add_argument("--semantic-distribution-version", required=True)
+    parser.add_argument("--semantic-stack-lock-hash", required=True)
+    parser.add_argument("--bootstrap-constraints-sha256", required=True)
+    parser.add_argument("--bootstrap-distribution-lock-hash", required=True)
     args = parser.parse_args()
 
     private_root = (Path.cwd() / ".runpod").resolve()
@@ -43,6 +49,12 @@ def main() -> int:
             vllm_wheel_sha256=args.vllm_wheel_sha256,
             transformers_commit=args.transformers_commit,
             jlens_commit=args.jlens_commit,
+            semantic_wheel_url=args.semantic_wheel_url,
+            semantic_wheel_sha256=args.semantic_wheel_sha256,
+            semantic_distribution_version=args.semantic_distribution_version,
+            semantic_stack_lock_hash=args.semantic_stack_lock_hash,
+            bootstrap_constraints_sha256=args.bootstrap_constraints_sha256,
+            bootstrap_distribution_lock_hash=args.bootstrap_distribution_lock_hash,
         )
         operation = create_gpu_setup_lock if args.mode == "create" else validate_gpu_setup_lock
         if args.mode == "create":

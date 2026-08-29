@@ -20,11 +20,13 @@ from model_forensics.resample_runner import (
     ReplacementClassificationResult,
     ReplacementTokenTolerance,
     ResampleAllocationManifest,
+    ResampleExecutionError,
     build_fixed_stage_two_allocation_manifest,
     build_initial_allocation_manifest,
     run_sentence_resampling,
     select_confirmatory_pairs,
 )
+from model_forensics.token_spans import token_stream_hash
 
 _DEFAULT_CLASSIFIER = object()
 _DEFAULT_OUTCOME_CALLER = object()
@@ -70,6 +72,19 @@ class LookupEmbedder:
         assert texts[0] == "Accuracy should not be swayed by threshold 100."
         assert texts[1]
         return ([1.0, 0.0], self.replacement_vector)
+
+    @property
+    def provenance(self) -> Mapping[str, object]:
+        payload: dict[str, object] = {
+            "runtime_kind": "unit_test_double",
+            "model_revision": "fixed-test-revision",
+            "primary_eligible": True,
+        }
+        payload["provenance_hash"] = stable_hash(payload)
+        return payload
+
+    def assert_primary_eligible(self) -> None:
+        return None
 
 
 class RecordingReplacementClassifier:
@@ -178,6 +193,47 @@ class RecordingRawPrefixBackend:
         self.prefix_calls: list[tuple[tuple[Mapping[str, object], ...], str]] = []
         self.continuation_calls: list[str] = []
         self.requests: tuple[RawPrefixGenerationRequest, ...] = ()
+        self._decoded_pieces: dict[int, str] = {}
+        self._next_piece_id = 1_000_000
+
+    @property
+    def tokenizer(self):
+        return self
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        del skip_special_tokens
+        assert clean_up_tokenization_spaces is False
+        return "".join(self._decoded_pieces.get(token_id, chr(token_id)) for token_id in token_ids)
+
+    def _piece_id(self, text: str) -> int:
+        token_id = self._next_piece_id
+        self._next_piece_id += 1
+        self._decoded_pieces[token_id] = text
+        return token_id
+
+    def _completion_ids(self, generated: str, *, arm: str) -> tuple[int, ...]:
+        if arm != "resample" or self.malformed == "missing_close":
+            return (self._piece_id(generated),)
+        reasoning = generated.split("</think>", 1)[0]
+        replacement = sentence_spans(reasoning)[0]
+        token_count = self.replacement_token_count or 3
+        boundaries = [round(index * len(replacement.text) / token_count) for index in range(token_count + 1)]
+        pieces = [
+            replacement.text[boundaries[index] : boundaries[index + 1]]
+            for index in range(token_count)
+        ]
+        assert all(pieces)
+        suffix = generated[replacement.end :]
+        return (
+            *(self._piece_id(piece) for piece in pieces),
+            self._piece_id(suffix),
+        )
 
     @property
     def provenance(self) -> Mapping[str, object]:
@@ -227,14 +283,22 @@ class RecordingRawPrefixBackend:
             prompt_token_ids = request.prompt_token_ids
             if self.corrupt_prompt_tokens:
                 prompt_token_ids = (*prompt_token_ids, 999)
+            completion_token_ids = self._completion_ids(generated, arm=request.arm)
             results.append(
                 RawPrefixGenerationResult(
                     request_id=request.request_id,
                     generated_text=generated,
                     prompt_token_ids=prompt_token_ids,
                     prompt_tokens=len(prompt_token_ids),
-                    completion_tokens=12,
-                    backend_metadata={"seed": request.seed},
+                    completion_tokens=len(completion_token_ids),
+                    backend_metadata={
+                        "seed": request.seed,
+                        "completion_token_ids": list(completion_token_ids),
+                        "completion_token_ids_hash": token_stream_hash(
+                            completion_token_ids,
+                            stream="completion",
+                        ),
+                    },
                 )
             )
         return results
@@ -298,10 +362,7 @@ def test_runner_conditions_exactly_and_preserves_fixed_prefix_and_full_artifacts
     common_text = base.trace[: anchor.char_start]
 
     assert backend.prefix_calls == [(base.messages, common_text)]
-    assert (
-        backend.continuation_calls
-        == [anchor.sentence_text] + ["A genuinely different replacement."] * 10
-    )
+    assert backend.continuation_calls == [anchor.sentence_text]
     assert requests["resample"].conditioning_text == common_text
     assert requests["retain"].conditioning_text == common_text + anchor.sentence_text
     assert requests["retain"].prompt_token_ids[:3] == requests["resample"].prompt_token_ids
@@ -318,7 +379,26 @@ def test_runner_conditions_exactly_and_preserves_fixed_prefix_and_full_artifacts
     assert by_arm["retain"].conditioning_prefix_hash != by_arm["resample"].conditioning_prefix_hash
     assert all(not record.synthetic_smoke for record in records)
     assert all(record.provenance["backend"]["model_id"] == "no-network" for record in records)
-    assert all(record.usage["completion_tokens"] == 12 for record in records)
+    assert all(
+        record.provenance["semantic_embedder"]["model_revision"]
+        == "fixed-test-revision"
+        for record in records
+    )
+    assert all(
+        record.usage["completion_tokens"]
+        == len(record.provenance["backend_result"]["completion_token_ids"])
+        for record in records
+    )
+
+
+def test_primary_runner_refuses_unattributed_semantic_embedder() -> None:
+    class UnattributedEmbedder:
+        def encode(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+            del texts
+            return ([1.0, 0.0], [0.0, 1.0])
+
+    with pytest.raises(ResampleExecutionError, match="eligibility check"):
+        _run(embedder=UnattributedEmbedder())  # type: ignore[arg-type]
 
 
 def test_runner_records_first_replacement_divergence_final_estimate_and_good_side() -> None:

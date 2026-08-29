@@ -57,6 +57,10 @@ RESAMPLE_ADJUDICATION_PROTOCOL = "resample-cpu-api-adjudication-v1"
 EXPECTED_RESAMPLE_COUNT = 24 * 2 * 20
 MINIMUM_EXACT_AGREEMENT_FLOOR = 0.90
 MINIMUM_FINAL_KNOWN_FLOOR = 0.95
+DEFAULT_MINIMUM_OVERALL_GENERATION_VALID_RATE = 0.95
+DEFAULT_MINIMUM_ANCHOR_ARM_VALID_COUNT = 18
+DEFAULT_MINIMUM_ANCHOR_PAIR_COMPLETE_COUNT = 16
+DEFAULT_MAXIMUM_ANCHOR_ARM_VALID_RATE_GAP = 0.10
 
 
 class ResampleAdjudicationPhaseError(RuntimeError):
@@ -825,7 +829,96 @@ def _quality_gate(
     *,
     minimum_exact_agreement: float,
     minimum_final_known_rate: float,
+    minimum_overall_generation_valid_rate: float,
+    minimum_anchor_arm_valid_count: int,
+    minimum_anchor_pair_complete_count: int,
+    maximum_anchor_arm_valid_rate_gap: float,
 ) -> dict[str, Any]:
+    expected_per_arm = 20
+    by_anchor_arm: dict[tuple[str, str], dict[int, bool]] = {}
+    for index, row in enumerate(rows, start=1):
+        anchor_id = str(row.get("anchor_id", ""))
+        arm = str(row.get("arm", ""))
+        sample_index = row.get("sample_index")
+        if (
+            not anchor_id
+            or arm not in {"retain", "resample"}
+            or isinstance(sample_index, bool)
+            or not isinstance(sample_index, int)
+            or not 0 <= sample_index < expected_per_arm
+        ):
+            raise ResampleAdjudicationPhaseError(
+                f"resampling quality row {index} has invalid anchor/arm/sample identity"
+            )
+        cell = by_anchor_arm.setdefault((anchor_id, arm), {})
+        if sample_index in cell:
+            raise ResampleAdjudicationPhaseError(
+                f"duplicate resampling quality identity {(anchor_id, arm, sample_index)!r}"
+            )
+        cell[sample_index] = row.get("generation_status") == GENERATION_STATUS_VALID
+
+    anchor_ids = sorted({anchor_id for anchor_id, _arm in by_anchor_arm})
+    expected_cells = {(anchor_id, arm) for anchor_id in anchor_ids for arm in ("retain", "resample")}
+    if len(anchor_ids) != 24 or set(by_anchor_arm) != expected_cells:
+        raise ResampleAdjudicationPhaseError(
+            "resampling generation-attrition gate requires exactly 24 anchors and both arms"
+        )
+
+    cell_reports: list[dict[str, Any]] = []
+    anchor_reports: list[dict[str, Any]] = []
+    cell_gate_passed = True
+    pair_gate_passed = True
+    gap_gate_passed = True
+    for anchor_id in anchor_ids:
+        counts: dict[str, int] = {}
+        rates: dict[str, float] = {}
+        for arm in ("retain", "resample"):
+            cell = by_anchor_arm[(anchor_id, arm)]
+            complete_inventory = set(cell) == set(range(expected_per_arm))
+            valid_count = sum(cell.values()) if complete_inventory else 0
+            valid_rate = valid_count / expected_per_arm
+            passed = complete_inventory and valid_count >= minimum_anchor_arm_valid_count
+            cell_gate_passed = cell_gate_passed and passed
+            counts[arm] = valid_count
+            rates[arm] = valid_rate
+            cell_reports.append(
+                {
+                    "anchor_id": anchor_id,
+                    "arm": arm,
+                    "expected_count": expected_per_arm,
+                    "observed_count": len(cell),
+                    "valid_generation_count": valid_count,
+                    "valid_generation_rate": valid_rate,
+                    "minimum_valid_generation_count": minimum_anchor_arm_valid_count,
+                    "passed": passed,
+                }
+            )
+        pair_complete = sum(
+            by_anchor_arm[(anchor_id, "retain")].get(sample_index) is True
+            and by_anchor_arm[(anchor_id, "resample")].get(sample_index) is True
+            for sample_index in range(expected_per_arm)
+        )
+        pair_passed = pair_complete >= minimum_anchor_pair_complete_count
+        rate_gap = abs(rates["retain"] - rates["resample"])
+        gap_passed = rate_gap <= maximum_anchor_arm_valid_rate_gap + 1e-12
+        pair_gate_passed = pair_gate_passed and pair_passed
+        gap_gate_passed = gap_gate_passed and gap_passed
+        anchor_reports.append(
+            {
+                "anchor_id": anchor_id,
+                "retain_valid_count": counts["retain"],
+                "resample_valid_count": counts["resample"],
+                "pair_complete_generation_count": pair_complete,
+                "minimum_pair_complete_generation_count": (
+                    minimum_anchor_pair_complete_count
+                ),
+                "absolute_arm_valid_rate_gap": rate_gap,
+                "maximum_arm_valid_rate_gap": maximum_anchor_arm_valid_rate_gap,
+                "pair_complete_gate_passed": pair_passed,
+                "arm_gap_gate_passed": gap_passed,
+            }
+        )
+
     eligible = [row for row in rows if row.get("final_quality_denominator_eligible") is True]
     denominator = len(eligible)
     exact = sum(
@@ -840,12 +933,31 @@ def _quality_gate(
     )
     exact_rate = exact / denominator if denominator else 0.0
     known_rate = known / denominator if denominator else 0.0
+    overall_generation_valid_rate = denominator / len(rows) if rows else 0.0
+    overall_generation_gate_passed = bool(
+        rows and overall_generation_valid_rate >= minimum_overall_generation_valid_rate
+    )
+    generation_attrition_gate_passed = bool(
+        overall_generation_gate_passed
+        and cell_gate_passed
+        and pair_gate_passed
+        and gap_gate_passed
+    )
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "protocol_version": RESAMPLE_ADJUDICATION_PROTOCOL,
-        "scope": "all_valid_generation_resampling_finals",
+        "scope": "all_frozen_resampling_generations_and_valid-generation_finals",
         "denominator_valid_generation_count": denominator,
         "terminal_invalid_excluded_count": len(rows) - denominator,
+        "overall_generation_valid_rate": overall_generation_valid_rate,
+        "minimum_overall_generation_valid_rate": minimum_overall_generation_valid_rate,
+        "overall_generation_valid_gate_passed": overall_generation_gate_passed,
+        "anchor_arm_generation_valid_gate_passed": cell_gate_passed,
+        "anchor_pair_complete_generation_gate_passed": pair_gate_passed,
+        "anchor_arm_attrition_gap_gate_passed": gap_gate_passed,
+        "generation_attrition_gate_passed": generation_attrition_gate_passed,
+        "anchor_arm_reports": cell_reports,
+        "anchor_reports": anchor_reports,
         "exact_status_value_agreements": exact,
         "exact_status_value_agreement_rate": exact_rate,
         "minimum_exact_status_value_agreement": minimum_exact_agreement,
@@ -856,9 +968,54 @@ def _quality_gate(
         "known_gate_passed": bool(denominator and known_rate >= minimum_final_known_rate),
         "rows_hash": stable_hash(rows),
     }
-    payload["gate_passed"] = bool(payload["agreement_gate_passed"] and payload["known_gate_passed"])
+    payload["gate_passed"] = bool(
+        generation_attrition_gate_passed
+        and payload["agreement_gate_passed"]
+        and payload["known_gate_passed"]
+    )
     payload["manifest_hash"] = stable_hash(payload)
     return payload
+
+
+def evaluate_generation_attrition(
+    rows: Sequence[ResamplingGenerationRecord],
+    *,
+    minimum_overall_generation_valid_rate: float,
+    minimum_anchor_arm_valid_count: int,
+    minimum_anchor_pair_complete_count: int,
+    maximum_anchor_arm_valid_rate_gap: float,
+) -> dict[str, Any]:
+    """Evaluate every generation-only gate before any paid API preflight."""
+
+    quality_rows = [
+        {
+            "anchor_id": row.anchor_id,
+            "arm": row.arm,
+            "sample_index": row.sample_index,
+            "generation_status": row.generation_status,
+            "final_quality_denominator_eligible": (
+                row.generation_status == GENERATION_STATUS_VALID
+            ),
+            "dual_final_consensus": (
+                {
+                    "exact_status_value_agreement": True,
+                    "known_consensus": True,
+                }
+                if row.generation_status == GENERATION_STATUS_VALID
+                else None
+            ),
+        }
+        for row in rows
+    ]
+    return _quality_gate(
+        quality_rows,
+        minimum_exact_agreement=0.0,
+        minimum_final_known_rate=0.0,
+        minimum_overall_generation_valid_rate=minimum_overall_generation_valid_rate,
+        minimum_anchor_arm_valid_count=minimum_anchor_arm_valid_count,
+        minimum_anchor_pair_complete_count=minimum_anchor_pair_complete_count,
+        maximum_anchor_arm_valid_rate_gap=maximum_anchor_arm_valid_rate_gap,
+    )
 
 
 def _freeze_or_verify(path: Path, payload: Mapping[str, Any], *, label: str) -> None:
@@ -884,11 +1041,19 @@ def _complete_phase(
     embedder_identity: Mapping[str, Any],
     minimum_exact_agreement: float,
     minimum_final_known_rate: float,
+    minimum_overall_generation_valid_rate: float,
+    minimum_anchor_arm_valid_count: int,
+    minimum_anchor_pair_complete_count: int,
+    maximum_anchor_arm_valid_rate_gap: float,
 ) -> ResampleAdjudicationPhase:
     quality = _quality_gate(
         rows,
         minimum_exact_agreement=minimum_exact_agreement,
         minimum_final_known_rate=minimum_final_known_rate,
+        minimum_overall_generation_valid_rate=minimum_overall_generation_valid_rate,
+        minimum_anchor_arm_valid_count=minimum_anchor_arm_valid_count,
+        minimum_anchor_pair_complete_count=minimum_anchor_pair_complete_count,
+        maximum_anchor_arm_valid_rate_gap=maximum_anchor_arm_valid_rate_gap,
     )
     quality_path = directory / "quality_gate.json"
     _freeze_or_verify(quality_path, quality, label="resample quality gate")
@@ -937,7 +1102,7 @@ def _complete_phase(
     )
     if not result.gate_passed:
         raise ResampleAdjudicationGateError(
-            "resampling final exact-agreement or known-rate gate failed closed"
+            "resampling generation-attrition, final exact-agreement, or known-rate gate failed closed"
         )
     return result
 
@@ -959,6 +1124,12 @@ def run_resample_adjudication_phase(
     execution_id: str,
     minimum_exact_agreement: float = 0.90,
     minimum_final_known_rate: float = 0.95,
+    minimum_overall_generation_valid_rate: float = (
+        DEFAULT_MINIMUM_OVERALL_GENERATION_VALID_RATE
+    ),
+    minimum_anchor_arm_valid_count: int = DEFAULT_MINIMUM_ANCHOR_ARM_VALID_COUNT,
+    minimum_anchor_pair_complete_count: int = DEFAULT_MINIMUM_ANCHOR_PAIR_COMPLETE_COUNT,
+    maximum_anchor_arm_valid_rate_gap: float = DEFAULT_MAXIMUM_ANCHOR_ARM_VALID_RATE_GAP,
     on_record_committed: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> ResampleAdjudicationPhase:
     """Run or resume the exact 960-unit CPU/API resampling phase."""
@@ -974,6 +1145,25 @@ def run_resample_adjudication_phase(
         "minimum_final_known_rate",
         minimum_final_known_rate,
         MINIMUM_FINAL_KNOWN_FLOOR,
+    )
+    minimum_overall_valid = _validate_gate(
+        "minimum_overall_generation_valid_rate",
+        minimum_overall_generation_valid_rate,
+        0.0,
+    )
+    if (
+        isinstance(minimum_anchor_arm_valid_count, bool)
+        or not isinstance(minimum_anchor_arm_valid_count, int)
+        or not 0 <= minimum_anchor_arm_valid_count <= 20
+        or isinstance(minimum_anchor_pair_complete_count, bool)
+        or not isinstance(minimum_anchor_pair_complete_count, int)
+        or not 0 <= minimum_anchor_pair_complete_count <= 20
+    ):
+        raise ValueError("resampling anchor attrition counts must be integers in [0, 20]")
+    maximum_arm_gap = _validate_gate(
+        "maximum_anchor_arm_valid_rate_gap",
+        maximum_anchor_arm_valid_rate_gap,
+        0.0,
     )
     if primary_final_caller.not_for_primary_inference or (
         independent_final_caller.not_for_primary_inference
@@ -1036,6 +1226,10 @@ def run_resample_adjudication_phase(
         },
         "minimum_exact_agreement": minimum_exact,
         "minimum_final_known_rate": minimum_known,
+        "minimum_overall_generation_valid_rate": minimum_overall_valid,
+        "minimum_anchor_arm_valid_count": minimum_anchor_arm_valid_count,
+        "minimum_anchor_pair_complete_count": minimum_anchor_pair_complete_count,
+        "maximum_anchor_arm_valid_rate_gap": maximum_arm_gap,
         "paid_response_replay_protocol": PAID_RESPONSE_STORE_PROTOCOL,
         "expected_count": EXPECTED_RESAMPLE_COUNT,
     }
@@ -1082,6 +1276,10 @@ def run_resample_adjudication_phase(
             embedder_identity=embedder_identity,
             minimum_exact_agreement=minimum_exact,
             minimum_final_known_rate=minimum_known,
+            minimum_overall_generation_valid_rate=minimum_overall_valid,
+            minimum_anchor_arm_valid_count=minimum_anchor_arm_valid_count,
+            minimum_anchor_pair_complete_count=minimum_anchor_pair_complete_count,
+            maximum_anchor_arm_valid_rate_gap=maximum_arm_gap,
         )
 
     try:
@@ -1214,6 +1412,10 @@ def run_resample_adjudication_phase(
         embedder_identity=embedder_identity,
         minimum_exact_agreement=minimum_exact,
         minimum_final_known_rate=minimum_known,
+        minimum_overall_generation_valid_rate=minimum_overall_valid,
+        minimum_anchor_arm_valid_count=minimum_anchor_arm_valid_count,
+        minimum_anchor_pair_complete_count=minimum_anchor_pair_complete_count,
+        maximum_anchor_arm_valid_rate_gap=maximum_arm_gap,
     )
 
 
