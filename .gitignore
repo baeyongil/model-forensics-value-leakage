@@ -22,6 +22,11 @@ data/upstream/
 # Model outputs can be large and are published only from curated release manifests.
 data/raw/
 data/interim/
+# All newly generated primary/runtime manifests are private by default. Git
+# continues to track the small reviewed static and synthetic-smoke fixtures
+# already in the index, but no new manifest is publishable without force-add
+# plus an explicit release-audit allowlist review.
+data/manifests/**
 outputs/
 reports/rendered/
 reports/staging/
