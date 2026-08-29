@@ -4,4 +4,16 @@ hard_stops:
   gpu: 220.0
   api: 100.0
   total: 325.0
-entries: []
+entries:
+- kind: storage
+  amount_usd: 5.0
+  description: RunPod container and volume disk across all GPU phases
+  status: estimated
+  occurred_at: '2026-08-29T19:02:38.101784+00:00'
+  entry_id: runpod-local-storage-reserve-v1
+- kind: gpu
+  amount_usd: 7.48488
+  description: GPU phase behavior_baseline_gpu session sha256:001602644f02fcca582851bb30f2c15f36cc2b7b1f7799873597a8d1ff7c571c
+  status: incurred
+  occurred_at: '2026-08-29T19:59:30.219429+00:00'
+  entry_id: sha256:e245858db561370e3bf1b1e7f00e66a0eb81cedbd0a06c289a79bf5a174937b4
