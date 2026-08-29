@@ -11,6 +11,7 @@ memory and reduced to a small private lifecycle record before persistence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -74,6 +75,7 @@ TERMINAL_POD_STATUSES = frozenset({"EXITED", "TERMINATED"})
 _POD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{5,127}\Z")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,127}\Z")
 _HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_EXISTING_POD_ID_HASH_RE = re.compile(r"runpod-pod-id-sha256:[0-9a-f]{64}\Z")
 _MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
 
 
@@ -108,7 +110,12 @@ class LifecycleAuthorization:
     approved_phase_maximum_usd: float
     live_hourly_total_usd: float
 
-    def manifest(self, *, launch_spec_hash: str) -> dict[str, Any]:
+    def manifest(
+        self,
+        *,
+        launch_spec_hash: str,
+        acknowledged_existing_pod_id_hashes: Sequence[str] = (),
+    ) -> dict[str, Any]:
         return {
             "phase": self.phase,
             "reservation_id": self.reservation_id,
@@ -120,6 +127,9 @@ class LifecycleAuthorization:
             "quote_hash": self.quote_hash,
             "immutable_spec_hash": self.immutable_spec_hash,
             "launch_spec_hash": launch_spec_hash,
+            "acknowledged_existing_pod_id_hashes": list(
+                acknowledged_existing_pod_id_hashes
+            ),
             "approved_runtime_hours": self.approved_runtime_hours,
             "approved_phase_maximum_usd": self.approved_phase_maximum_usd,
             "live_hourly_total_usd": self.live_hourly_total_usd,
@@ -290,11 +300,15 @@ def build_create_payload(
     name: str,
     hf_token: str,
     session_nonce: str,
+    acknowledged_existing_pod_id_hashes: Sequence[str] = (),
 ) -> tuple[dict[str, Any], str]:
     """Build the exact v2 payload and its secret-safe launch-spec hash."""
 
     if _NAME_RE.fullmatch(name) is None:
         raise RunpodLifecycleError("Pod name is malformed")
+    acknowledged_hashes = _canonical_existing_pod_id_hashes(
+        acknowledged_existing_pod_id_hashes
+    )
     environment = pod_environment(hf_token=hf_token, session_nonce=session_nonce)
     spec = authorization.immutable_spec
     payload = {
@@ -317,7 +331,11 @@ def build_create_payload(
     secret_safe_payload = deepcopy(payload)
     secret_safe_payload["env"][HF_TOKEN_ENV_NAME] = "present-redacted"
     secret_safe_payload["env"][SESSION_ENV_NAME] = authorization.session_hash
-    return payload, stable_hash(secret_safe_payload)
+    launch_intent = {
+        "create_payload": secret_safe_payload,
+        "acknowledged_existing_pod_id_hashes": list(acknowledged_hashes),
+    }
+    return payload, stable_hash(launch_intent)
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -490,6 +508,34 @@ def _require_pod_id(value: Any) -> str:
     if not isinstance(value, str) or _POD_ID_RE.fullmatch(value) is None:
         raise RunpodLifecycleError("RunPod Pod ID is malformed")
     return value
+
+
+def existing_pod_id_hash(pod_id: str) -> str:
+    """Hash one exact provider Pod ID without exposing it in an allow-list.
+
+    This intentionally hashes the raw UTF-8 Pod ID rather than its JSON
+    representation.  The output namespace makes the scheme unambiguous and
+    keeps it distinct from hashes of structured lifecycle records.
+    """
+
+    value = _require_pod_id(pod_id)
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"runpod-pod-id-sha256:{digest}"
+
+
+def _canonical_existing_pod_id_hashes(values: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise RunpodLifecycleError("existing Pod allow-list must be a sequence of hashes")
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or _EXISTING_POD_ID_HASH_RE.fullmatch(value) is None:
+            raise RunpodLifecycleError(
+                "existing Pod allow-list hash must use runpod-pod-id-sha256:<64 lowercase hex>"
+            )
+        normalized.append(value)
+    if len(normalized) != len(set(normalized)):
+        raise RunpodLifecycleError("existing Pod allow-list contains a duplicate hash")
+    return tuple(sorted(normalized))
 
 
 def _require_exact_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -840,6 +886,7 @@ def _base_state(
     authorization: LifecycleAuthorization,
     launch_spec_hash: str,
     pod: Mapping[str, Any] | None,
+    acknowledged_existing_pod_id_hashes: Sequence[str] = (),
     history: Sequence[Mapping[str, Any]] = (),
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -849,19 +896,40 @@ def _base_state(
         "operation": operation,
         "updated_at": _utc_timestamp(now),
         "immutable_spec": deepcopy(dict(authorization.immutable_spec)),
-        "current_authorization": authorization.manifest(launch_spec_hash=launch_spec_hash),
+        "current_authorization": authorization.manifest(
+            launch_spec_hash=launch_spec_hash,
+            acknowledged_existing_pod_id_hashes=acknowledged_existing_pod_id_hashes,
+        ),
         "authorization_history": [deepcopy(dict(item)) for item in history],
         "pod": deepcopy(dict(pod)) if pod is not None else None,
     }
 
 
-def _refuse_nonterminal_pods(pods: Sequence[Mapping[str, Any]]) -> None:
+def _validate_existing_pod_allowlist(
+    pods: Sequence[Mapping[str, Any]],
+    *,
+    acknowledged_existing_pod_id_hashes: Sequence[str],
+) -> tuple[str, ...]:
+    acknowledged = _canonical_existing_pod_id_hashes(
+        acknowledged_existing_pod_id_hashes
+    )
+    observed: list[str] = []
     for pod in pods:
         status = pod.get("desiredStatus")
         if status not in TERMINAL_POD_STATUSES:
+            observed.append(existing_pod_id_hash(_require_pod_id(pod.get("id"))))
+    if len(observed) != len(set(observed)):
+        raise RunpodLifecycleError("RunPod returned duplicate nonterminal Pod IDs")
+    if set(observed) != set(acknowledged):
+        missing = set(observed) - set(acknowledged)
+        if missing:
             raise RunpodLifecycleError(
-                "refusing paid creation while any existing RunPod Pod is nonterminal"
+                "refusing paid creation while a nonterminal Pod is not explicitly allowlisted"
             )
+        raise RunpodLifecycleError(
+            "existing Pod allow-list contains a hash not present in the nonterminal Pod set"
+        )
+    return acknowledged
 
 
 def _v1_running_metadata_ready(raw: Mapping[str, Any]) -> bool:
@@ -1020,6 +1088,7 @@ def create_approved_pod(
     name: str,
     hf_token: str,
     session_nonce: str,
+    acknowledged_existing_pod_id_hashes: Sequence[str] = (),
     now: datetime | None = None,
     maximum_wait_seconds: float = 600.0,
     poll_interval_seconds: float = 10.0,
@@ -1031,18 +1100,26 @@ def create_approved_pod(
     state_path = lifecycle_state_path(project_root)
     if os.path.lexists(state_path):
         raise RunpodLifecycleError("refusing to create a second Pod from an existing lifecycle")
+    acknowledged_hashes = _canonical_existing_pod_id_hashes(
+        acknowledged_existing_pod_id_hashes
+    )
     payload, launch_hash = build_create_payload(
         authorization=authorization,
         name=name,
         hf_token=hf_token,
         session_nonce=session_nonce,
+        acknowledged_existing_pod_id_hashes=acknowledged_hashes,
     )
-    _refuse_nonterminal_pods(client.list_pods_v1())
+    _validate_existing_pod_allowlist(
+        client.list_pods_v1(),
+        acknowledged_existing_pod_id_hashes=acknowledged_hashes,
+    )
     intent = _base_state(
         operation="create_intent",
         authorization=authorization,
         launch_spec_hash=launch_hash,
         pod=None,
+        acknowledged_existing_pod_id_hashes=acknowledged_hashes,
         now=now,
     )
     _exclusive_state_write(state_path, intent)
@@ -1370,6 +1447,7 @@ __all__ = [
     "authorize_gpu_lifecycle",
     "build_create_payload",
     "create_approved_pod",
+    "existing_pod_id_hash",
     "lifecycle_state_path",
     "pod_environment",
     "read_lifecycle_status",

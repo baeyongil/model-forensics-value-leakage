@@ -6,6 +6,9 @@ machine, current price, planned maximum runtime, and estimated charge.
 Pod creation and stopped-Pod re-arming must use the production-safe workflow in
 [`docs/runpod_lifecycle.md`](docs/runpod_lifecycle.md). It records the official v2 request shape,
 private secret boundary, duplicate-spend lock, bounded readiness polling, and recovery rules.
+The only coexistence exception is the create-only, hash-bound acknowledgement documented there:
+every unrelated nonterminal Pod must be explicitly matched, while duplicate, missing, or extra
+hashes and any existing model-forensics lifecycle claim still fail closed.
 
 ## Prepare without starting compute
 

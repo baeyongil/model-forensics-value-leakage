@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 from collections.abc import Mapping
@@ -21,6 +22,7 @@ from model_forensics.runpod_lifecycle import (
     RunpodLifecycleError,
     build_create_payload,
     create_approved_pod,
+    existing_pod_id_hash,
     lifecycle_state_path,
     pod_environment,
     read_lifecycle_status,
@@ -32,6 +34,7 @@ OLD_NONCE = "old-session-nonce-must-never-be-persisted"
 NEW_NONCE = "new-session-nonce-must-never-be-persisted"
 API_FIXTURE_VALUE = "runpod-account-key-must-never-be-persisted"
 POD_ID = "podabc123"
+UNRELATED_POD_ID = "claudeprojectpod123"
 MACHINE_ID = "machine-secure-001"
 IMAGE = "runpod/pytorch@sha256:" + "ab" * 32
 
@@ -247,6 +250,32 @@ def test_v2_create_payload_is_exact_and_launch_hash_is_secret_safe() -> None:
     assert "RUNPOD_API_KEY" not in payload["env"]
 
 
+def test_existing_pod_hash_uses_canonical_raw_id_scheme_and_binds_launch_hash() -> None:
+    authorization = _authorization(
+        phase="behavior_baseline_gpu", nonce=OLD_NONCE, suffix="old"
+    )
+    expected = "runpod-pod-id-sha256:" + hashlib.sha256(
+        UNRELATED_POD_ID.encode("utf-8")
+    ).hexdigest()
+
+    assert existing_pod_id_hash(UNRELATED_POD_ID) == expected
+    _, without_acknowledgement = build_create_payload(
+        authorization=authorization,
+        name="model-forensics-behavior",
+        hf_token=HF_FIXTURE_VALUE,
+        session_nonce=OLD_NONCE,
+    )
+    _, with_acknowledgement = build_create_payload(
+        authorization=authorization,
+        name="model-forensics-behavior",
+        hf_token=HF_FIXTURE_VALUE,
+        session_nonce=OLD_NONCE,
+        acknowledged_existing_pod_id_hashes=(expected,),
+    )
+
+    assert with_acknowledgement != without_acknowledgement
+
+
 def test_create_uses_v1_duplicate_gate_and_official_v2_post_without_secret_persistence(
     tmp_path: Path,
 ) -> None:
@@ -310,6 +339,78 @@ def test_create_refuses_any_nonterminal_pod_before_post_or_local_claim(tmp_path:
         )
 
     assert [call["method"] for call in transport.calls] == ["GET"]
+    assert not lifecycle_state_path(tmp_path).exists()
+
+
+def test_create_allows_only_exact_acknowledged_nonterminal_pod_set(tmp_path: Path) -> None:
+    acknowledged = existing_pod_id_hash(UNRELATED_POD_ID)
+    transport = FakeTransport(
+        [
+            _json_result(
+                200,
+                [{"id": UNRELATED_POD_ID, "desiredStatus": "RUNNING"}],
+            ),
+            _json_result(201, _v2_pod(nonce=OLD_NONCE, status="PROVISIONING")),
+            _json_result(200, _v1_pod(nonce=OLD_NONCE, status="RUNNING")),
+        ]
+    )
+
+    summary = create_approved_pod(
+        project_root=tmp_path,
+        client=RunpodLifecycleClient(api_key=API_FIXTURE_VALUE, transport=transport),
+        authorization=_authorization(
+            phase="behavior_baseline_gpu", nonce=OLD_NONCE, suffix="old"
+        ),
+        name="model-forensics-behavior",
+        hf_token=HF_FIXTURE_VALUE,
+        session_nonce=OLD_NONCE,
+        acknowledged_existing_pod_id_hashes=(acknowledged,),
+    )
+
+    assert summary["operation"] == "created"
+    state_text = lifecycle_state_path(tmp_path).read_text(encoding="utf-8")
+    state = json.loads(state_text)
+    assert state["current_authorization"][
+        "acknowledged_existing_pod_id_hashes"
+    ] == [acknowledged]
+    assert UNRELATED_POD_ID not in state_text
+
+
+def test_create_rejects_duplicate_or_extra_existing_pod_hashes(tmp_path: Path) -> None:
+    acknowledged = existing_pod_id_hash(UNRELATED_POD_ID)
+    authorization = _authorization(
+        phase="behavior_baseline_gpu", nonce=OLD_NONCE, suffix="old"
+    )
+    duplicate_transport = FakeTransport([])
+
+    with pytest.raises(RunpodLifecycleError, match="duplicate hash"):
+        create_approved_pod(
+            project_root=tmp_path,
+            client=RunpodLifecycleClient(
+                api_key=API_FIXTURE_VALUE, transport=duplicate_transport
+            ),
+            authorization=authorization,
+            name="model-forensics-behavior",
+            hf_token=HF_FIXTURE_VALUE,
+            session_nonce=OLD_NONCE,
+            acknowledged_existing_pod_id_hashes=(acknowledged, acknowledged),
+        )
+    assert duplicate_transport.calls == []
+
+    extra_transport = FakeTransport([_json_result(200, [])])
+    with pytest.raises(RunpodLifecycleError, match="not present"):
+        create_approved_pod(
+            project_root=tmp_path,
+            client=RunpodLifecycleClient(
+                api_key=API_FIXTURE_VALUE, transport=extra_transport
+            ),
+            authorization=authorization,
+            name="model-forensics-behavior",
+            hf_token=HF_FIXTURE_VALUE,
+            session_nonce=OLD_NONCE,
+            acknowledged_existing_pod_id_hashes=(acknowledged,),
+        )
+    assert [call["method"] for call in extra_transport.calls] == ["GET"]
     assert not lifecycle_state_path(tmp_path).exists()
 
 

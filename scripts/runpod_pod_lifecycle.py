@@ -247,6 +247,15 @@ def _parser() -> argparse.ArgumentParser:
     create = subparsers.add_parser("create", help="create the one exact approved Pod")
     _add_paid_arguments(create)
     create.add_argument("--name")
+    create.add_argument(
+        "--allow-existing-pod-id-hash",
+        action="append",
+        default=[],
+        help=(
+            "repeat once per user-confirmed unrelated nonterminal Pod; value must be "
+            "runpod-pod-id-sha256:<64 lowercase hex>"
+        ),
+    )
 
     subparsers.add_parser("status", help="read and validate status without mutation")
 
@@ -296,6 +305,9 @@ def main(
                     name=name,
                     hf_token=hf_token,
                     session_nonce=nonce,
+                    acknowledged_existing_pod_id_hashes=(
+                        args.allow_existing_pod_id_hash
+                    ),
                 )
             else:
                 result = rearm_approved_pod(

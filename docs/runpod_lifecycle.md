@@ -57,8 +57,29 @@ PYTHONPATH=src .venv/bin/python scripts/runpod_pod_lifecycle.py \
   --reservation ".runpod/reservations/$GPU_PHASE.json"
 ```
 
-Before POST, the helper refuses creation if the account has any existing nonterminal Pod. It then
-claims a local `create_intent` before the paid request, preventing a retry after any uncertain
+By default, before POST the helper refuses creation if the account has any existing nonterminal
+Pod. A user-confirmed unrelated Pod may coexist only when its exact provider ID has been hashed
+locally as `runpod-pod-id-sha256:` followed by the lowercase SHA-256 of the raw UTF-8 ID, and that
+hash is supplied once with the create-only repeatable option below:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/runpod_pod_lifecycle.py \
+  --project-root . \
+  create \
+  --phase "$GPU_PHASE" \
+  --reservation ".runpod/reservations/$GPU_PHASE.json" \
+  --allow-existing-pod-id-hash 'runpod-pod-id-sha256:<64-lowercase-hex>'
+```
+
+The raw unrelated Pod ID must never be put in argv, lifecycle state, or output. Every live
+nonterminal Pod must match exactly one supplied hash; duplicate hashes, stale/extra hashes,
+terminal-Pod hashes, malformed live IDs, and any unacknowledged live Pod all fail closed before
+POST. The canonical sorted hash set is included in the secret-safe launch-intent hash and private
+create authorization for audit. This exception never bypasses the local lifecycle claim: an
+existing `.runpod/pod_lifecycle.json` still prevents a second model-forensics create.
+
+After the account-level coexistence gate, the helper claims a local `create_intent` before the
+paid request, preventing a retry after any uncertain
 network outcome. It verifies the v2 response and polls v1 for at most ten minutes, with no sleep
 longer than 30 seconds, until the exact Pod is running and direct SSH is ready. Pending, terminal,
 verification-failed, and timeout states remain claimed. Do **not** rerun `create`; inspect status.
