@@ -1,0 +1,34 @@
+{
+  "config_hash": "sha256:0517792ae0ceba18c1c6f19f5b8714b7369107ed04abb8861ae3aa99316e033e",
+  "counts": {
+    "chicago_coffee": {
+      "above_good": 6,
+      "baseline": 7,
+      "below_good": 6
+    },
+    "giraffe": {
+      "above_good": 6,
+      "baseline": 7,
+      "below_good": 6,
+      "threshold_only": 6
+    }
+  },
+  "final_measurement_rate": 1.0,
+  "manifest_hash": "sha256:fa96a01a3c16d60c0074437280a071bd76ff0ea327fe251a561d4d72adffafe3",
+  "measurement_source": "deterministic_smoke_adjudication",
+  "model": {
+    "backend": "fake",
+    "id": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+  },
+  "preregistration_hash": "sha256:6b27628ca4587d19a80aabf76132310ad1333a85a5978e0353904a67f73e9fa0",
+  "profile": "qwen35_4b_smoke",
+  "rollout_path": "data/raw/smoke/rollouts.jsonl",
+  "rollout_sha256": "175b3bb25fcee30d5cd388f8a18c36235b3e8f66b5885442cfb6e8ad28430bbb",
+  "schema_version": 1,
+  "synthetic_smoke": true,
+  "thresholds": {
+    "chicago_coffee": 980000.0,
+    "giraffe": 41000000.0
+  }
+}

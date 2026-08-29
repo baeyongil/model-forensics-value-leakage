@@ -1,0 +1,34 @@
+.DS_Store
+.venv/
+.venv-gpu/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Credentials are never committed.
+.env
+.env.*
+!.env.example
+secrets/
+
+# Upstream data has no license and is fetched into ignored cache only.
+data/cache/
+data/upstream/
+
+# Model outputs can be large and are published only from curated release manifests.
+data/raw/
+data/interim/
+outputs/
+reports/rendered/
+reports/staging/
+
+# Local execution metadata.
+.omx/
+.runpod/
+*.log
+data/manifests/runpod_watchdog.pid
+data/manifests/runpod_stop.request

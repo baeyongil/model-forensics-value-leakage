@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "adjudication_manifest": "data/manifests/smoke/adjudication_manifest.jsonl",
+    "adjudication_raw": "data/raw/smoke/adjudication_raw.jsonl",
+    "analysis_summary": "reports/staging/smoke/analysis_summary.json",
+    "anchor_candidates": "data/interim/smoke/anchor_candidates.jsonl",
+    "anchor_manifest": "data/manifests/smoke/anchor_manifest.json",
+    "lens": "data/interim/smoke/lens.jsonl",
+    "resampling": "data/interim/smoke/resampling.jsonl",
+    "rollouts": "data/raw/smoke/rollouts.jsonl",
+    "sampling_manifest": "data/manifests/smoke/sampling_manifest.json"
+  },
+  "command": "smoke",
+  "completion_hash": "sha256:a36b6c70b58193403a078dd29ff419615bff88465eddd0690d41c40fc717af56",
+  "counts": {
+    "anchor_candidates": 24,
+    "anchors": 24,
+    "lens": 2880,
+    "resampling": 480,
+    "rollouts": 44
+  },
+  "figures": {
+    "first_vs_final_bias": "reports/figures/smoke/first_vs_final_bias.png",
+    "lens_layer_position_heatmap": "reports/figures/smoke/lens_layer_position_heatmap.png",
+    "sentence_causal_effect_forest": "reports/figures/smoke/sentence_causal_effect_forest.png"
+  },
+  "input_hashes": {
+    "adjudication_manifest": "fc8820245729f801c717832eaf6beee840e964dde1583acaf09b7d8a080e017c",
+    "adjudication_raw": "c5de63b4defb35896af36155dabdf495ef4dbf28292e8964414cad491a070a7a",
+    "anchor_candidates": "d1581cc9740aeeb58e33f5219bfab2ae092cd41f0d68e2840de5036560b64280",
+    "lens": "08f46be2d23ab9d0a85af4bcb2784936147d31f3386bd6abc4b0087f97e12724",
+    "resampling": "3e34e75a287677934d6a256d526d0af7c7db5a76b215d1c30d10a4a1ad1955ea",
+    "rollouts": "175b3bb25fcee30d5cd388f8a18c36235b3e8f66b5885442cfb6e8ad28430bbb"
+  },
+  "network_or_model_downloads": false,
+  "profile": "qwen35_4b_smoke",
+  "schema_version": 1,
+  "status": "complete",
+  "synthetic_smoke": true
+}

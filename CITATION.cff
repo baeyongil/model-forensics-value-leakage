@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this investigation or its code, please cite this repository."
+title: "Do Accuracy Denials Control Reasoning? A Model Forensics Study of Value Leakage"
+type: software
+authors:
+  - family-names: Bae
+    given-names: Yongil
+license: MIT
+version: 0.1.0
+date-released: 2026-08-29
+repository-code: "https://github.com/baeyongil/model-forensics-value-leakage"

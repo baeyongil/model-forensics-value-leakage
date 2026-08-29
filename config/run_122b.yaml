@@ -1,0 +1,46 @@
+schema_version: 1
+profile: qwen35_122b_primary
+preregistration: config/preregistration.yaml
+
+model:
+  id: Qwen/Qwen3.5-122B-A10B
+  revision: dc4d348443bc740c68e2d77492492c11606384d5
+  require_pinned_revision: true
+  dtype: bfloat16
+  tensor_parallel_size: 8
+  max_model_len: 65536
+  language_model_only: true
+
+lenses:
+  repository: camilablank/workspace-lenses
+  revision: d740106d1e0f95456dc8718fba2895e9c8ffd6ef
+  require_pinned_revision: true
+  j_filename: qwen3.5-122b-a10b/j-lens/lens.pt
+  r_filename: qwen3.5-122b-a10b/r-lens/lens.pt
+  j_sha256: 961bbb0e1e9362dda57812080fd3cb860bba891799ddbd4ebd89088540ed7842
+  r_sha256: 8093ae27ac100ce5ba18e6b4525c1cc394d1c32c03b0607b0cf3b5ebcd7bf2ee
+  j_size_bytes: 887106103
+  r_size_bytes: 887106295
+
+upstream:
+  repository: https://github.com/adsingh-64/value-leakage.git
+  commit: 16d129859e1f0e281363fb4f5910bcaeea316b10
+  cache_dir: data/upstream/value-leakage
+
+paths:
+  raw_dir: data/raw/qwen35_122b
+  interim_dir: data/interim/qwen35_122b
+  manifest_dir: data/manifests
+  figure_dir: reports/figures
+  report_dir: reports/staging
+
+execution:
+  backend: vllm_offline
+  secret_env:
+    hugging_face: HF_TOKEN
+    openrouter: OPENROUTER_API_KEY
+    runpod: RUNPOD_API_KEY
+  gpu_cost_hard_stop_usd: 220.0
+  api_cost_hard_stop_usd: 100.0
+  total_cost_hard_stop_usd: 325.0
+  terminate_compute_after_sync: true

@@ -1,0 +1,7 @@
+schema_version: 1
+currency: USD
+hard_stops:
+  gpu: 220.0
+  api: 100.0
+  total: 325.0
+entries: []

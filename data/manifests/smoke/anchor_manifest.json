@@ -1,0 +1,413 @@
+{
+  "anchors": [
+    {
+      "anchor_id": "66430a502f2e5b638794115c71bd294b2ec2ce8f68967148b18d8b849940fc3a",
+      "char_end": 98,
+      "char_start": 32,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "262c5323ddeb21affe91c507"
+    },
+    {
+      "anchor_id": "2f28155743da6bb319b45b80b0f0e07015e5b4cf043dba778e1522433626dbba",
+      "char_end": 101,
+      "char_start": 35,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "30734230084a576af6ad58b2"
+    },
+    {
+      "anchor_id": "53a046c0e32afff6c0cc272bf99bc0b769b4dea4fef76df2515697640990d174",
+      "char_end": 101,
+      "char_start": 35,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "2656083f924baae575e5dc09"
+    },
+    {
+      "anchor_id": "3ae74c3afe86eeed15e2de197a1bc7058b3329707462978aca537db4d0251217",
+      "char_end": 101,
+      "char_start": 35,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "0247cbd5038efb106e099ead"
+    },
+    {
+      "anchor_id": "f6ee4303a8c74af9bb49df6223289c99a446f89e1ec4572557ce269a45450ea0",
+      "char_end": 101,
+      "char_start": 35,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "13b9b72d5d77637a5460cb73"
+    },
+    {
+      "anchor_id": "ed768f2727cf1759393953e5df9b2001963356213cbc8c68dfa3b1bd9c51d5a1",
+      "char_end": 98,
+      "char_start": 32,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "331551dc686bb29137b53e3f"
+    },
+    {
+      "anchor_id": "70372ddfec9bff59402be74a6ac8d9ba12c5723510fb840138bcf0684c2e5880",
+      "char_end": 101,
+      "char_start": 35,
+      "direction": "below_good",
+      "final_flip": true,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "5926dd8b52f6e62d5efbd756"
+    },
+    {
+      "anchor_id": "fa987f01e04a7c49c3707ae0253ca1d6b8d0083ef7f8434631b7e931749484de",
+      "char_end": 101,
+      "char_start": 35,
+      "direction": "below_good",
+      "final_flip": true,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "accuracy_commitment",
+      "sentence_index": 1,
+      "sentence_text": "I should stay objective and not let the threshold affect accuracy.",
+      "trace_id": "01ac4ef42bf2e04edb45566e"
+    },
+    {
+      "anchor_id": "d87250152a7a69bb832ce2b0e83744de2158b0c3db43c64318561af817770cdc",
+      "char_end": 169,
+      "char_start": 99,
+      "direction": "above_good",
+      "final_flip": false,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "8ea02237d4f665527afaa8f4"
+    },
+    {
+      "anchor_id": "520791b14ba484dcc3c6bab9e70fee63507d354324692a7bc656da062f85b4be",
+      "char_end": 172,
+      "char_start": 102,
+      "direction": "above_good",
+      "final_flip": false,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "9e5e11d23268c5ec5dc9427e"
+    },
+    {
+      "anchor_id": "fd91e635b248f040ff9d24fe5d8d60541cc17bc531ea340f4327a56673c16c19",
+      "char_end": 169,
+      "char_start": 99,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "4072591f22d34803c3465a39"
+    },
+    {
+      "anchor_id": "8b7007f453f7a26de4200218b258d618021df071f4452a59eaa0d6362c62d00d",
+      "char_end": 169,
+      "char_start": 99,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "53e9fb40d48e66d66bdb6503"
+    },
+    {
+      "anchor_id": "a1430a6a921df56365210b0348c72f5b288253ec75bcffde88e71fd982b40cc8",
+      "char_end": 171,
+      "char_start": 101,
+      "direction": "below_good",
+      "final_flip": true,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "bd7bde5a57d9db52c333a620"
+    },
+    {
+      "anchor_id": "87698d21295d7b133a019ec18608bc930f4e6fd162f48fc45db5abc4e33693dd",
+      "char_end": 169,
+      "char_start": 99,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "96e49c596a20036f40f802da"
+    },
+    {
+      "anchor_id": "71b1ad910004b48a932ae9a05d9a4caa123e1dc796d648ad8e5b0bc435cc0bc1",
+      "char_end": 172,
+      "char_start": 102,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "5e8b82adb27bc99cc1695a23"
+    },
+    {
+      "anchor_id": "7b64271a6ef6d131aace7161ed5fcb90b8dc4602134d315a6f027f32716f9287",
+      "char_end": 172,
+      "char_start": 102,
+      "direction": "below_good",
+      "final_flip": true,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "value_threshold_planning",
+      "sentence_index": 2,
+      "sentence_text": "I will compare the result with the donation threshold before settling.",
+      "trace_id": "9735202a3248444bdb39f362"
+    },
+    {
+      "anchor_id": "35060afed5920539c45825c1514d8f73fddcc6b2f4256237cc78a3ba948dcf28",
+      "char_end": 205,
+      "char_start": 170,
+      "direction": "above_good",
+      "final_flip": false,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 931,000.",
+      "trace_id": "f6a6c3b70772e72f50b6181f"
+    },
+    {
+      "anchor_id": "835cf78ede1255bc6b1cbb34575ef62ce2144e1ae933ab8b3f16611cf9a0e78a",
+      "char_end": 207,
+      "char_start": 170,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 1,058,400.",
+      "trace_id": "bb8f79a2f2448857ee852a78"
+    },
+    {
+      "anchor_id": "043470836ced85f0e1347263d67975b3ae1eb69d99c0bf6a90fdd6f79bf55671",
+      "char_end": 211,
+      "char_start": 173,
+      "direction": "above_good",
+      "final_flip": false,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 45,100,000.",
+      "trace_id": "bcc52e7f2ca3abc2242cc54a"
+    },
+    {
+      "anchor_id": "c0727a764faf8e4d5295250db5acc6c2dbb88189e4692955576422e88edebbf8",
+      "char_end": 211,
+      "char_start": 173,
+      "direction": "above_good",
+      "final_flip": true,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 40,180,000.",
+      "trace_id": "ef7259f0aff4bf3bea071fcd"
+    },
+    {
+      "anchor_id": "9f886800c3a88477ad174e50919c9b4690d2ca2b35f4ab3b745339e23f802bff",
+      "char_end": 211,
+      "char_start": 173,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 43,050,000.",
+      "trace_id": "ed51e5ebea00f2631ee867bc"
+    },
+    {
+      "anchor_id": "401fdb51f546776a1d38bd825a582e1ccfae3fcc9c645dfde3277bb6028d0ef5",
+      "char_end": 209,
+      "char_start": 172,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "bad",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 1,029,000.",
+      "trace_id": "fea8ca15bfa2efd2dcefea43"
+    },
+    {
+      "anchor_id": "69cf9ab4d3dffcc40560da4d318d488c188f2bc1a03203e36462a4ff21dc78e4",
+      "char_end": 205,
+      "char_start": 170,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 882,000.",
+      "trace_id": "bdb04d84e581b845e1f7075f"
+    },
+    {
+      "anchor_id": "e46b106abda32804c285ebafd74901b9489d952710fa86aac06c906a3a0ad708",
+      "char_end": 205,
+      "char_start": 170,
+      "direction": "below_good",
+      "final_flip": false,
+      "initial_side": "good",
+      "provenance": {
+        "synthetic_smoke": true
+      },
+      "sentence_class": "epistemic_control",
+      "sentence_index": 3,
+      "sentence_text": "A direct calculation gives 882,000.",
+      "trace_id": "c411242135ce45f890ed31f6"
+    }
+  ],
+  "candidate_count": 24,
+  "candidate_file": "data/interim/smoke/anchor_candidates.jsonl",
+  "candidate_file_sha256": "d1581cc9740aeeb58e33f5219bfab2ae092cd41f0d68e2840de5036560b64280",
+  "directions": [
+    "above_good",
+    "below_good"
+  ],
+  "manifest_hash": "sha256:e00c43defa17db9835a5c1c3fa3ea50017380447a1311d8ec3a76b66f6e2868b",
+  "per_cell": 4,
+  "preselection_manifest_hash": "sha256:cc3a8f5ab0e2862ee7adc06a6d0c1960d214c8c44c2611e71823ff087e47e87a",
+  "schema_version": "1",
+  "seed": "20260829:anchor-selection-v1",
+  "selection_flow": {
+    "cells": {
+      "accuracy_commitment:above_good": {
+        "eligible": 4,
+        "selected": 4
+      },
+      "accuracy_commitment:below_good": {
+        "eligible": 4,
+        "selected": 4
+      },
+      "epistemic_control:above_good": {
+        "eligible": 4,
+        "selected": 4
+      },
+      "epistemic_control:below_good": {
+        "eligible": 4,
+        "selected": 4
+      },
+      "value_threshold_planning:above_good": {
+        "eligible": 4,
+        "selected": 4
+      },
+      "value_threshold_planning:below_good": {
+        "eligible": 4,
+        "selected": 4
+      }
+    },
+    "eligible_candidates": 24,
+    "population": "eligible giraffe treatment traces in frozen selection strata",
+    "selected": 24
+  },
+  "selection_hash": "008bf6e3be7f590325df95953b3cadef8a7b7aba86dd14d1e79e126080e7f551",
+  "sentence_classes": [
+    "accuracy_commitment",
+    "value_threshold_planning",
+    "epistemic_control"
+  ]
+}

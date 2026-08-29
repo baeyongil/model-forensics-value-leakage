@@ -1,0 +1,58 @@
+schema_version: 2
+resolved_at_utc: "2026-08-29T15:56:00Z"
+source_repositories:
+  jacobian_lens:
+    url: https://github.com/anthropics/jacobian-lens.git
+    commit: 581d398613e5602a5af361e1c34d3a92ea82ba8e
+  transformers:
+    url: https://github.com/huggingface/transformers.git
+    commit: 42ca97014c85d71a88ad60d55f08cb9fb4d26e2c
+  vllm:
+    url: https://github.com/vllm-project/vllm.git
+    release: 0.28.0
+    install_route: official_pypi_release_wheel
+    wheel_url: >-
+      https://files.pythonhosted.org/packages/87/d7/97f6ecc2ae883e601e08d7cef87cb54ececeefcfe6b5e12d5d92f8d06d6b/vllm-0.28.0-cp38-abi3-manylinux_2_28_x86_64.whl
+    wheel_sha256: addb0ffdaafd8155d75e9b3f5ddb3da28fdee9e8a7097ede91f7db2e9e1a3889
+    wheel_platform: manylinux_2_28_x86_64
+    bundled_cuda: "13.0"
+    torch: "2.13.0"
+    transformers_requirement: ">=5.5.3"
+container_image:
+  reference: vllm/vllm-openai@sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14
+  tag_observed: v0.28.0
+  registry_manifest_list_sha256: 61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14
+  linux_amd64_manifest_sha256: 2286e8533ca8b6bc777594bae30524f1426ba46ca21797524e06df6a94b06635
+notes:
+  - The stable vLLM wheel URL and SHA-256 were resolved from the official PyPI JSON API.
+  - Exact installed distributions and hashes are captured again on the GPU host.
+  - The GPU host must satisfy the official CUDA 13 driver/compatibility requirements.
+  - The official vLLM image is pinned by registry manifest-list digest; local preflight records the selected linux/amd64 digest.
+  - Model and lens Hub commits are revalidated immediately before the primary run.
+hub_revisions:
+  qwen35_122b_a10b: dc4d348443bc740c68e2d77492492c11606384d5
+  qwen35_27b_fallback: fc05daec18b0a78c049392ed2e771dde82bdf654
+  qwen35_4b_smoke: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  workspace_lenses: d740106d1e0f95456dc8718fba2895e9c8ffd6ef
+lens_lfs_objects:
+  qwen35_122b_a10b:
+    j_sha256: 961bbb0e1e9362dda57812080fd3cb860bba891799ddbd4ebd89088540ed7842
+    j_size_bytes: 887106103
+    r_sha256: 8093ae27ac100ce5ba18e6b4525c1cc394d1c32c03b0607b0cf3b5ebcd7bf2ee
+    r_size_bytes: 887106295
+    embedded_metadata:
+      model_id: Qwen/Qwen3.5-122B-A10B
+      d_model: 3072
+      source_layers: [0, 46]
+      preregistered_analysis_layers: [4, 46]
+      target_layer: 46
+      skip_first: 4
+      n_prompts: 25
+      dataset_id: NeelNanda/pile-10k
+      j_estimator: standard
+      r_estimator: relp
+  qwen35_27b_methodological_fallback:
+    j_sha256: 308a49842eea7085f93f0b3fd81a77288a2f923f14e3264d3c727088cdf3b916
+    j_size_bytes: 3303028503
+    r_sha256: 3584be12b2ed8ddd85f68a1105afa84491d1937c250c1fdf6b35d4f6540403d9
+    r_size_bytes: 3303028631

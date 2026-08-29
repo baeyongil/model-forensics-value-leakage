@@ -1,0 +1,137 @@
+{
+  "all_exact_single_token": true,
+  "manifest_hash": "sha256:8a0f607233d8ca5ae788276981dd995f081cd3f4a7f7ce069221c59b4720f91d",
+  "model_id": "Qwen/Qwen3.5-122B-A10B",
+  "probe_count": 18,
+  "records": [
+    {
+      "concept": "direction",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 38453,
+      "word": " upward"
+    },
+    {
+      "concept": "direction",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 5096,
+      "word": " increase"
+    },
+    {
+      "concept": "direction",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 68304,
+      "word": " inflate"
+    },
+    {
+      "concept": "direction",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 43001,
+      "word": " downward"
+    },
+    {
+      "concept": "direction",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 17921,
+      "word": " decrease"
+    },
+    {
+      "concept": "direction",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 89495,
+      "word": " deflate"
+    },
+    {
+      "concept": "valence",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 22957,
+      "word": " beneficial"
+    },
+    {
+      "concept": "valence",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 10631,
+      "word": " helpful"
+    },
+    {
+      "concept": "valence",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 22135,
+      "word": " charity"
+    },
+    {
+      "concept": "valence",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 26857,
+      "word": " harmful"
+    },
+    {
+      "concept": "valence",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 32243,
+      "word": " damaging"
+    },
+    {
+      "concept": "valence",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 15866,
+      "word": " penalty"
+    },
+    {
+      "concept": "epistemic",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 16050,
+      "word": " objective"
+    },
+    {
+      "concept": "epistemic",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 65441,
+      "word": " impartial"
+    },
+    {
+      "concept": "epistemic",
+      "polarity": "positive",
+      "single_token": true,
+      "token_id": 86775,
+      "word": " truthful"
+    },
+    {
+      "concept": "epistemic",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 46073,
+      "word": " biased"
+    },
+    {
+      "concept": "epistemic",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 77507,
+      "word": " deceptive"
+    },
+    {
+      "concept": "epistemic",
+      "polarity": "negative",
+      "single_token": true,
+      "token_id": 83484,
+      "word": " skewed"
+    }
+  ],
+  "schema_version": 1,
+  "tokenizer_revision": "dc4d348443bc740c68e2d77492492c11606384d5",
+  "trust_remote_code": false
+}

@@ -1,0 +1,54 @@
+schema_version: 1
+timezone: America/Chicago
+entries:
+- category: condition_and_anchor_freeze
+  minutes: 36
+  description: Finalize frozen anchor eligibility, production intervention contract,
+    and paid-run gates.
+  status: counted
+  started_at: '2026-08-29T15:33:07.432685+00:00'
+  ended_at: '2026-08-29T16:08:18.172807+00:00'
+  elapsed_seconds: 2110.740122
+- category: condition_and_anchor_freeze
+  minutes: 11
+  description: Integrate frozen paid execution contracts and split phase interfaces.
+  status: counted
+  started_at: '2026-08-29T16:35:26.524562+00:00'
+  ended_at: '2026-08-29T16:45:34.549555+00:00'
+  elapsed_seconds: 608.024993
+- category: condition_and_anchor_freeze
+  minutes: 5
+  description: Harden remaining paid phase boundaries and resumable execution order.
+  status: counted
+  started_at: '2026-08-29T16:53:02.760923+00:00'
+  ended_at: '2026-08-29T16:57:58.294766+00:00'
+  elapsed_seconds: 295.533843
+- category: condition_and_anchor_freeze
+  minutes: 10
+  description: Integrate final paid phase boundaries, resume safety, and execution
+    interface.
+  status: counted
+  started_at: '2026-08-29T16:58:44.484375+00:00'
+  ended_at: '2026-08-29T17:08:22.199574+00:00'
+  elapsed_seconds: 577.715199
+- category: robustness_statistics
+  minutes: 10
+  description: Close confirmatory inference tiers, outcome-independent selection,
+    and observational lens safeguards before paid execution
+  status: counted
+  started_at: '2026-08-29T17:55:54.202803+00:00'
+  ended_at: '2026-08-29T18:05:42.135373+00:00'
+  elapsed_seconds: 587.93257
+categories:
+  counted:
+    hypotheses_and_preregistration: 35
+    condition_and_anchor_freeze: 45
+    behavior_and_resampling_analysis: 75
+    lens_analysis: 70
+    robustness_statistics: 45
+    synthesis_and_core_figures: 30
+  excluded_but_logged:
+  - replication
+  - sentence_resampling_generation
+  - model_and_lens_download
+  - document_production

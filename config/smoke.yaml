@@ -1,0 +1,40 @@
+schema_version: 1
+profile: qwen35_4b_smoke
+preregistration: config/preregistration.yaml
+
+model:
+  id: Qwen/Qwen3.5-4B
+  revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  require_pinned_revision: false
+  dtype: bfloat16
+  tensor_parallel_size: 1
+  max_model_len: 8192
+  language_model_only: true
+
+lenses:
+  repository: camilablank/workspace-lenses
+  revision: d740106d1e0f95456dc8718fba2895e9c8ffd6ef
+  require_pinned_revision: false
+  j_filename: qwen3.5-4b/j-lens/lens.pt
+  r_filename: qwen3.5-4b/r-lens/lens.pt
+
+upstream:
+  repository: https://github.com/adsingh-64/value-leakage.git
+  commit: 16d129859e1f0e281363fb4f5910bcaeea316b10
+  cache_dir: data/upstream/value-leakage
+
+paths:
+  raw_dir: data/raw/smoke
+  interim_dir: data/interim/smoke
+  manifest_dir: data/manifests/smoke
+  figure_dir: reports/figures/smoke
+  report_dir: reports/staging/smoke
+
+execution:
+  backend: fake_or_transformers
+  secret_env:
+    hugging_face: HF_TOKEN
+  gpu_cost_hard_stop_usd: 0.0
+  api_cost_hard_stop_usd: 0.0
+  total_cost_hard_stop_usd: 0.0
+  terminate_compute_after_sync: true
