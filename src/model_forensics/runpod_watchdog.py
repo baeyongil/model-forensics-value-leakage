@@ -1,14 +1,16 @@
 """Fail-closed RunPod GPU-cost watchdog.
 
-The watchdog uses RunPod's v2 live Pod metadata rather than a caller-supplied
-hourly rate. It runs independently from the experiment and only sends the
-non-destructive ``{"action":"stop"}`` Pod action. Pod deletion remains an
+The watchdog uses RunPod's supported REST v1 Pod metadata rather than a
+caller-supplied hourly rate.  It runs independently from the experiment and
+only invokes the non-destructive Pod stop endpoint.  Pod deletion remains an
 explicit post-sync operation.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
+import ipaddress
 import json
 import math
 import os
@@ -22,13 +24,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from model_forensics.io import write_json
+from model_forensics.io import stable_hash, write_json
 
-RUNPOD_API_BASE = "https://api.runpod.io/v2"
-RUNPOD_REST_BASE = RUNPOD_API_BASE
-RUNPOD_POD_LOOKUP_DOC = "https://api.runpod.io/v2/openapi.yaml"
-RUNPOD_POD_STOP_DOC = "https://api.runpod.io/v2/openapi.yaml"
+RUNPOD_REST_BASE = "https://rest.runpod.io/v1"
+RUNPOD_API_BASE = RUNPOD_REST_BASE
+RUNPOD_POD_LOOKUP_DOC = "https://docs.runpod.io/api-reference/pods/GET/pods/podId"
+RUNPOD_POD_STOP_DOC = "https://docs.runpod.io/api-reference/pods/POST/pods/podId/stop"
 WATCHDOG_VERSION = "runpod-gpu-cost-watchdog-v2"
+PROVIDER_API = "rest-v1"
 _POD_ID_RE = re.compile(r"[A-Za-z0-9_-]{3,128}\Z")
 _GPU_FAMILY_RE = {
     "H100": re.compile(r"(?:^|[^A-Z0-9])H100(?:$|[^A-Z0-9])", re.IGNORECASE),
@@ -42,6 +45,10 @@ _EXPECTED_FAMILY_ALIASES = {
 }
 _TERMINAL_STATUSES = frozenset({"EXITED", "TERMINATED"})
 _CONTAINER_DIGEST_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+_RUNPOD_GO_TIMESTAMP_RE = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))? (?P<offset>[+-]\d{4}) UTC\Z"
+)
 _EXPECTED_CONTAINER_DISK_GB = 50
 _EXPECTED_VOLUME_DISK_GB = 650
 _EXPECTED_VOLUME_MOUNT_PATH = "/workspace"
@@ -55,6 +62,7 @@ _EXPECTED_STATIC_ENV = {
 }
 _EXPECTED_SECRET_ENV_KEYS = frozenset({"HF_TOKEN", "GPU_BUDGET_SESSION_ID"})
 _ALLOWED_PROVIDER_ENV_KEYS = frozenset({"PUBLIC_KEY"})
+_NAMESPACED_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class WatchdogError(RuntimeError):
@@ -78,6 +86,7 @@ class WatchdogLimits:
     maximum_approved_hourly_total_usd: float | None = None
     maximum_approved_storage_hourly_usd: float = 0.0
     prior_committed_gpu_usd: float = 0.0
+    maximum_approved_compute_hourly_usd: float | None = None
 
     def __post_init__(self) -> None:
         numeric = (
@@ -104,6 +113,26 @@ class WatchdogLimits:
             raise ValueError("maximum approved hourly total must be positive and finite")
         if approved is not None and self.maximum_approved_storage_hourly_usd >= approved:
             raise ValueError("approved storage hourly cost must be below the all-in hourly total")
+        approved_compute = self.maximum_approved_compute_hourly_usd
+        if approved_compute is not None and (
+            isinstance(approved_compute, bool)
+            or not math.isfinite(float(approved_compute))
+            or approved_compute <= 0
+        ):
+            raise ValueError("maximum approved compute hourly cost must be positive and finite")
+        if approved_compute is not None and approved is not None and not math.isclose(
+            approved_compute + self.maximum_approved_storage_hourly_usd,
+            approved,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError("approved compute plus storage must equal the all-in hourly total")
+        if (
+            approved_compute is None
+            and approved is not None
+            and approved - self.maximum_approved_storage_hourly_usd <= 0
+        ):
+            raise ValueError("all-in hourly total leaves no approved compute hourly cost")
         if self.prior_committed_gpu_usd >= self.global_safe_budget_usd:
             raise ValueError("prior committed GPU cost leaves no safety-adjusted GPU budget")
 
@@ -115,41 +144,56 @@ class WatchdogLimits:
     def safe_budget_usd(self) -> float:
         return self.global_safe_budget_usd - self.prior_committed_gpu_usd
 
+    @property
+    def approved_compute_hourly_usd(self) -> float | None:
+        """Return the compute-only ceiling, excluding separately billed storage."""
+
+        if self.maximum_approved_compute_hourly_usd is not None:
+            return self.maximum_approved_compute_hourly_usd
+        if self.maximum_approved_hourly_total_usd is None:
+            return None
+        return self.maximum_approved_hourly_total_usd - self.maximum_approved_storage_hourly_usd
+
 
 @dataclass(frozen=True, slots=True)
 class PodMetadata:
-    """Secret-free subset of the authoritative RunPod v2 Pod response."""
+    """Secret-free subset of the authoritative RunPod REST v1 Pod response."""
 
     pod_id: str
+    pod_name: str
     gpu_count: int
     provider_gpu_id: str
     gpu_display_name: str
-    runtime_gpu_count: int
+    runtime_gpu_count: int | None
+    machine_id_hash: str
     execution_identity_hash: str
     data_center_id: str
-    cuda_version: str
+    cuda_version: str | None
     secure_cloud: bool
     container_image: str
     container_disk_gb: int
     persistent_volume_disk_gb: int
     persistent_volume_mount_path: str
     ports: tuple[str, ...]
-    global_networking_enabled: bool
+    global_networking_enabled: bool | None
     ssh_ready: bool
+    direct_ssh_ready: bool
+    direct_ssh_endpoint_hash: str | None
     environment_verified: bool
     desired_status: str
     cost_per_hr: float
     adjusted_cost_per_hr: float
     last_started_at: datetime
     observed_at: datetime
-    locked: bool
+    locked: bool | None
+    interruptible: bool | None
     network_volume_attached: bool
 
     @property
     def effective_hourly_usd(self) -> float:
-        # The v2 Pod resource exposes ``cost`` as the current compute rate.  The
+        # Conservatively use the larger of the list and adjusted rates.  The
         # frozen storage rate is added separately by ``run_watchdog``.
-        return self.adjusted_cost_per_hr
+        return max(self.cost_per_hr, self.adjusted_cost_per_hr)
 
     @property
     def runtime_seconds(self) -> float:
@@ -166,11 +210,21 @@ class PodMetadata:
         """Return only non-secret fields safe to persist in a public manifest."""
 
         return {
+            "provider_api": PROVIDER_API,
+            "provider_evidence_unavailable": [
+                "cuda_version",
+                "global_networking_enabled",
+                "interruptible",
+                "locked",
+                "runtime_gpu_count",
+            ],
             "pod_id": self.pod_id,
+            "pod_name": self.pod_name,
             "gpu_count": self.gpu_count,
             "provider_gpu_id": self.provider_gpu_id,
             "gpu_display_name": self.gpu_display_name,
             "runtime_gpu_count": self.runtime_gpu_count,
+            "machine_id_hash": self.machine_id_hash,
             "execution_identity_hash": self.execution_identity_hash,
             "data_center_id": self.data_center_id,
             "cuda_version": self.cuda_version,
@@ -180,8 +234,14 @@ class PodMetadata:
             "persistent_volume_disk_gb": self.persistent_volume_disk_gb,
             "persistent_volume_mount_path": self.persistent_volume_mount_path,
             "ports": list(self.ports),
-            "global_networking_enabled": self.global_networking_enabled,
+            # These fields are deliberately null because the currently
+            # returned REST v1 schema does not attest to them.  If optional
+            # fields appear, they may tighten in-memory rejection but are not
+            # elevated into portable evidence.
+            "global_networking_enabled": None,
             "ssh_ready": self.ssh_ready,
+            "direct_ssh_ready": self.direct_ssh_ready,
+            "direct_ssh_endpoint_hash": self.direct_ssh_endpoint_hash,
             "environment_verified": self.environment_verified,
             "desired_status": self.desired_status,
             "cost_per_hr": self.cost_per_hr,
@@ -189,7 +249,8 @@ class PodMetadata:
             "effective_hourly_usd": self.effective_hourly_usd,
             "last_started_at": self.last_started_at.isoformat(),
             "observed_at": self.observed_at.isoformat(),
-            "locked": self.locked,
+            "locked": None,
+            "interruptible": None,
             "network_volume_attached": self.network_volume_attached,
         }
 
@@ -212,7 +273,7 @@ class DerivedDeadline:
 
 
 MetadataTransport = Callable[[str, str, float], tuple[int, str]]
-StopTransport = Callable[[str, str, float, Mapping[str, str]], tuple[int, str]]
+StopTransport = Callable[[str, str, float, Mapping[str, str] | None], tuple[int, str]]
 
 
 def _default_transport(
@@ -257,7 +318,7 @@ def _default_stop_transport(
     url: str,
     api_key: str,
     timeout: float,
-    payload: Mapping[str, str],
+    payload: Mapping[str, str] | None,
 ) -> tuple[int, str]:
     return _default_transport(url, api_key, timeout, method="POST", payload=payload)
 
@@ -271,8 +332,22 @@ def _parse_timestamp(value: Any, *, field: str) -> datetime:
         raise WatchdogError(f"RunPod metadata field {field} must be a nonempty timestamp")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise WatchdogError(f"RunPod metadata field {field} is not ISO-8601") from exc
+    except ValueError:
+        # The live REST v1 service currently serializes lastStartedAt using
+        # Go's ``String`` form (for example ``... +0000 UTC``), despite the
+        # OpenAPI contract documenting ISO-8601.  Accept only that exact second
+        # provider form; do not fall back to a permissive date parser.
+        match = _RUNPOD_GO_TIMESTAMP_RE.fullmatch(value)
+        if match is None:
+            raise WatchdogError(
+                f"RunPod metadata field {field} is neither ISO-8601 nor RunPod Go time"
+            ) from None
+        fraction = (match.group("fraction") or "0")[:6].ljust(6, "0")
+        normalized = f"{match.group('date')}.{fraction} {match.group('offset')}"
+        try:
+            parsed = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S.%f %z")
+        except ValueError as exc:  # pragma: no cover - regex already constrains shape
+            raise WatchdogError(f"RunPod metadata field {field} is malformed") from exc
     if parsed.tzinfo is None:
         raise WatchdogError(f"RunPod metadata field {field} must include a timezone")
     return parsed.astimezone(UTC)
@@ -299,16 +374,20 @@ def _parse_container_digest(value: Any, *, field: str) -> str:
 def _execution_identity_hash(
     *,
     pod_id: str,
+    pod_name: str,
     started_at: datetime,
+    machine_id: str,
     provider_gpu_id: str,
     data_center_id: str,
-    cuda_version: str,
+    container_image: str,
 ) -> str:
     canonical = json.dumps(
         {
-            "cuda_version": cuda_version,
+            "container_image": container_image,
             "data_center_id": data_center_id,
+            "machine_id": machine_id,
             "pod_id": pod_id,
+            "pod_name": pod_name,
             "provider_gpu_id": provider_gpu_id,
             "started_at": started_at.isoformat(),
         },
@@ -316,8 +395,21 @@ def _execution_identity_hash(
         sort_keys=True,
         separators=(",", ":"),
     )
-    digest = hashlib.sha256(f"runpod-v2-execution-identity-v1:{canonical}".encode()).hexdigest()
+    digest = hashlib.sha256(
+        f"runpod-rest-v1-execution-identity-v1:{canonical}".encode()
+    ).hexdigest()
     return f"sha256:{digest}"
+
+
+def _opaque_hash(namespace: str, value: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        dict(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return f"sha256:{hashlib.sha256(f'{namespace}:{canonical}'.encode()).hexdigest()}"
 
 
 def _parse_exact_positive_integer(value: Any, *, field: str) -> int:
@@ -329,177 +421,286 @@ def _parse_exact_positive_integer(value: Any, *, field: str) -> int:
     return parsed
 
 
-def _validate_secret_environment(value: Any) -> None:
-    """Validate approval-bound environment shape without returning secret values."""
+def _validate_secret_environment(
+    value: Any,
+    *,
+    expected_session_hash: str,
+    expected_hf_token_hash: str,
+) -> None:
+    """Bind provider secrets in memory without returning or persisting their values."""
+
+    if (
+        _NAMESPACED_HASH_RE.fullmatch(expected_session_hash) is None
+        or _NAMESPACED_HASH_RE.fullmatch(expected_hf_token_hash) is None
+    ):
+        raise WatchdogError("watchdog secret-binding hashes are malformed")
 
     if not isinstance(value, Mapping) or not all(
         isinstance(key, str) and isinstance(item, str) for key, item in value.items()
     ):
-        raise WatchdogError("RunPod v2 environment is missing or malformed")
+        raise WatchdogError("RunPod REST v1 environment is missing or malformed")
     allowed = set(_EXPECTED_STATIC_ENV) | _EXPECTED_SECRET_ENV_KEYS | _ALLOWED_PROVIDER_ENV_KEYS
-    if set(value) - allowed or not (
-        set(_EXPECTED_STATIC_ENV) | _EXPECTED_SECRET_ENV_KEYS
-    ).issubset(value):
-        raise WatchdogError("RunPod v2 environment violates the approval-bound allow-list")
+    if set(value) - allowed or not (set(_EXPECTED_STATIC_ENV) | _EXPECTED_SECRET_ENV_KEYS).issubset(
+        value
+    ):
+        raise WatchdogError("RunPod REST v1 environment violates the approval-bound allow-list")
     if any(not value[key] for key in _EXPECTED_SECRET_ENV_KEYS):
-        raise WatchdogError("RunPod v2 environment is missing an approval-bound secret")
+        raise WatchdogError("RunPod REST v1 environment is missing an approval-bound secret")
     if any(value.get(key) != expected for key, expected in _EXPECTED_STATIC_ENV.items()):
-        raise WatchdogError("RunPod v2 compatibility/cache environment drifted")
+        raise WatchdogError("RunPod REST v1 compatibility/cache environment drifted")
+    observed_session_hash = stable_hash(
+        {"opaque_gpu_session_id": value["GPU_BUDGET_SESSION_ID"]}
+    )
+    observed_hf_token_hash = stable_hash({"hf_token": value["HF_TOKEN"]})
+    if not hmac.compare_digest(observed_session_hash, expected_session_hash):
+        raise WatchdogError("RunPod REST v1 GPU session identity disagrees with approval")
+    if not hmac.compare_digest(observed_hf_token_hash, expected_hf_token_hash):
+        raise WatchdogError("RunPod REST v1 Hugging Face credential identity drifted")
     public_key = value.get("PUBLIC_KEY")
     if public_key is not None and (not public_key.strip() or len(public_key) > 65536):
-        raise WatchdogError("RunPod v2 provider-managed SSH environment is malformed")
+        raise WatchdogError("RunPod REST v1 provider-managed SSH environment is malformed")
 
 
-def _ssh_ready(value: Any) -> bool:
-    if not isinstance(value, Mapping):
-        raise WatchdogError("RunPod v2 SSH metadata is missing or malformed")
-    ready = False
-    for kind in ("proxy", "direct"):
-        endpoint = value.get(kind)
-        if endpoint is None:
+def _direct_ssh_evidence(
+    public_ip: Any,
+    port_mappings: Any,
+    *,
+    required: bool,
+) -> tuple[bool, str | None]:
+    """Validate direct SSH routing without persisting the address or port."""
+
+    absent = public_ip in (None, "") and port_mappings in (None, {})
+    if absent and not required:
+        return False, None
+    if not isinstance(public_ip, str) or not public_ip:
+        raise WatchdogError("RunPod REST v1 direct SSH publicIp is unavailable")
+    try:
+        parsed_ip = ipaddress.ip_address(public_ip)
+    except ValueError as exc:
+        raise WatchdogError("RunPod REST v1 direct SSH publicIp is malformed") from exc
+    if parsed_ip.version != 4:
+        raise WatchdogError("RunPod REST v1 direct SSH publicIp must be IPv4")
+    if not isinstance(port_mappings, Mapping) or set(port_mappings) != {"22"}:
+        raise WatchdogError("RunPod REST v1 direct SSH portMappings are not SSH-only")
+    port = port_mappings.get("22")
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        raise WatchdogError("RunPod REST v1 direct SSH port mapping is malformed")
+    return True, _opaque_hash(
+        "runpod-rest-v1-direct-ssh-v1",
+        {"public_ip": str(parsed_ip), "public_port": port},
+    )
+
+
+def _reconcile_aliases(*values: Any, field: str) -> Any:
+    present = [value for value in values if value is not None]
+    if not present:
+        raise WatchdogError(f"RunPod REST v1 metadata field {field} is missing")
+    if any(value != present[0] for value in present[1:]):
+        raise WatchdogError(f"RunPod REST v1 metadata aliases for {field} disagree")
+    return present[0]
+
+
+def _optional_boolean(payload: Mapping[str, Any], field: str) -> bool | None:
+    if field not in payload:
+        return None
+    value = payload[field]
+    if not isinstance(value, bool):
+        raise WatchdogError(f"RunPod REST v1 metadata field {field} must be boolean")
+    return value
+
+
+def _optional_global_networking(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, Mapping) and isinstance(value.get("enabled"), bool):
+        return bool(value["enabled"])
+    raise WatchdogError("RunPod REST v1 globalNetworking metadata is malformed")
+
+
+def _network_volume_attached(payload: Mapping[str, Any]) -> bool:
+    """Reconcile every supported network-volume alias and reject split-brain metadata."""
+
+    network_volume = payload.get("networkVolume")
+    nested_identifiers: list[str] = []
+    object_present = network_volume is not None
+    if isinstance(network_volume, Mapping):
+        for key in ("id", "networkVolumeId", "networkVolumeID"):
+            if key not in network_volume or network_volume[key] is None:
+                continue
+            value = network_volume[key]
+            if not isinstance(value, str) or not value.strip():
+                raise WatchdogError("RunPod REST v1 network volume identity is malformed")
+            nested_identifiers.append(value.strip())
+    elif isinstance(network_volume, str):
+        if not network_volume.strip():
+            raise WatchdogError("RunPod REST v1 network volume identity is malformed")
+        nested_identifiers.append(network_volume.strip())
+    elif network_volume is not None:
+        raise WatchdogError("RunPod REST v1 networkVolume metadata is malformed")
+
+    alias_identifiers: list[str] = []
+    for key in ("networkVolumeId", "networkVolumeID", "network_volume_id"):
+        if key not in payload or payload[key] is None:
             continue
-        if not isinstance(endpoint, Mapping):
-            raise WatchdogError("RunPod v2 SSH endpoint is malformed")
-        host = endpoint.get("host")
-        username = endpoint.get("username")
-        port = endpoint.get("port")
-        if (
-            not isinstance(host, str)
-            or not host.strip()
-            or not isinstance(username, str)
-            or not username.strip()
-            or isinstance(port, bool)
-            or not isinstance(port, int)
-            or not 0 < port < 65536
-        ):
-            raise WatchdogError("RunPod v2 SSH endpoint is malformed")
-        ready = True
-    if not ready:
-        raise WatchdogError("RunPod v2 SSH endpoint is not ready")
-    return True
+        value = payload[key]
+        if not isinstance(value, str) or not value.strip():
+            raise WatchdogError("RunPod REST v1 network volume alias is malformed")
+        alias_identifiers.append(value.strip())
+
+    identifiers = [*nested_identifiers, *alias_identifiers]
+    if identifiers and any(value != identifiers[0] for value in identifiers[1:]):
+        raise WatchdogError("RunPod REST v1 network volume aliases disagree")
+    return object_present or bool(alias_identifiers)
 
 
 def parse_pod_metadata(
     payload: Mapping[str, Any],
     *,
     expected_pod_id: str,
+    expected_session_hash: str,
+    expected_hf_token_hash: str,
     observed_at: datetime,
 ) -> PodMetadata:
-    """Parse and sanitize a live ``GET /v2/pods/{id}`` response.
+    """Parse and sanitize a live ``GET /v1/pods/{id}`` response.
 
-    The v2 response includes ``env`` and SSH routing details.  Both are
-    validated in memory and deliberately discarded before state persistence.
+    The response includes ``env`` and direct SSH routing details.  Secret
+    values and endpoint coordinates are validated in memory and deliberately
+    discarded before state persistence.
     """
 
     if payload.get("id") != expected_pod_id:
         raise WatchdogError("RunPod metadata returned a different Pod id")
-    gpu = payload.get("gpu")
-    if not isinstance(gpu, Mapping):
-        raise WatchdogError("RunPod metadata is missing the GPU object")
-    count = _parse_exact_positive_integer(gpu.get("count"), field="gpu.count")
-    provider_gpu_id = gpu.get("id")
+    pod_name = payload.get("name")
+    if not isinstance(pod_name, str) or not pod_name.strip():
+        raise WatchdogError("RunPod REST v1 metadata name must be nonempty")
+
+    machine = payload.get("machine")
+    if not isinstance(machine, Mapping):
+        raise WatchdogError("RunPod REST v1 machine metadata is missing")
+    provider_gpu_id = machine.get("gpuTypeId")
     if not isinstance(provider_gpu_id, str) or not provider_gpu_id.strip():
-        raise WatchdogError("RunPod metadata gpu.id must be nonempty")
-    display_name = gpu.get("displayName", provider_gpu_id)
-    if not isinstance(display_name, str) or not display_name.strip():
-        raise WatchdogError("RunPod metadata GPU display identity must be nonempty")
-
-    cloud = payload.get("cloud")
-    if not isinstance(cloud, str) or not cloud:
-        raise WatchdogError("RunPod v2 metadata cloud must be nonempty")
-    data_center_id = payload.get("dataCenterId")
+        raise WatchdogError("RunPod REST v1 machine.gpuTypeId must be nonempty")
+    provider_gpu_id = provider_gpu_id.strip()
+    data_center_id = machine.get("dataCenterId")
     if not isinstance(data_center_id, str) or not data_center_id.strip():
-        raise WatchdogError("RunPod v2 metadata has no dataCenterId")
-    cuda_version = payload.get("cudaVersion")
-    if not isinstance(cuda_version, str) or not cuda_version.strip():
-        raise WatchdogError("RunPod v2 metadata has no cudaVersion")
-    desired_status = payload.get("status")
-    if desired_status not in {"RUNNING", "EXITED", "TERMINATED"}:
-        raise WatchdogError("RunPod v2 metadata status is unsupported")
-    locked = payload.get("locked")
-    if not isinstance(locked, bool):
-        raise WatchdogError("RunPod metadata locked flag must be boolean")
+        raise WatchdogError("RunPod REST v1 machine metadata has no dataCenterId")
+    secure_cloud = machine.get("secureCloud")
+    if not isinstance(secure_cloud, bool):
+        raise WatchdogError("RunPod REST v1 machine.secureCloud must be boolean")
+    machine_id = payload.get("machineId")
+    if not isinstance(machine_id, str) or not machine_id.strip():
+        raise WatchdogError("RunPod REST v1 machineId must be nonempty")
 
-    container_disk_gb = _parse_exact_positive_integer(payload.get("disk"), field="disk")
-    mounts = payload.get("mounts")
-    if not isinstance(mounts, Mapping) or set(mounts) != {"persistent"}:
-        raise WatchdogError("RunPod v2 persistent mount metadata is missing or unexpected")
-    if payload.get("networkVolume") is not None:
-        raise WatchdogError("RunPod v2 Pod unexpectedly has a network volume")
-    persistent = mounts.get("persistent")
-    if not isinstance(persistent, Mapping):
-        raise WatchdogError("RunPod v2 persistent mount metadata is malformed")
-    volume_disk_gb = _parse_exact_positive_integer(
-        persistent.get("size"), field="mounts.persistent.size"
+    gpu = payload.get("gpu")
+    if gpu is not None and not isinstance(gpu, Mapping):
+        raise WatchdogError("RunPod REST v1 gpu metadata is malformed")
+    nested_count = gpu.get("count") if isinstance(gpu, Mapping) else None
+    count = _parse_exact_positive_integer(
+        _reconcile_aliases(payload.get("gpuCount"), nested_count, field="gpuCount"),
+        field="gpuCount",
     )
-    volume_mount_path = persistent.get("path")
+    if isinstance(gpu, Mapping) and gpu.get("id") is not None and gpu.get("id") != provider_gpu_id:
+        raise WatchdogError("RunPod REST v1 GPU and machine identities disagree")
+    display_candidates = (
+        machine.get("gpuDisplayName"),
+        gpu.get("displayName") if isinstance(gpu, Mapping) else None,
+        provider_gpu_id,
+    )
+    display_name = next(
+        (value.strip() for value in display_candidates if isinstance(value, str) and value.strip()),
+        provider_gpu_id,
+    )
+
+    desired_status = payload.get("desiredStatus")
+    if desired_status not in {"RUNNING", "EXITED", "TERMINATED"}:
+        raise WatchdogError("RunPod REST v1 metadata desiredStatus is unsupported")
+    locked = _optional_boolean(payload, "locked")
+    interruptible = _optional_boolean(payload, "interruptible")
+
+    container_disk_gb = _parse_exact_positive_integer(
+        payload.get("containerDiskInGb"), field="containerDiskInGb"
+    )
+    volume_disk_gb = _parse_exact_positive_integer(payload.get("volumeInGb"), field="volumeInGb")
+    volume_mount_path = payload.get("volumeMountPath", payload.get("mount"))
     if not isinstance(volume_mount_path, str) or not volume_mount_path:
-        raise WatchdogError("RunPod v2 persistent mount path is missing")
+        raise WatchdogError("RunPod REST v1 persistent volume mount path is missing")
     ports = payload.get("ports")
     if not isinstance(ports, list) or not all(isinstance(item, str) for item in ports):
-        raise WatchdogError("RunPod v2 port metadata is malformed")
-    global_networking = payload.get("globalNetworking")
-    if not isinstance(global_networking, Mapping) or not isinstance(
-        global_networking.get("enabled"), bool
-    ):
-        raise WatchdogError("RunPod v2 globalNetworking metadata is malformed")
+        raise WatchdogError("RunPod REST v1 port metadata is malformed")
+    global_networking = _optional_global_networking(payload.get("globalNetworking"))
+    network_volume_attached = _network_volume_attached(payload)
 
-    runtime = payload.get("runtime")
-    if not isinstance(runtime, Mapping):
-        raise WatchdogError("RunPod v2 runtime metadata is missing")
-    runtime_gpus = runtime.get("gpus")
-    if not isinstance(runtime_gpus, list):
-        raise WatchdogError("RunPod v2 runtime.gpus metadata is missing")
-    uptime = runtime.get("uptime")
-    if isinstance(uptime, bool) or not isinstance(uptime, int) or uptime < 0:
-        raise WatchdogError("RunPod v2 runtime.uptime must be a nonnegative integer")
-
-    _validate_secret_environment(payload.get("env"))
-    ssh_ready = _ssh_ready(payload.get("ssh"))
+    _validate_secret_environment(
+        payload.get("env"),
+        expected_session_hash=expected_session_hash,
+        expected_hf_token_hash=expected_hf_token_hash,
+    )
+    direct_ssh_ready, direct_ssh_hash = _direct_ssh_evidence(
+        payload.get("publicIp"),
+        payload.get("portMappings"),
+        required=desired_status == "RUNNING",
+    )
     current = observed_at.astimezone(UTC)
-    created = _parse_timestamp(payload.get("createdAt"), field="createdAt")
-    started = _parse_timestamp(payload.get("startedAt"), field="startedAt")
-    if started < created - timedelta(minutes=5):
-        raise WatchdogError("RunPod startedAt predates createdAt")
+    started = _parse_timestamp(payload.get("lastStartedAt"), field="lastStartedAt")
     if started > current + timedelta(minutes=5):
-        raise WatchdogError("RunPod startedAt is implausibly in the future")
-    if uptime > max(0.0, (current - started).total_seconds()) + 600:
-        raise WatchdogError("RunPod runtime.uptime disagrees with startedAt")
+        raise WatchdogError("RunPod lastStartedAt is implausibly in the future")
 
-    image = _parse_container_digest(payload.get("image"), field="image")
-    cost = _parse_positive_number(payload.get("cost"), field="cost")
+    image = _parse_container_digest(
+        _reconcile_aliases(payload.get("imageName"), payload.get("image"), field="imageName"),
+        field="imageName",
+    )
+    cost = _parse_positive_number(payload.get("costPerHr"), field="costPerHr")
+    adjusted_raw = payload.get("adjustedCostPerHr")
+    adjusted_cost = (
+        cost
+        if adjusted_raw is None
+        else _parse_positive_number(adjusted_raw, field="adjustedCostPerHr")
+    )
+    machine_hash = _opaque_hash(
+        "runpod-rest-v1-machine-v1",
+        {"machine_id": machine_id.strip()},
+    )
     execution_hash = _execution_identity_hash(
         pod_id=expected_pod_id,
+        pod_name=pod_name.strip(),
         started_at=started,
-        provider_gpu_id=provider_gpu_id.strip(),
+        machine_id=machine_id.strip(),
+        provider_gpu_id=provider_gpu_id,
         data_center_id=data_center_id.strip(),
-        cuda_version=cuda_version.strip(),
+        container_image=image,
     )
     return PodMetadata(
         pod_id=expected_pod_id,
+        pod_name=pod_name.strip(),
         gpu_count=count,
-        provider_gpu_id=provider_gpu_id.strip(),
-        gpu_display_name=display_name.strip(),
-        runtime_gpu_count=len(runtime_gpus),
+        provider_gpu_id=provider_gpu_id,
+        gpu_display_name=display_name,
+        runtime_gpu_count=None,
+        machine_id_hash=machine_hash,
         execution_identity_hash=execution_hash,
         data_center_id=data_center_id.strip(),
-        cuda_version=cuda_version.strip(),
-        secure_cloud=cloud == "SECURE",
+        cuda_version=None,
+        secure_cloud=secure_cloud,
         container_image=image,
         container_disk_gb=container_disk_gb,
         persistent_volume_disk_gb=volume_disk_gb,
         persistent_volume_mount_path=volume_mount_path,
         ports=tuple(ports),
-        global_networking_enabled=bool(global_networking["enabled"]),
-        ssh_ready=ssh_ready,
+        global_networking_enabled=global_networking,
+        ssh_ready=direct_ssh_ready,
+        direct_ssh_ready=direct_ssh_ready,
+        direct_ssh_endpoint_hash=direct_ssh_hash,
         environment_verified=True,
         desired_status=str(desired_status),
         cost_per_hr=cost,
-        adjusted_cost_per_hr=cost,
+        adjusted_cost_per_hr=adjusted_cost,
         last_started_at=started,
         observed_at=current,
         locked=locked,
-        network_volume_attached=False,
+        interruptible=interruptible,
+        network_volume_attached=network_volume_attached,
     )
 
 
@@ -508,6 +709,103 @@ def normalize_gpu_family(value: str) -> str:
         return _EXPECTED_FAMILY_ALIASES[value]
     except KeyError as exc:
         raise ValueError(f"unsupported expected GPU family: {value}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class LifecyclePodBinding:
+    """Private, authenticated lifecycle identity used before constructing a stop client."""
+
+    pod_id: str
+    operation: str
+    phase: str
+    session_hash: str
+    pod_status: str
+
+
+def _load_lifecycle_binding(lifecycle_state_path: str | Path) -> tuple[LifecyclePodBinding, dict[str, Any]]:
+    """Load the lifecycle record through its secure owner/link/hash/schema checks."""
+
+    # Import lazily so the provider-neutral lifecycle module remains usable
+    # without importing this long-running watcher.
+    from model_forensics.runpod_lifecycle import (
+        RunpodLifecycleError,
+        _authorization_from_state,
+        _load_state,
+    )
+
+    try:
+        state = _load_state(Path(lifecycle_state_path))
+        authorization = _authorization_from_state(state)
+    except (OSError, TypeError, ValueError, RunpodLifecycleError) as exc:
+        raise WatchdogError("private RunPod lifecycle binding is invalid") from exc
+    pod = state.get("pod")
+    if not isinstance(pod, Mapping):
+        raise WatchdogError("private RunPod lifecycle has no bound Pod")
+    pod_id = pod.get("id")
+    if not isinstance(pod_id, str) or _POD_ID_RE.fullmatch(pod_id) is None:
+        raise WatchdogError("private RunPod lifecycle Pod identity is malformed")
+    operation = state.get("operation")
+    pod_status = pod.get("status")
+    if not isinstance(operation, str) or not isinstance(pod_status, str):
+        raise WatchdogError("private RunPod lifecycle operation or status is malformed")
+    binding = LifecyclePodBinding(
+        pod_id=pod_id,
+        operation=operation,
+        phase=authorization.phase,
+        session_hash=authorization.session_hash,
+        pod_status=pod_status,
+    )
+    return binding, state
+
+
+def bind_lifecycle_pod(
+    *,
+    lifecycle_state_path: str | Path,
+    expected_session_hash: str,
+    expected_phase: str,
+    ambient_pod_id: str | None = None,
+    waiting_for_rearm: bool = False,
+) -> str:
+    """Return only the lifecycle-bound Pod id after all local identity checks.
+
+    In normal mode the active authorization must already match the authenticated
+    reservation.  ``waiting_for_rearm`` is the one deliberate exception: it
+    binds a stopped Pod before mutation while requiring the supplied session
+    hash to be fresh relative to the entire lifecycle history.
+    """
+
+    if _NAMESPACED_HASH_RE.fullmatch(expected_session_hash) is None:
+        raise WatchdogError("expected GPU session hash is malformed")
+    if not isinstance(expected_phase, str) or not expected_phase.strip():
+        raise WatchdogError("expected GPU phase is malformed")
+    if ambient_pod_id is not None and _POD_ID_RE.fullmatch(ambient_pod_id) is None:
+        raise WatchdogError("ambient RunPod Pod identity is malformed")
+    binding, state = _load_lifecycle_binding(lifecycle_state_path)
+    if ambient_pod_id is not None and not hmac.compare_digest(binding.pod_id, ambient_pod_id):
+        # Never construct a stop-capable client for an ambient or unrelated Pod.
+        raise WatchdogError("ambient Pod is not the private lifecycle-bound research Pod")
+
+    if waiting_for_rearm:
+        if binding.operation != "stopped" or binding.pod_status != "EXITED":
+            raise WatchdogError("host watcher can wait only on an authenticated stopped Pod")
+        history = state.get("authorization_history")
+        if not isinstance(history, list):  # already schema-checked; defensive for typing
+            raise WatchdogError("private RunPod lifecycle history is malformed")
+        used_hashes = {
+            str(item.get("session_hash")) for item in history if isinstance(item, Mapping)
+        }
+        used_hashes.add(binding.session_hash)
+        if expected_session_hash in used_hashes:
+            raise WatchdogError("host watcher requires a fresh GPU session identity")
+        return binding.pod_id
+
+    if binding.operation not in {"created", "rearmed"} or binding.pod_status != "RUNNING":
+        raise WatchdogError("private RunPod lifecycle is not an authenticated running Pod")
+    if not hmac.compare_digest(binding.session_hash, expected_session_hash):
+        raise WatchdogError("private lifecycle session disagrees with authenticated reservation")
+    if binding.phase != expected_phase:
+        raise WatchdogError("private lifecycle phase disagrees with authenticated reservation")
+    return binding.pod_id
 
 
 def validate_live_metadata(
@@ -532,9 +830,10 @@ def validate_live_metadata(
         raise WatchdogError(
             f"RunPod live metadata must report exactly 8 GPUs; observed {metadata.gpu_count}"
         )
-    if _GPU_FAMILY_RE[family].search(metadata.gpu_display_name) is None or _GPU_FAMILY_RE[
-        family
-    ].search(metadata.provider_gpu_id) is None:
+    if (
+        _GPU_FAMILY_RE[family].search(metadata.gpu_display_name) is None
+        or _GPU_FAMILY_RE[family].search(metadata.provider_gpu_id) is None
+    ):
         raise WatchdogError(
             "RunPod live GPU family does not match the approved profile: "
             f"expected {family}, observed {metadata.gpu_display_name!r}"
@@ -549,12 +848,14 @@ def validate_live_metadata(
             "RunPod live data center is outside the frozen launch set: "
             f"observed {metadata.data_center_id!r}"
         )
-    if not allowed_cuda_versions or metadata.cuda_version not in allowed_cuda_versions:
+    if not allowed_cuda_versions:
+        raise WatchdogError("RunPod approved CUDA host-version set is empty")
+    if metadata.cuda_version is not None and metadata.cuda_version not in allowed_cuda_versions:
         raise WatchdogError(
             "RunPod live CUDA host version is outside the frozen launch set: "
             f"observed {metadata.cuda_version!r}"
         )
-    if metadata.runtime_gpu_count != expected_gpu_count:
+    if metadata.runtime_gpu_count is not None and metadata.runtime_gpu_count != expected_gpu_count:
         raise WatchdogError("RunPod runtime GPU inventory does not contain exactly 8 GPUs")
     if not metadata.secure_cloud:
         raise WatchdogError("RunPod live machine is not in Secure Cloud")
@@ -572,23 +873,30 @@ def validate_live_metadata(
         raise WatchdogError("RunPod live persistent volume differs from the frozen 650 GB spec")
     if metadata.ports != _EXPECTED_PORTS:
         raise WatchdogError("RunPod live ports differ from the frozen SSH-only spec")
-    if metadata.global_networking_enabled:
+    if metadata.global_networking_enabled is True:
         raise WatchdogError("RunPod global networking must remain disabled")
     if metadata.network_volume_attached:
         raise WatchdogError("RunPod must not attach a network volume")
-    if not metadata.ssh_ready or not metadata.environment_verified:
+    if (
+        not metadata.ssh_ready
+        or not metadata.direct_ssh_ready
+        or metadata.direct_ssh_endpoint_hash is None
+        or not metadata.environment_verified
+    ):
         raise WatchdogError("RunPod SSH or environment verification is incomplete")
     if metadata.desired_status != "RUNNING":
         raise WatchdogError(
             f"RunPod Pod must be RUNNING when watchdog is armed; got {metadata.desired_status}"
         )
-    if metadata.locked:
+    if metadata.locked is True:
         raise WatchdogError("RunPod Pod is locked; the official API says locked Pods cannot stop")
-    approved = limits.maximum_approved_hourly_total_usd
+    if metadata.interruptible is True:
+        raise WatchdogError("RunPod Pod is interruptible; the approved rental mode drifted")
+    approved = limits.approved_compute_hourly_usd
     live_rate_ceiling = max(metadata.cost_per_hr, metadata.effective_hourly_usd)
-    if approved is not None and live_rate_ceiling > approved + 0.01:
+    if approved is not None and live_rate_ceiling > approved + 1e-6:
         raise WatchdogError(
-            "RunPod live hourly cost exceeds the approved quote: "
+            "RunPod live compute hourly cost exceeds the approved compute quote: "
             f"${live_rate_ceiling:.4f}/h > ${approved:.4f}/h"
         )
 
@@ -618,13 +926,15 @@ def derive_deadline(
 
 
 class RunpodStopClient:
-    """Minimal RunPod v2 client with injectable GET and action transports."""
+    """Minimal RunPod REST v1 client with injectable GET and stop transports."""
 
     def __init__(
         self,
         *,
         pod_id: str,
+        expected_session_hash: str,
         api_key_env: str = "RUNPOD_API_KEY",
+        hf_token_env: str = "HF_TOKEN",
         endpoint_base: str = RUNPOD_API_BASE,
         transport: StopTransport | None = None,
         metadata_transport: MetadataTransport | None = None,
@@ -635,18 +945,29 @@ class RunpodStopClient:
         api_key = os.environ.get(api_key_env)
         if not api_key:
             raise WatchdogError(f"required secret environment variable is unset: {api_key_env}")
+        if _NAMESPACED_HASH_RE.fullmatch(expected_session_hash) is None:
+            raise WatchdogError("expected GPU session hash is malformed")
+        hf_token = os.environ.get(hf_token_env)
+        if not hf_token:
+            raise WatchdogError(
+                f"required secret environment variable is unset: {hf_token_env}"
+            )
         if not endpoint_base.startswith("https://"):
             raise ValueError("RunPod endpoint must use HTTPS")
         if timeout_seconds <= 0 or timeout_seconds > 60:
             raise ValueError("RunPod request timeout must be in (0, 60]")
         self.pod_id = pod_id
         pod_endpoint = f"{endpoint_base.rstrip('/')}/pods/{pod_id}"
-        self._metadata_endpoint = pod_endpoint
-        self._stop_endpoint = f"{pod_endpoint}/action"
+        self._metadata_endpoint = (
+            f"{pod_endpoint}?includeMachine=true&includeNetworkVolume=true&includeTemplate=true"
+        )
+        self._stop_endpoint = f"{pod_endpoint}/stop"
         self._api_key = api_key
         self._stop_transport = transport or _default_stop_transport
         self._metadata_transport = metadata_transport or _default_metadata_transport
         self._timeout_seconds = timeout_seconds
+        self._expected_session_hash = expected_session_hash
+        self._expected_hf_token_hash = stable_hash({"hf_token": hf_token})
 
     def _get_payload(self) -> Mapping[str, Any]:
         status, body = self._metadata_transport(
@@ -669,6 +990,8 @@ class RunpodStopClient:
         return parse_pod_metadata(
             self._get_payload(),
             expected_pod_id=self.pod_id,
+            expected_session_hash=self._expected_session_hash,
+            expected_hf_token_hash=self._expected_hf_token_hash,
             observed_at=observed_at or datetime.now(UTC),
         )
 
@@ -676,9 +999,9 @@ class RunpodStopClient:
         payload = self._get_payload()
         if payload.get("id") != self.pod_id:
             raise WatchdogError("RunPod metadata returned a different Pod id")
-        status = payload.get("status")
+        status = payload.get("desiredStatus")
         if status not in {"RUNNING", "EXITED", "TERMINATED"}:
-            raise WatchdogError("RunPod v2 metadata status is unsupported")
+            raise WatchdogError("RunPod REST v1 metadata desiredStatus is unsupported")
         return str(status)
 
     def stop(self) -> None:
@@ -686,7 +1009,7 @@ class RunpodStopClient:
             self._stop_endpoint,
             self._api_key,
             self._timeout_seconds,
-            {"action": "stop"},
+            None,
         )
         if status < 200 or status >= 300:
             raise WatchdogError(f"RunPod stop returned HTTP {status}")
@@ -722,9 +1045,8 @@ def _state(
             "safety_margin_fraction": limits.safety_margin_fraction,
             "maximum_runtime_hours": limits.maximum_runtime_hours,
             "maximum_approved_hourly_total_usd": limits.maximum_approved_hourly_total_usd,
-            "maximum_approved_storage_hourly_usd": (
-                limits.maximum_approved_storage_hourly_usd
-            ),
+            "maximum_approved_compute_hourly_usd": limits.approved_compute_hourly_usd,
+            "maximum_approved_storage_hourly_usd": (limits.maximum_approved_storage_hourly_usd),
             "prior_committed_gpu_usd": limits.prior_committed_gpu_usd,
         },
         "deadline": (
@@ -747,6 +1069,16 @@ def _state(
     }
 
 
+def _try_write_state(path: str | Path, payload: Mapping[str, Any]) -> OSError | None:
+    """Persist stop-path evidence when possible without suppressing a stop attempt."""
+
+    try:
+        write_json(path, payload)
+    except OSError as exc:
+        return exc
+    return None
+
+
 def _stop_until_confirmed(
     *,
     client: RunpodStopClient,
@@ -756,12 +1088,14 @@ def _stop_until_confirmed(
     metadata: PodMetadata | None,
     derived: DerivedDeadline | None,
     stop_reason: str,
-    stop_attempts: int,
+    stop_attempts: int | None,
     sleep: Callable[[float], None],
     now: Callable[[], datetime],
 ) -> dict[str, Any]:
     last_error: str | None = None
-    for attempt in range(1, stop_attempts + 1):
+    attempt = 0
+    while stop_attempts is None or attempt < stop_attempts:
+        attempt += 1
         try:
             status_before = client.desired_status()
         except WatchdogError as exc:
@@ -780,7 +1114,11 @@ def _stop_until_confirmed(
                 stop_reason=stop_reason,
                 error=last_error,
             )
-            write_json(state_path, completed)
+            state_error = _try_write_state(state_path, completed)
+            if state_error is not None:
+                raise WatchdogError(
+                    "Pod stop was confirmed but watchdog state persistence failed"
+                ) from state_error
             return completed
         try:
             client.stop()
@@ -788,7 +1126,7 @@ def _stop_until_confirmed(
             last_error = str(exc)
         else:
             last_error = None
-        write_json(
+        _try_write_state(
             state_path,
             _state(
                 pod_id=client.pod_id,
@@ -802,8 +1140,9 @@ def _stop_until_confirmed(
                 error=last_error,
             ),
         )
-        if attempt < stop_attempts:
+        if stop_attempts is None or attempt < stop_attempts:
             sleep(5)
+    assert stop_attempts is not None  # finite mode exists only for deterministic tests
     try:
         final_status = client.desired_status()
     except WatchdogError as exc:
@@ -822,7 +1161,11 @@ def _stop_until_confirmed(
             stop_reason=stop_reason,
             error=last_error,
         )
-        write_json(state_path, completed)
+        state_error = _try_write_state(state_path, completed)
+        if state_error is not None:
+            raise WatchdogError(
+                "Pod stop was confirmed but watchdog state persistence failed"
+            ) from state_error
         return completed
     failed = _state(
         pod_id=client.pod_id,
@@ -835,7 +1178,7 @@ def _stop_until_confirmed(
         stop_reason=stop_reason,
         error=last_error or f"desiredStatus remained {final_status}",
     )
-    write_json(state_path, failed)
+    _try_write_state(state_path, failed)
     raise WatchdogError(f"failed to confirm Pod stop after {stop_attempts} attempts")
 
 
@@ -853,7 +1196,7 @@ def run_watchdog(
     expected_gpu_count: int = 8,
     stop_request_path: str | Path | None = None,
     poll_seconds: float = 15,
-    stop_attempts: int = 12,
+    stop_attempts: int | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     monotonic: Callable[[], float] = time.monotonic,
@@ -865,7 +1208,9 @@ def run_watchdog(
     normalize_gpu_family(expected_gpu_family)
     if expected_gpu_count != 8:
         raise ValueError("this experiment requires exactly 8 GPUs")
-    if poll_seconds <= 0 or poll_seconds > 60 or stop_attempts <= 0:
+    if poll_seconds <= 0 or poll_seconds > 60 or (
+        stop_attempts is not None and stop_attempts <= 0
+    ):
         raise ValueError("poll interval must be in (0, 60] and attempts positive")
 
     armed_at = now().astimezone(UTC)
@@ -884,7 +1229,7 @@ def run_watchdog(
             expected_container_image=expected_container_image,
             limits=limits,
         )
-        # RunPod's live Pod rate has historically represented compute while
+        # RunPod's live Pod rate represents compute while
         # volume/container storage is billed separately. Add the frozen storage
         # allowance even if a future response includes it; double-counting the
         # small storage component is deliberately conservative.
@@ -893,7 +1238,7 @@ def run_watchdog(
         )
         derived = derive_deadline(metadata, limits, calculation_hourly_usd=calculation_rate)
     except WatchdogError as exc:
-        write_json(
+        _try_write_state(
             state_path,
             _state(
                 pod_id=pod_id,
@@ -937,7 +1282,7 @@ def run_watchdog(
 
     monotonic_deadline = armed_monotonic + (derived.deadline - armed_at).total_seconds()
 
-    write_json(
+    armed_state_error = _try_write_state(
         state_path,
         _state(
             pod_id=pod_id,
@@ -949,6 +1294,20 @@ def run_watchdog(
             now=armed_at,
         ),
     )
+    if armed_state_error is not None:
+        _stop_until_confirmed(
+            client=client,
+            state_path=state_path,
+            limits=limits,
+            armed_at=armed_at,
+            metadata=metadata,
+            derived=derived,
+            stop_reason="state_persistence_failed",
+            stop_attempts=stop_attempts,
+            sleep=sleep,
+            now=now,
+        )
+        raise WatchdogError("watchdog could not persist its armed state") from armed_state_error
     initial_started_at = metadata.last_started_at
     initial_execution_identity_hash = metadata.execution_identity_hash
     while True:
@@ -985,7 +1344,11 @@ def run_watchdog(
                     now=current_time,
                     stop_reason="stopped_outside_watchdog",
                 )
-                write_json(state_path, terminal)
+                state_error = _try_write_state(state_path, terminal)
+                if state_error is not None:
+                    raise WatchdogError(
+                        "Pod stopped externally but watchdog state persistence failed"
+                    ) from state_error
                 return terminal
             validate_live_metadata(
                 current,
@@ -1000,7 +1363,9 @@ def run_watchdog(
             if current.last_started_at != initial_started_at:
                 raise WatchdogError("RunPod lastStartedAt changed after watchdog arming")
             if current.execution_identity_hash != initial_execution_identity_hash:
-                raise WatchdogError("RunPod v2 execution identity changed after watchdog arming")
+                raise WatchdogError(
+                    "RunPod REST v1 execution identity changed after watchdog arming"
+                )
             # Never extend the deadline if RunPod later reports a lower rate.
             calculation_rate = max(
                 calculation_rate,
@@ -1021,7 +1386,7 @@ def run_watchdog(
             )
         except WatchdogError as exc:
             stop_reason = "live_metadata_became_unsafe"
-            write_json(
+            _try_write_state(
                 state_path,
                 _state(
                     pod_id=pod_id,
@@ -1036,7 +1401,7 @@ def run_watchdog(
                 ),
             )
             break
-        write_json(
+        state_error = _try_write_state(
             state_path,
             _state(
                 pod_id=pod_id,
@@ -1048,6 +1413,9 @@ def run_watchdog(
                 now=current_time,
             ),
         )
+        if state_error is not None:
+            stop_reason = "state_persistence_failed"
+            break
 
     return _stop_until_confirmed(
         client=client,
@@ -1063,20 +1431,226 @@ def run_watchdog(
     )
 
 
+def wait_for_rearm_then_run_watchdog(
+    *,
+    lifecycle_state_path: str | Path,
+    expected_session_hash: str,
+    expected_phase: str,
+    pod_id: str,
+    expected_gpu_family: str,
+    expected_provider_gpu_id: str,
+    allowed_data_center_ids: tuple[str, ...],
+    allowed_cuda_versions: tuple[str, ...],
+    expected_container_image: str,
+    limits: WatchdogLimits,
+    state_path: str | Path,
+    client: RunpodStopClient,
+    expected_gpu_count: int = 8,
+    stop_request_path: str | Path | None = None,
+    poll_seconds: float = 5,
+    running_readiness_timeout_seconds: float = 300,
+    stop_attempts: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Arm on the host before re-arm, then enforce the new provider start.
+
+    The initial acknowledgement is written while the lifecycle is still
+    ``stopped``.  The watcher never trusts an ambient Pod id: it keeps checking
+    the same private lifecycle record, requires the fresh authorization before
+    accepting RUNNING, and then delegates to the normal lastStartedAt-derived
+    deadline monitor.  Thus it survives a re-arm client dying after POST /start.
+    """
+
+    bound_id = bind_lifecycle_pod(
+        lifecycle_state_path=lifecycle_state_path,
+        expected_session_hash=expected_session_hash,
+        expected_phase=expected_phase,
+        ambient_pod_id=pod_id,
+        waiting_for_rearm=True,
+    )
+    if client.pod_id != bound_id:
+        raise ValueError("stop client targets a different lifecycle-bound Pod")
+    if (
+        poll_seconds <= 0
+        or poll_seconds > 60
+        or not math.isfinite(running_readiness_timeout_seconds)
+        or running_readiness_timeout_seconds <= 0
+        or running_readiness_timeout_seconds > 600
+    ):
+        raise ValueError("start polling/readiness limits are invalid")
+
+    waiting_at = now().astimezone(UTC)
+    waiting_state = _state(
+        pod_id=bound_id,
+        limits=limits,
+        status="waiting_for_start",
+        armed_at=waiting_at,
+        metadata=None,
+        derived=None,
+        now=waiting_at,
+    )
+    write_json(state_path, waiting_state)
+    first_running_monotonic: float | None = None
+    allowed_transition_operations = {
+        "rearm_intent",
+        "rearm_patched",
+        "rearm_start_requested",
+        "rearm_start_pending",
+        "rearm_timeout",
+        "rearmed",
+        "rearm_verification_failed",
+        "rearm_failed_terminal",
+    }
+
+    while True:
+        current_time = now().astimezone(UTC)
+        if stop_request_path is not None and Path(stop_request_path).exists():
+            return _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="external_stop_request",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
+
+        binding, _state_record = _load_lifecycle_binding(lifecycle_state_path)
+        if not hmac.compare_digest(binding.pod_id, bound_id):
+            raise WatchdogError("private lifecycle Pod identity changed while awaiting re-arm")
+        pre_transition = binding.operation == "stopped" and binding.pod_status == "EXITED"
+        transition_bound = (
+            binding.operation in allowed_transition_operations
+            and binding.session_hash == expected_session_hash
+            and binding.phase == expected_phase
+        )
+        if not pre_transition and not transition_bound:
+            _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="lifecycle_became_unsafe",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
+            raise WatchdogError("private lifecycle authorization became unsafe during re-arm")
+
+        try:
+            provider_status = client.desired_status()
+        except WatchdogError:
+            sleep(poll_seconds)
+            continue
+        if provider_status in _TERMINAL_STATUSES:
+            if provider_status == "EXITED":
+                sleep(poll_seconds)
+                continue
+            terminal = _state(
+                pod_id=bound_id,
+                limits=limits,
+                status="terminated_externally",
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                now=current_time,
+                stop_reason="stopped_outside_watchdog",
+            )
+            write_json(state_path, terminal)
+            return terminal
+        if pre_transition:
+            _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="provider_started_before_fresh_authorization",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
+            raise WatchdogError("provider Pod started before fresh lifecycle authorization")
+
+        try:
+            candidate = client.metadata(observed_at=current_time)
+            validate_live_metadata(
+                candidate,
+                expected_gpu_count=expected_gpu_count,
+                expected_gpu_family=expected_gpu_family,
+                expected_provider_gpu_id=expected_provider_gpu_id,
+                allowed_data_center_ids=allowed_data_center_ids,
+                allowed_cuda_versions=allowed_cuda_versions,
+                expected_container_image=expected_container_image,
+                limits=limits,
+            )
+        except WatchdogError as exc:
+            current_monotonic = monotonic()
+            if first_running_monotonic is None:
+                first_running_monotonic = current_monotonic
+            if current_monotonic - first_running_monotonic < running_readiness_timeout_seconds:
+                sleep(poll_seconds)
+                continue
+            _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="start_readiness_verification_failed",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
+            raise exc
+
+        return run_watchdog(
+            pod_id=bound_id,
+            expected_gpu_family=expected_gpu_family,
+            expected_provider_gpu_id=expected_provider_gpu_id,
+            allowed_data_center_ids=allowed_data_center_ids,
+            allowed_cuda_versions=allowed_cuda_versions,
+            expected_container_image=expected_container_image,
+            limits=limits,
+            state_path=state_path,
+            client=client,
+            expected_gpu_count=expected_gpu_count,
+            stop_request_path=stop_request_path,
+            poll_seconds=poll_seconds,
+            stop_attempts=stop_attempts,
+            sleep=sleep,
+            now=now,
+            monotonic=monotonic,
+        )
+
+
 __all__ = [
+    "PROVIDER_API",
     "RUNPOD_API_BASE",
     "RUNPOD_POD_LOOKUP_DOC",
     "RUNPOD_POD_STOP_DOC",
     "RUNPOD_REST_BASE",
     "WATCHDOG_VERSION",
     "DerivedDeadline",
+    "LifecyclePodBinding",
     "PodMetadata",
     "RunpodStopClient",
     "WatchdogError",
     "WatchdogLimits",
+    "bind_lifecycle_pod",
     "derive_deadline",
     "normalize_gpu_family",
     "parse_pod_metadata",
     "run_watchdog",
     "validate_live_metadata",
+    "wait_for_rearm_then_run_watchdog",
 ]

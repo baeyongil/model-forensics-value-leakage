@@ -49,9 +49,12 @@ WATCHDOG_PID_FILE=".runpod/emergency_watchdog.pid"
 WATCHDOG_LOG=".runpod/emergency_watchdog.log"
 STOP_REQUEST_PATH=".runpod/emergency_stop.request"
 GPU_BUDGET_BOOTSTRAP_STATE=".runpod/gpu_budget_bootstrap.pending.json"
+LIFECYCLE_STATE=".runpod/pod_lifecycle.json"
+EXPECTED_SESSION_HASH=""
 GPU_BOOTSTRAP_TMP=""
 BOOTSTRAP_SUCCEEDED=0
 WATCHDOG_PID=""
+GPU_BUDGET_SESSION_ID_PRIVATE=""
 case "$GPU_FAMILY" in
   H100 | H100_80GB | A100 | A100_80GB) EMERGENCY_GPU_FAMILY="$GPU_FAMILY" ;;
   *) EMERGENCY_GPU_FAMILY="H100_80GB" ;;
@@ -61,9 +64,18 @@ cleanup_on_exit() {
   local status="$?"
   if [[ "$BOOTSTRAP_SUCCEEDED" != "1" ]]; then
     : > "$STOP_REQUEST_PATH" || true
-    if { [[ -z "$WATCHDOG_PID" ]] || ! kill -0 "$WATCHDOG_PID" 2>/dev/null; } \
+    local watchdog_identity_live=0
+    if [[ -n "$WATCHDOG_PID" && -f "$WATCHDOG_PID_FILE" ]] \
+      && [[ -f scripts/runpod_process_identity.py ]] \
+      && PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py verify \
+        --identity "$WATCHDOG_PID_FILE" >/dev/null 2>&1; then
+      watchdog_identity_live=1
+    fi
+    if [[ "$watchdog_identity_live" != "1" ]] \
       && [[ -n "${RUNPOD_POD_ID:-}" ]] \
       && [[ -n "${RUNPOD_API_KEY:-}" ]] \
+      && [[ -n "$EXPECTED_SESSION_HASH" ]] \
+      && [[ -f "$LIFECYCLE_STATE" ]] \
       && [[ -f scripts/runpod_watchdog.py ]]; then
       # Receipt validation happens before the regular watchdog is configured.
       # If it fails, arm an immediate one-shot watchdog so this exact Pod does
@@ -71,6 +83,9 @@ cleanup_on_exit() {
       # path in run_watchdog.
       env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" python3 scripts/runpod_watchdog.py \
         --pod-id "$RUNPOD_POD_ID" \
+        --lifecycle-state "$LIFECYCLE_STATE" \
+        --expected-session-hash "$EXPECTED_SESSION_HASH" \
+        --expected-phase "$GPU_PHASE" \
         --expected-gpu-family "$EMERGENCY_GPU_FAMILY" \
         --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
         "${DATA_CENTER_ARGS[@]}" \
@@ -88,6 +103,7 @@ cleanup_on_exit() {
     fi
   fi
   unset GPU_BUDGET_SESSION_ID || true
+  unset GPU_BUDGET_SESSION_ID_PRIVATE || true
   if [[ -n "$GPU_BOOTSTRAP_TMP" && -d "$GPU_BOOTSTRAP_TMP" ]]; then
     rm -rf -- "$GPU_BOOTSTRAP_TMP" || true
   fi
@@ -111,6 +127,16 @@ if [[ -z "${GPU_BUDGET_SESSION_ID:-}" ]]; then
   echo "GPU_BUDGET_SESSION_ID must contain the opaque pre-launch session nonce" >&2
   exit 2
 fi
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  echo "HF_TOKEN is required for in-memory provider credential binding" >&2
+  exit 2
+fi
+EXPECTED_SESSION_HASH="$(PYTHONPATH="$PWD/src" python3 -c 'import os; from model_forensics.io import stable_hash; print(stable_hash({"opaque_gpu_session_id": os.environ["GPU_BUDGET_SESSION_ID"]}))')"
+if [[ ! "$EXPECTED_SESSION_HASH" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "could not derive a safe GPU session identity hash" >&2
+  exit 2
+fi
+GPU_BUDGET_SESSION_ID_PRIVATE="$GPU_BUDGET_SESSION_ID"
 if [[ ! -f "$GPU_RESERVATION_RECEIPT" || ! -f "$COST_LEDGER" ]]; then
   echo "authenticated GPU reservation receipt and canonical cost ledger must be synced" >&2
   exit 2
@@ -173,6 +199,10 @@ SESSION_DIR="$(PYTHONPATH="$PWD/src" python3 scripts/runpod_session_prepare.py \
   --gpu-hard-stop-usd "$GPU_HARD_STOP_USD" \
   --api-hard-stop-usd 100 \
   --total-hard-stop-usd 325)"
+if [[ "sha256:${SESSION_DIR##*/}" != "$EXPECTED_SESSION_HASH" ]]; then
+  echo "authenticated session directory disagrees with the in-memory session identity" >&2
+  exit 2
+fi
 case "$SESSION_DIR" in
   "$PWD"/.runpod/sessions/*) ;;
   *)
@@ -190,12 +220,16 @@ GPU_SETUP_LOCK="$GPU_SETUP_DIR/setup_lock.json"
 GPU_ENVIRONMENT_MANIFEST="$GPU_SETUP_DIR/gpu_environment.json"
 QWEN4B_SMOKE_MANIFEST="$GPU_SETUP_DIR/qwen4b_prefix_smoke.json"
 GPU_SETUP_VALIDATION="$SESSION_DIR/gpu_setup_validation.json"
+POST_SETUP_ACTIVE_SESSION="$SESSION_DIR/post_setup_active_session.json"
 TRANSFORMERS_COMMIT="42ca97014c85d71a88ad60d55f08cb9fb4d26e2c"
 JLENS_COMMIT="581d398613e5602a5af361e1c34d3a92ea82ba8e"
 
 # Arm a separate, nohup-protected process before any wheel or model download.
 env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" nohup python3 scripts/runpod_watchdog.py \
   --pod-id "$RUNPOD_POD_ID" \
+  --lifecycle-state "$LIFECYCLE_STATE" \
+  --expected-session-hash "$EXPECTED_SESSION_HASH" \
+  --expected-phase "$GPU_PHASE" \
   --expected-gpu-family "$GPU_FAMILY" \
   --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
   "${DATA_CENTER_ARGS[@]}" \
@@ -213,7 +247,18 @@ env -u GPU_BUDGET_SESSION_ID PYTHONPATH="$PWD/src" nohup python3 scripts/runpod_
   --stop-request "$STOP_REQUEST_PATH" \
   > "$WATCHDOG_LOG" 2>&1 &
 WATCHDOG_PID="$!"
-printf '%s\n' "$WATCHDOG_PID" > "$WATCHDOG_PID_FILE"
+PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py record \
+  --pid "$WATCHDOG_PID" \
+  --output "$WATCHDOG_PID_FILE" \
+  --required-cmdline-token scripts/runpod_watchdog.py \
+  --required-cmdline-token "$WATCHDOG_STATE" \
+  --required-cmdline-token "$STOP_REQUEST_PATH" \
+  >/dev/null
+
+watchdog_process_is_live() {
+  PYTHONPATH="$PWD/src" python3 scripts/runpod_process_identity.py verify \
+    --identity "$WATCHDOG_PID_FILE" >/dev/null 2>&1
+}
 
 watchdog_is_armed() {
   python3 - "$WATCHDOG_STATE" <<'PY'
@@ -226,14 +271,35 @@ try:
     payload = json.loads(path.read_text(encoding="utf-8"))
 except (FileNotFoundError, OSError, json.JSONDecodeError):
     raise SystemExit(1)
-raise SystemExit(0 if payload.get("status") == "armed" else 1)
+metadata = payload.get("live_metadata")
+expected_gaps = {
+    "cuda_version",
+    "global_networking_enabled",
+    "interruptible",
+    "locked",
+    "runtime_gpu_count",
+}
+unavailable = metadata.get("provider_evidence_unavailable") if isinstance(metadata, dict) else None
+ready = (
+    payload.get("schema_version") == 2
+    and payload.get("watchdog_version") == "runpod-gpu-cost-watchdog-v2"
+    and payload.get("status") == "armed"
+    and isinstance(metadata, dict)
+    and metadata.get("provider_api") == "rest-v1"
+    and isinstance(unavailable, list)
+    and all(isinstance(item, str) for item in unavailable)
+    and len(unavailable) == len(set(unavailable))
+    and set(unavailable) == expected_gaps
+    and all(field in metadata and metadata[field] is None for field in expected_gaps)
+)
+raise SystemExit(0 if ready else 1)
 PY
 }
 
 WATCHDOG_READY=0
 for _ in $(seq 1 45); do
-  if ! kill -0 "$WATCHDOG_PID" 2>/dev/null; then
-    echo "RunPod watchdog exited before arming; inspect $WATCHDOG_LOG" >&2
+  if ! watchdog_process_is_live; then
+    echo "RunPod watchdog process identity changed before arming; inspect $WATCHDOG_LOG" >&2
     exit 2
   fi
   if watchdog_is_armed; then
@@ -349,8 +415,19 @@ else
     > "$GPU_SETUP_VALIDATION"
 fi
 
-if ! kill -0 "$WATCHDOG_PID" 2>/dev/null || ! watchdog_is_armed; then
-  echo "RunPod watchdog is not armed after bootstrap" >&2
-  exit 2
-fi
+# Re-run the complete receipt/ledger/watchdog/process/preflight gate after all
+# setup and smoke work.  A live PID plus an `armed` string is not sufficient:
+# the PID may have been recycled and any one of the bound artifacts may have
+# changed during the long installation window.
+env GPU_BUDGET_SESSION_ID="$GPU_BUDGET_SESSION_ID_PRIVATE" \
+  PYTHONPATH="$PWD/src" python3 scripts/runpod_active_session_verify.py \
+  --session-directory "$SESSION_DIR" \
+  --reservation-receipt "$GPU_RESERVATION_RECEIPT" \
+  --cost-ledger "$COST_LEDGER" \
+  --phase "$GPU_PHASE" \
+  --gpu-hard-stop-usd "$GPU_HARD_STOP_USD" \
+  --api-hard-stop-usd 100 \
+  --total-hard-stop-usd 325 \
+  > "$POST_SETUP_ACTIVE_SESSION"
+unset GPU_BUDGET_SESSION_ID_PRIVATE
 BOOTSTRAP_SUCCEEDED=1

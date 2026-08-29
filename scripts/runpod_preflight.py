@@ -22,6 +22,10 @@ from model_forensics.gpu_budget import (
     load_gpu_phase_budget_reservation,
     validate_gpu_phase_bootstrap,
 )
+from model_forensics.runpod_sessions import (
+    RunpodSessionError,
+    validate_watchdog_process_identity,
+)
 from model_forensics.runpod_watchdog import normalize_gpu_family
 
 GPU_PATTERNS = {
@@ -37,6 +41,15 @@ CUDA_13_COMPAT_LIBRARIES = (
 )
 _CONTAINER_DIGEST_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _EXECUTION_IDENTITY_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_V1_UNAVAILABLE_PROVIDER_EVIDENCE = frozenset(
+    {
+        "cuda_version",
+        "global_networking_enabled",
+        "interruptible",
+        "locked",
+        "runtime_gpu_count",
+    }
+)
 
 
 def _command_output(command: list[str]) -> str:
@@ -151,7 +164,7 @@ def parse_fresh_price_timestamp(value: str, *, now: datetime | None = None) -> d
         raise ValueError("price checked timestamp must include timezone")
     current = now or datetime.now(UTC)
     age_seconds = (current - parsed.astimezone(UTC)).total_seconds()
-    if age_seconds < -300:
+    if age_seconds < 0:
         raise ValueError("price checked timestamp is in the future")
     if age_seconds > 6 * 3600:
         raise ValueError("RunPod price must have been checked within the last six hours")
@@ -211,7 +224,17 @@ def validate_watchdog_state(
     expected_prior_committed_gpu_usd: float = 0.0,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Validate a fresh, live-metadata-backed state emitted by watchdog v2."""
+    """Validate a fresh watchdog state backed by RunPod's official v1 API.
+
+    ``schema_version`` and ``watchdog_version`` name this repository's private
+    state protocol; they are deliberately independent of the provider endpoint
+    version.  RunPod v1 does not expose CUDA placement, runtime GPU inventory,
+    global-networking state, or the Pod lock flag.  The watchdog must represent
+    those gaps as explicit nulls, never as fabricated provider observations.
+    Runtime inventory and CUDA compatibility are checked locally later in this
+    preflight.  The remaining provider-control gaps stay visible in the private
+    manifest and are bounded by the approval-bound launch/lifecycle workflow.
+    """
 
     if not isinstance(payload, dict) or payload.get("schema_version") != 2:
         raise ValueError("watchdog state must use schema_version 2")
@@ -226,18 +249,33 @@ def validate_watchdog_state(
     current = (now or datetime.now(UTC)).astimezone(UTC)
     updated = _parse_aware_timestamp(payload.get("updated_at"), field="updated_at")
     age = (current - updated).total_seconds()
-    if age < -300 or age > 90:
+    if age < 0:
+        raise ValueError("watchdog state timestamp is in the future")
+    if age > 90:
         raise ValueError("watchdog state must have been refreshed within 90 seconds")
 
     metadata = payload.get("live_metadata")
     if not isinstance(metadata, dict):
         raise ValueError("watchdog state is missing sanitized live metadata")
+    if metadata.get("provider_api") != "rest-v1":
+        raise ValueError("watchdog live metadata must come from RunPod rest-v1")
+    unavailable = metadata.get("provider_evidence_unavailable")
+    if (
+        not isinstance(unavailable, list)
+        or not all(isinstance(item, str) for item in unavailable)
+        or len(unavailable) != len(set(unavailable))
+        or set(unavailable) != _V1_UNAVAILABLE_PROVIDER_EVIDENCE
+    ):
+        raise ValueError("watchdog must disclose the exact RunPod v1 provider-evidence gaps")
+    for field in _V1_UNAVAILABLE_PROVIDER_EVIDENCE:
+        if field not in metadata or metadata[field] is not None:
+            raise ValueError(
+                f"watchdog RunPod v1-unavailable field {field} must be present and null"
+            )
     if metadata.get("pod_id") != expected_pod_id:
         raise ValueError("watchdog live metadata targets a different Pod")
     if metadata.get("desired_status") != "RUNNING":
         raise ValueError("watchdog live metadata must report desiredStatus RUNNING")
-    if metadata.get("locked") is not False:
-        raise ValueError("watchdog live metadata must report an unlocked Pod")
     if metadata.get("gpu_count") != expected_gpu_count or expected_gpu_count != 8:
         raise ValueError("watchdog live metadata must report exactly 8 GPUs")
     if metadata.get("provider_gpu_id") != expected_provider_gpu_id:
@@ -268,32 +306,36 @@ def validate_watchdog_state(
         is None
     ):
         raise ValueError("watchdog live GPU family does not match the local preflight profile")
-    if metadata.get("runtime_gpu_count") != expected_gpu_count:
-        raise ValueError("watchdog v2 runtime inventory must report exactly 8 GPUs")
-    if not allowed_cuda_versions or metadata.get("cuda_version") not in allowed_cuda_versions:
-        raise ValueError("watchdog v2 CUDA version is outside the frozen launch set")
+    # RunPod v1 cannot attest runtime inventory or the placement CUDA version.
+    # Still require the exact frozen CUDA allow-list here; local nvidia-smi and
+    # forward-compatibility checks below supply the executable evidence.
+    if allowed_cuda_versions != ("12.8",):
+        raise ValueError("frozen launch must allow exactly CUDA host version 12.8")
     if metadata.get("container_disk_gb") != 50:
-        raise ValueError("watchdog v2 container disk disagrees with the frozen launch spec")
+        raise ValueError("watchdog v1 container disk disagrees with the frozen launch spec")
     if (
         metadata.get("persistent_volume_disk_gb") != 650
         or metadata.get("persistent_volume_mount_path") != "/workspace"
     ):
-        raise ValueError("watchdog v2 persistent volume disagrees with the frozen launch spec")
+        raise ValueError("watchdog v1 persistent volume disagrees with the frozen launch spec")
     if metadata.get("ports") != ["22/tcp"]:
-        raise ValueError("watchdog v2 ports disagree with the SSH-only launch spec")
-    if metadata.get("global_networking_enabled") is not False:
-        raise ValueError("watchdog v2 global networking must remain disabled")
+        raise ValueError("watchdog v1 ports disagree with the SSH-only launch spec")
     if metadata.get("network_volume_attached") is not False:
-        raise ValueError("watchdog v2 network volume attachment is forbidden")
-    if metadata.get("ssh_ready") is not True or metadata.get("environment_verified") is not True:
-        raise ValueError("watchdog v2 SSH/environment verification is incomplete")
+        raise ValueError("watchdog v1 network volume attachment is forbidden")
+    if (
+        metadata.get("ssh_ready") is not True
+        or metadata.get("direct_ssh_ready") is not True
+        or metadata.get("environment_verified") is not True
+    ):
+        raise ValueError("watchdog v1 direct-SSH/environment verification is incomplete")
+    for field in ("machine_id_hash", "direct_ssh_endpoint_hash"):
+        value = metadata.get(field)
+        if not isinstance(value, str) or _EXECUTION_IDENTITY_HASH_RE.fullmatch(value) is None:
+            raise ValueError(f"watchdog v1 live metadata is missing sanitized {field}")
     live_nominal = _positive_finite(metadata.get("cost_per_hr"), field="cost_per_hr")
     live_effective = _positive_finite(
         metadata.get("adjusted_cost_per_hr"), field="adjusted_cost_per_hr"
     )
-    if max(live_nominal, live_effective) > approved_hourly_total_usd + 0.01:
-        raise ValueError("live RunPod hourly cost exceeds the approved quote")
-
     limits = payload.get("limits")
     deadline = payload.get("deadline")
     if not isinstance(limits, dict) or not isinstance(deadline, dict):
@@ -314,11 +356,17 @@ def validate_watchdog_state(
         limits.get("maximum_approved_hourly_total_usd"),
         field="maximum_approved_hourly_total_usd",
     )
+    approved_compute = approved_all_in - storage_hourly
+    if approved_compute <= 0:
+        raise ValueError("watchdog approved compute-only hourly ceiling must be positive")
     if (
         abs(storage_hourly - approved_storage_hourly_usd) > 1e-9
         or abs(approved_all_in - approved_hourly_total_usd) > 1e-9
     ):
         raise ValueError("watchdog all-in hourly quote disagrees with frozen storage pricing")
+    live_compute = max(live_nominal, live_effective)
+    if live_compute > approved_compute + 1e-9:
+        raise ValueError("live RunPod compute hourly cost exceeds the approved compute-only quote")
     raw_prior = limits.get("prior_committed_gpu_usd")
     if isinstance(raw_prior, bool):
         raise ValueError("watchdog prior_committed_gpu_usd must be numeric")
@@ -342,8 +390,11 @@ def validate_watchdog_state(
     calculation_rate = _positive_finite(
         deadline.get("calculation_hourly_usd"), field="calculation_hourly_usd"
     )
-    if calculation_rate + 1e-9 < live_effective:
-        raise ValueError("watchdog calculation rate understates the live effective rate")
+    minimum_calculation_rate = live_compute + storage_hourly
+    if calculation_rate + 1e-9 < minimum_calculation_rate:
+        raise ValueError(
+            "watchdog calculation rate understates live compute plus running storage"
+        )
     effective_deadline = _parse_aware_timestamp(
         deadline.get("effective_deadline"), field="effective_deadline"
     )
@@ -374,26 +425,27 @@ def validate_watchdog_state(
         "global_safe_budget_usd": global_safe_budget,
         "prior_committed_gpu_usd": prior_committed,
         "provider_gpu_id": expected_provider_gpu_id,
+        "provider_api": "rest-v1",
+        "provider_evidence_unavailable": sorted(_V1_UNAVAILABLE_PROVIDER_EVIDENCE),
         "execution_identity_hash": execution_identity_hash,
+        "machine_id_hash": metadata["machine_id_hash"],
+        "direct_ssh_endpoint_hash": metadata["direct_ssh_endpoint_hash"],
         "container_image": expected_container_image,
         "data_center_id": metadata["data_center_id"],
         "approved_storage_hourly_usd": storage_hourly,
+        "approved_compute_hourly_usd": approved_compute,
     }
 
 
-def validate_watchdog_pid(path: Path) -> int:
+def validate_watchdog_pid(
+    path: Path,
+    *,
+    proc_root: str | Path = "/proc",
+) -> dict[str, Any]:
     try:
-        raw = path.read_text(encoding="utf-8").strip()
-        pid = int(raw)
-    except (FileNotFoundError, OSError, ValueError) as exc:
-        raise ValueError("watchdog PID file is missing or invalid") from exc
-    if pid <= 1:
-        raise ValueError("watchdog PID must identify a non-system process")
-    try:
-        os.kill(pid, 0)
-    except OSError as exc:
-        raise ValueError("watchdog process is not alive") from exc
-    return pid
+        return validate_watchdog_process_identity(path, proc_root=proc_root)
+    except (OSError, RunpodSessionError, ValueError) as exc:
+        raise ValueError(f"watchdog process identity is invalid: {exc}") from exc
 
 
 def main() -> None:
@@ -505,7 +557,8 @@ def main() -> None:
         if abs(args.prior_committed_gpu_usd - gpu_reservation.prior_committed_gpu_usd) > 1e-6:
             raise ValueError("prior committed GPU cost disagrees with the cumulative reservation")
         watchdog_payload = json.loads(args.watchdog_state.read_text(encoding="utf-8"))
-        watchdog_pid = validate_watchdog_pid(args.watchdog_pid_file)
+        watchdog_process = validate_watchdog_pid(args.watchdog_pid_file)
+        watchdog_pid = int(watchdog_process["pid"])
         watchdog = validate_watchdog_state(
             watchdog_payload,
             expected_pod_id=args.pod_id,
@@ -559,6 +612,23 @@ def main() -> None:
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "gpus": inventory,
         "cuda_compatibility": cuda_compatibility,
+        "evidence_boundary": {
+            "provider_api": watchdog["provider_api"],
+            "provider_evidence_unavailable": watchdog[
+                "provider_evidence_unavailable"
+            ],
+            "locally_verified_substitutes": {
+                "runtime_gpu_count": len(inventory),
+                "runtime_gpu_source": "nvidia-smi",
+                "cuda_forward_compatibility": True,
+                "cuda_source": "local-driver-and-compatibility-libraries",
+            },
+            "approval_bound_but_not_live_provider_verified": [
+                "global_networking_enabled",
+                "interruptible",
+                "locked",
+            ],
+        },
         "free_disk_gib": free_disk_gib,
         "price": {
             "approved_hourly_per_gpu_usd": args.hourly_per_gpu_usd,
@@ -583,6 +653,7 @@ def main() -> None:
         "gpu_budget_reservation": gpu_budget_gate,
         "watchdog": {
             "pid": watchdog_pid,
+            "process_identity_hash": watchdog_process["record_hash"],
             "state_path": str(args.watchdog_state),
             "state_updated_at": watchdog["updated_at"],
             "effective_deadline": watchdog["effective_deadline"],
@@ -592,6 +663,8 @@ def main() -> None:
         "container_image_digest": watchdog["container_image"],
         "provider_gpu_id": watchdog["provider_gpu_id"],
         "execution_identity_hash": watchdog["execution_identity_hash"],
+        "machine_id_hash": watchdog["machine_id_hash"],
+        "direct_ssh_endpoint_hash": watchdog["direct_ssh_endpoint_hash"],
         "data_center_id": watchdog["data_center_id"],
         "allowed_cuda_versions": args.allowed_cuda_version,
         "vllm_wheel": {

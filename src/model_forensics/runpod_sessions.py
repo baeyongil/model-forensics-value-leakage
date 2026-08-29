@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -16,7 +17,12 @@ from model_forensics.gpu_budget import (
     GpuPhaseBudgetReservation,
     validate_existing_gpu_phase_reservation,
 )
-from model_forensics.io import read_json, stable_hash
+from model_forensics.io import read_json, stable_hash, write_json
+from model_forensics.runpod_recovery import (
+    EXTERNAL_STOP_RECEIPT_FILENAME,
+    RunpodRecoveryError,
+    load_external_stop_receipt,
+)
 
 GPU_BUDGET_BOOTSTRAP_FILENAME = "gpu_budget_bootstrap.json"
 WATCHDOG_STATE_FILENAME = "runpod_watchdog.json"
@@ -25,10 +31,174 @@ GPU_PREFLIGHT_FILENAME = "gpu_preflight.json"
 WATCHDOG_PID_FILENAME = "runpod_watchdog.pid"
 _RAW_HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 _NAMESPACED_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_CONTAINER_IMAGE_DIGEST_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+_WATCHDOG_STATE_SCHEMA_VERSION = 2
+_WATCHDOG_STATE_PROTOCOL_VERSION = "runpod-gpu-cost-watchdog-v2"
+_SETTLEMENT_V2_PROTOCOL_VERSION = "cumulative-gpu-phase-settlement-v2"
+_WATCHDOG_PROCESS_PROTOCOL_VERSION = "runpod-watchdog-process-identity-v1"
+_RUNPOD_V1_PROVIDER_EVIDENCE_GAPS = (
+    "cuda_version",
+    "global_networking_enabled",
+    "interruptible",
+    "locked",
+    "runtime_gpu_count",
+)
 
 
 class RunpodSessionError(RuntimeError):
     """A private GPU session lifecycle is incomplete or inconsistent."""
+
+
+def _read_linux_process_identity(*, pid: int, proc_root: Path) -> dict[str, Any]:
+    """Read the non-reusable Linux identity of one live process.
+
+    A PID alone is not an identity: the kernel can recycle it after a process
+    exits.  Linux exposes both the boot identity and the process start tick,
+    which together distinguish reincarnations.  The exact NUL-delimited
+    command line additionally prevents an unrelated live process from
+    satisfying the watchdog gate.
+    """
+
+    if pid <= 1:
+        raise RunpodSessionError("watchdog PID must identify a non-system process")
+    process_root = proc_root / str(pid)
+    try:
+        stat = (process_root / "stat").read_text(encoding="utf-8")
+        raw_cmdline = (process_root / "cmdline").read_bytes()
+        boot_id = (proc_root / "sys" / "kernel" / "random" / "boot_id").read_text(
+            encoding="utf-8"
+        ).strip()
+    except (FileNotFoundError, OSError) as exc:
+        raise RunpodSessionError("watchdog process identity is not live") from exc
+
+    # ``comm`` is parenthesized and may contain spaces or closing parentheses;
+    # the last ')' therefore marks the stable boundary before field 3.
+    close = stat.rfind(")")
+    if close < 0:
+        raise RunpodSessionError("watchdog process stat record is malformed")
+    fields_after_comm = stat[close + 1 :].split()
+    if len(fields_after_comm) < 20:
+        raise RunpodSessionError("watchdog process stat record is incomplete")
+    raw_start_ticks = fields_after_comm[19]  # proc(5) field 22; field 3 is index 0 here.
+    if not raw_start_ticks.isdigit() or int(raw_start_ticks) <= 0:
+        raise RunpodSessionError("watchdog process start time is invalid")
+    if not raw_cmdline or raw_cmdline.strip(b"\0") == b"":
+        raise RunpodSessionError("watchdog process command line is missing")
+    argv_bytes = raw_cmdline.rstrip(b"\0").split(b"\0")
+    if not argv_bytes or any(not token for token in argv_bytes):
+        raise RunpodSessionError("watchdog process command line is malformed")
+    if re.fullmatch(r"[0-9a-fA-F-]{16,64}", boot_id) is None:
+        raise RunpodSessionError("Linux boot identity is malformed")
+    return {
+        "pid": pid,
+        "linux_boot_id_hash": "sha256:"
+        + hashlib.sha256(boot_id.encode("utf-8")).hexdigest(),
+        "linux_proc_start_ticks": int(raw_start_ticks),
+        "cmdline_hash": "sha256:" + hashlib.sha256(raw_cmdline).hexdigest(),
+        "argv": [os.fsdecode(token) for token in argv_bytes],
+    }
+
+
+def record_watchdog_process_identity(
+    path: str | Path,
+    *,
+    pid: int,
+    required_cmdline_tokens: tuple[str, ...],
+    proc_root: str | Path = "/proc",
+    captured_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Atomically bind the watchdog PID to its start time and exact command line."""
+
+    destination = Path(path)
+    if destination.is_symlink() or destination.exists():
+        raise RunpodSessionError("refusing to replace watchdog process identity record")
+    if not required_cmdline_tokens or any(not token for token in required_cmdline_tokens):
+        raise RunpodSessionError("watchdog process identity requires nonempty command tokens")
+    snapshot = _read_linux_process_identity(pid=pid, proc_root=Path(proc_root))
+    argv = snapshot.pop("argv")
+    missing = [token for token in required_cmdline_tokens if token not in argv]
+    if missing:
+        raise RunpodSessionError("watchdog process command line does not match the armed command")
+    payload = {
+        "schema_version": 1,
+        "protocol_version": _WATCHDOG_PROCESS_PROTOCOL_VERSION,
+        **snapshot,
+        "required_cmdline_token_hashes": [
+            "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+            for token in required_cmdline_tokens
+        ],
+        "captured_at_utc": (captured_at or datetime.now(UTC)).astimezone(UTC).isoformat(),
+    }
+    payload["record_hash"] = stable_hash(payload)
+    write_json(destination, payload)
+    try:
+        destination.chmod(0o600)
+    except OSError:  # pragma: no cover - best effort on unusual filesystems
+        pass
+    return payload
+
+
+def validate_watchdog_process_identity(
+    path: str | Path,
+    *,
+    proc_root: str | Path = "/proc",
+) -> dict[str, Any]:
+    """Require that the process recorded at arm time is still that same process."""
+
+    identity_path = Path(path)
+    _require_regular_private_record(identity_path)
+    try:
+        payload = read_json(identity_path)
+    except (OSError, ValueError) as exc:
+        raise RunpodSessionError("watchdog process identity record is unreadable") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("protocol_version") != _WATCHDOG_PROCESS_PROTOCOL_VERSION
+    ):
+        raise RunpodSessionError("watchdog process identity record is malformed")
+    record_hash = payload.get("record_hash")
+    unsigned = {key: value for key, value in payload.items() if key != "record_hash"}
+    if (
+        not isinstance(record_hash, str)
+        or _NAMESPACED_HASH_RE.fullmatch(record_hash) is None
+        or record_hash != stable_hash(unsigned)
+    ):
+        raise RunpodSessionError("watchdog process identity record hash mismatch")
+    pid = payload.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        raise RunpodSessionError("watchdog process identity PID is invalid")
+    for field in ("linux_boot_id_hash", "cmdline_hash"):
+        if (
+            not isinstance(payload.get(field), str)
+            or _NAMESPACED_HASH_RE.fullmatch(str(payload[field])) is None
+        ):
+            raise RunpodSessionError(f"watchdog process identity {field} is invalid")
+    start_ticks = payload.get("linux_proc_start_ticks")
+    if isinstance(start_ticks, bool) or not isinstance(start_ticks, int) or start_ticks <= 0:
+        raise RunpodSessionError("watchdog process identity start time is invalid")
+    token_hashes = payload.get("required_cmdline_token_hashes")
+    if (
+        not isinstance(token_hashes, list)
+        or not token_hashes
+        or not all(
+            isinstance(value, str) and _NAMESPACED_HASH_RE.fullmatch(value) is not None
+            for value in token_hashes
+        )
+    ):
+        raise RunpodSessionError("watchdog process command token binding is invalid")
+
+    live = _read_linux_process_identity(pid=pid, proc_root=Path(proc_root))
+    for field in (
+        "linux_boot_id_hash",
+        "linux_proc_start_ticks",
+        "cmdline_hash",
+    ):
+        if live[field] != payload[field]:
+            raise RunpodSessionError(
+                "watchdog PID was reused or its process identity changed"
+            )
+    return dict(payload)
 
 
 def _require_regular_private_record(path: Path) -> None:
@@ -100,13 +270,121 @@ def _validated_watchdog(path: Path) -> dict[str, Any]:
         payload = read_json(path)
     except (OSError, ValueError) as exc:
         raise RunpodSessionError(f"cannot read prior watchdog state: {path}") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != 2:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != _WATCHDOG_STATE_SCHEMA_VERSION
+    ):
         raise RunpodSessionError("prior watchdog state is malformed")
-    if payload.get("watchdog_version") != "runpod-gpu-cost-watchdog-v2":
+    if payload.get("watchdog_version") != _WATCHDOG_STATE_PROTOCOL_VERSION:
         raise RunpodSessionError("prior watchdog state version is unsupported")
     if payload.get("status") != "stopped_confirmed":
         raise RunpodSessionError("prior GPU session is not stopped_confirmed")
     return payload
+
+
+def _validated_active_v1_metadata(watchdog: dict[str, Any]) -> dict[str, Any]:
+    """Require the explicit REST-v1 evidence boundary for active compute."""
+
+    metadata = watchdog.get("live_metadata")
+    if not isinstance(metadata, dict) or metadata.get("provider_api") != "rest-v1":
+        raise RunpodSessionError("active session watchdog lacks RunPod rest-v1 evidence")
+    unavailable = metadata.get("provider_evidence_unavailable")
+    expected_gaps = set(_RUNPOD_V1_PROVIDER_EVIDENCE_GAPS)
+    if (
+        not isinstance(unavailable, list)
+        or not all(isinstance(item, str) for item in unavailable)
+        or len(unavailable) != len(set(unavailable))
+        or set(unavailable) != expected_gaps
+    ):
+        raise RunpodSessionError("active session watchdog provider-evidence gaps mismatch")
+    for field in _RUNPOD_V1_PROVIDER_EVIDENCE_GAPS:
+        if field not in metadata or metadata[field] is not None:
+            raise RunpodSessionError(
+                f"active session watchdog v1-unavailable field {field} is not null"
+            )
+    for field in (
+        "execution_identity_hash",
+        "machine_id_hash",
+        "direct_ssh_endpoint_hash",
+    ):
+        value = metadata.get(field)
+        if not isinstance(value, str) or _NAMESPACED_HASH_RE.fullmatch(value) is None:
+            raise RunpodSessionError(f"active session watchdog {field} is invalid")
+    for field in ("pod_id", "provider_gpu_id", "data_center_id", "container_image"):
+        value = metadata.get(field)
+        if not isinstance(value, str) or not value:
+            raise RunpodSessionError(f"active session watchdog {field} is invalid")
+    if _CONTAINER_IMAGE_DIGEST_RE.fullmatch(str(metadata["container_image"])) is None:
+        raise RunpodSessionError("active session watchdog container_image is not digest-pinned")
+    if (
+        metadata.get("ssh_ready") is not True
+        or metadata.get("direct_ssh_ready") is not True
+        or metadata.get("environment_verified") is not True
+        or metadata.get("network_volume_attached") is not False
+    ):
+        raise RunpodSessionError("active session watchdog v1 SSH/environment evidence is unsafe")
+    return metadata
+
+
+def _validate_local_gpu_evidence(
+    preflight: dict[str, Any], *, provider_gpu_id: Any
+) -> None:
+    inventory = preflight.get("gpus")
+    if (
+        not isinstance(inventory, list)
+        or len(inventory) != 8
+        or not all(isinstance(item, dict) for item in inventory)
+    ):
+        raise RunpodSessionError("active session GPU preflight lacks eight local GPU records")
+    indices = [item.get("index") for item in inventory]
+    uuids = [item.get("uuid") for item in inventory]
+    names = [item.get("name") for item in inventory]
+    drivers = [item.get("driver_version") for item in inventory]
+    if indices != list(range(8)):
+        raise RunpodSessionError("active session local GPU indices are not exactly 0 through 7")
+    if (
+        not all(isinstance(value, str) and value for value in uuids)
+        or len(set(uuids)) != 8
+    ):
+        raise RunpodSessionError("active session local GPU UUID evidence is invalid")
+    if not all(isinstance(value, str) and value for value in names) or len(set(names)) != 1:
+        raise RunpodSessionError("active session local GPU family evidence is not homogeneous")
+    if not isinstance(provider_gpu_id, str):
+        raise RunpodSessionError("active session provider GPU identity is invalid")
+    provider_upper = provider_gpu_id.upper()
+    if "H100" in provider_upper:
+        family = "H100"
+    elif "A100" in provider_upper:
+        family = "A100"
+    else:
+        raise RunpodSessionError("active session provider GPU family is unsupported")
+    if family not in str(names[0]).upper():
+        raise RunpodSessionError("active session local GPU family disagrees with provider")
+    for item in inventory:
+        memory = item.get("memory_gib")
+        if (
+            isinstance(memory, bool)
+            or not isinstance(memory, (int, float))
+            or not math.isfinite(float(memory))
+            or float(memory) < 79
+        ):
+            raise RunpodSessionError("active session local GPU memory evidence is insufficient")
+        if str(item.get("mig_mode", "")).lower() != "disabled":
+            raise RunpodSessionError("active session local GPU MIG evidence is unsafe")
+    if not all(isinstance(value, str) and value for value in drivers) or len(set(drivers)) != 1:
+        raise RunpodSessionError("active session local GPU driver evidence is invalid")
+    if preflight.get("allowed_cuda_versions") != ["12.8"]:
+        raise RunpodSessionError("active session frozen CUDA placement evidence mismatch")
+    compatibility = preflight.get("cuda_compatibility")
+    if (
+        not isinstance(compatibility, dict)
+        or compatibility.get("required_environment")
+        != "VLLM_ENABLE_CUDA_COMPATIBILITY=1"
+        or compatibility.get("compatibility_directory") != "/usr/local/cuda-13.0/compat"
+        or compatibility.get("required_libraries")
+        != ["libcuda.so.1", "libnvidia-ptxjitcompiler.so.1"]
+    ):
+        raise RunpodSessionError("active session local CUDA compatibility evidence is invalid")
 
 
 def _validated_settlement(
@@ -114,15 +392,58 @@ def _validated_settlement(
     *,
     bootstrap: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = _authenticated_record(path, protocol=GPU_PHASE_SETTLEMENT_PROTOCOL)
+    _require_regular_private_record(path)
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise RunpodSessionError(f"cannot read authenticated session record: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RunpodSessionError(f"session record must be a JSON object: {path}")
+    version = payload.get("schema_version")
+    protocol = payload.get("protocol_version")
+    if (version, protocol) not in {
+        (1, GPU_PHASE_SETTLEMENT_PROTOCOL),
+        (2, _SETTLEMENT_V2_PROTOCOL_VERSION),
+    }:
+        raise RunpodSessionError(f"session record protocol mismatch: {path}")
+    record_hash = payload.get("record_hash")
+    unsigned = {key: value for key, value in payload.items() if key != "record_hash"}
+    if (
+        not isinstance(record_hash, str)
+        or _NAMESPACED_HASH_RE.fullmatch(record_hash) is None
+        or record_hash != stable_hash(unsigned)
+    ):
+        raise RunpodSessionError(f"session record content hash mismatch: {path}")
     if payload.get("status") != "settled":
         raise RunpodSessionError("prior GPU session settlement is incomplete")
     for field in ("session_hash", "reservation_id", "reservation_record_hash"):
         if payload.get(field) != bootstrap.get(field):
             raise RunpodSessionError(f"prior settlement {field} disagrees with bootstrap")
-    incurred = payload.get("provider_incurred_usd")
-    if isinstance(incurred, bool) or not isinstance(incurred, (int, float)) or float(incurred) < 0:
+    incurred = (
+        payload.get("accounted_gpu_usd")
+        if version == 2
+        else payload.get("provider_incurred_usd")
+    )
+    if (
+        isinstance(incurred, bool)
+        or not isinstance(incurred, (int, float))
+        or not math.isfinite(float(incurred))
+        or float(incurred) < 0
+    ):
         raise RunpodSessionError("prior settlement incurred cost is invalid")
+    if version == 2:
+        for field in (
+            "external_stop_receipt_hash",
+            "stop_evidence_hash",
+            "billing_evidence_hash",
+        ):
+            if (
+                not isinstance(payload.get(field), str)
+                or _NAMESPACED_HASH_RE.fullmatch(str(payload[field])) is None
+            ):
+                raise RunpodSessionError(f"prior settlement {field} is invalid")
+        if payload.get("billing_status") not in {"final", "pending"}:
+            raise RunpodSessionError("prior settlement billing status is invalid")
     return payload
 
 
@@ -144,20 +465,66 @@ def validate_completed_runpod_sessions(
             raise RunpodSessionError(f"unexpected private session entry: {directory}")
         if _RAW_HASH_RE.fullmatch(directory.name) is None:
             raise RunpodSessionError(f"private session directory name is invalid: {directory}")
-        bootstrap = _validated_bootstrap(directory / GPU_BUDGET_BOOTSTRAP_FILENAME)
-        if bootstrap["session_hash"] != f"sha256:{directory.name}":
-            raise RunpodSessionError("private session directory disagrees with session hash")
-        watchdog = _validated_watchdog(directory / WATCHDOG_STATE_FILENAME)
-        settlement = _validated_settlement(
-            directory / SETTLEMENT_FILENAME,
-            bootstrap=bootstrap,
-        )
-        if settlement.get("watchdog_state_hash") != stable_hash(watchdog):
-            raise RunpodSessionError("prior settlement watchdog state hash mismatch")
+        external_path = directory / EXTERNAL_STOP_RECEIPT_FILENAME
+        if external_path.exists():
+            try:
+                external = load_external_stop_receipt(external_path)
+            except RunpodRecoveryError as exc:
+                raise RunpodSessionError("prior external-stop receipt is invalid") from exc
+            bootstrap_path = directory / GPU_BUDGET_BOOTSTRAP_FILENAME
+            if bootstrap_path.exists():
+                bootstrap = _validated_bootstrap(bootstrap_path)
+            else:
+                # A bootstrap failure can leave its authenticated receipt only
+                # on the now-stopped remote volume.  The external-stop receipt
+                # independently binds these three reservation identities, so
+                # it is sufficient for closed-session validation.
+                bootstrap = {
+                    field: external[field]
+                    for field in (
+                        "session_hash",
+                        "reservation_id",
+                        "reservation_record_hash",
+                    )
+                }
+            if bootstrap["session_hash"] != f"sha256:{directory.name}":
+                raise RunpodSessionError("private session directory disagrees with session hash")
+            settlement = _validated_settlement(
+                directory / SETTLEMENT_FILENAME,
+                bootstrap=bootstrap,
+            )
+            for field in ("session_hash", "reservation_id", "reservation_record_hash"):
+                if external.get(field) != bootstrap.get(field):
+                    raise RunpodSessionError(
+                        f"prior external-stop receipt {field} disagrees with bootstrap"
+                    )
+            if settlement.get("schema_version") != 2:
+                raise RunpodSessionError("external-stop session requires settlement v2")
+            if settlement.get("external_stop_receipt_hash") != external.get("record_hash"):
+                raise RunpodSessionError("prior settlement external-stop receipt hash mismatch")
+            if settlement.get("stop_evidence_hash") != external.get("stop_evidence_hash"):
+                raise RunpodSessionError("prior settlement stop evidence hash mismatch")
+            if settlement.get("billing_evidence_hash") != external.get(
+                "billing_evidence_hash"
+            ):
+                raise RunpodSessionError("prior settlement billing evidence hash mismatch")
+            incurred = settlement.get("accounted_gpu_usd")
+        else:
+            bootstrap = _validated_bootstrap(directory / GPU_BUDGET_BOOTSTRAP_FILENAME)
+            if bootstrap["session_hash"] != f"sha256:{directory.name}":
+                raise RunpodSessionError("private session directory disagrees with session hash")
+            watchdog = _validated_watchdog(directory / WATCHDOG_STATE_FILENAME)
+            settlement = _validated_settlement(
+                directory / SETTLEMENT_FILENAME,
+                bootstrap=bootstrap,
+            )
+            if settlement.get("watchdog_state_hash") != stable_hash(watchdog):
+                raise RunpodSessionError("prior settlement watchdog state hash mismatch")
+            incurred = settlement.get("provider_incurred_usd")
         entry = _ledger_entry(ledger, reservation_id=str(bootstrap["reservation_id"]))
         if entry.get("kind") != "gpu" or entry.get("status") != "incurred":
             raise RunpodSessionError("prior GPU reservation is not settled in canonical ledger")
-        if abs(float(entry.get("amount_usd")) - float(settlement["provider_incurred_usd"])) > 1e-6:
+        if abs(float(entry.get("amount_usd")) - float(incurred)) > 1e-6:
             raise RunpodSessionError("prior GPU settlement disagrees with canonical ledger")
         summaries.append(
             {
@@ -231,6 +598,7 @@ def validate_active_runpod_session(
     session_id: str,
     now: datetime | None = None,
     maximum_watchdog_age_seconds: float = 90,
+    proc_root: str | Path = "/proc",
 ) -> dict[str, Any]:
     """Authenticate the live private session immediately before GPU backend use."""
 
@@ -260,14 +628,18 @@ def validate_active_runpod_session(
         watchdog = read_json(watchdog_path)
     except (OSError, ValueError) as exc:
         raise RunpodSessionError("active session watchdog state is unreadable") from exc
-    if not isinstance(watchdog, dict) or watchdog.get("schema_version") != 2:
+    if (
+        not isinstance(watchdog, dict)
+        or watchdog.get("schema_version") != _WATCHDOG_STATE_SCHEMA_VERSION
+    ):
         raise RunpodSessionError("active session watchdog state is malformed")
-    if watchdog.get("watchdog_version") != "runpod-gpu-cost-watchdog-v2":
+    if watchdog.get("watchdog_version") != _WATCHDOG_STATE_PROTOCOL_VERSION:
         raise RunpodSessionError("active session watchdog version is unsupported")
     if watchdog.get("status") != "armed":
         raise RunpodSessionError("active session watchdog is not armed")
     if watchdog.get("action") != "stop_only_preserve_volume":
         raise RunpodSessionError("active session watchdog action is unsafe")
+    live_metadata = _validated_active_v1_metadata(watchdog)
     raw_updated = watchdog.get("updated_at")
     if not isinstance(raw_updated, str):
         raise RunpodSessionError("active session watchdog timestamp is missing")
@@ -279,7 +651,9 @@ def validate_active_runpod_session(
         raise RunpodSessionError("active session watchdog timestamp lacks timezone")
     current = (now or datetime.now(UTC)).astimezone(UTC)
     age = (current - updated.astimezone(UTC)).total_seconds()
-    if age < -300 or age > maximum_watchdog_age_seconds:
+    if age < 0:
+        raise RunpodSessionError("active session watchdog state is in the future")
+    if age > maximum_watchdog_age_seconds:
         raise RunpodSessionError("active session watchdog state is stale")
 
     limits = watchdog.get("limits")
@@ -342,15 +716,11 @@ def validate_active_runpod_session(
         allow_zero=True,
     )
 
-    pid_path = directory / WATCHDOG_PID_FILENAME
-    _require_regular_private_record(pid_path)
-    try:
-        pid = int(pid_path.read_text(encoding="utf-8").strip())
-        if pid <= 1:
-            raise ValueError
-        os.kill(pid, 0)
-    except (OSError, ValueError) as exc:
-        raise RunpodSessionError("active session watchdog process is not alive") from exc
+    process_identity = validate_watchdog_process_identity(
+        directory / WATCHDOG_PID_FILENAME,
+        proc_root=proc_root,
+    )
+    pid = int(process_identity["pid"])
 
     preflight_path = directory / GPU_PREFLIGHT_FILENAME
     _require_regular_private_record(preflight_path)
@@ -364,6 +734,46 @@ def validate_active_runpod_session(
         or preflight.get("passed") is not True
     ):
         raise RunpodSessionError("active session GPU preflight did not pass")
+    evidence_boundary = preflight.get("evidence_boundary")
+    if not isinstance(evidence_boundary, dict):
+        raise RunpodSessionError("active session GPU preflight lacks its evidence boundary")
+    if evidence_boundary.get("provider_api") != "rest-v1" or evidence_boundary.get(
+        "provider_evidence_unavailable"
+    ) != list(_RUNPOD_V1_PROVIDER_EVIDENCE_GAPS):
+        raise RunpodSessionError("active session GPU preflight provider evidence mismatch")
+    local_substitutes = evidence_boundary.get("locally_verified_substitutes")
+    if (
+        not isinstance(local_substitutes, dict)
+        or local_substitutes.get("runtime_gpu_count") != 8
+        or local_substitutes.get("runtime_gpu_source") != "nvidia-smi"
+        or local_substitutes.get("cuda_forward_compatibility") is not True
+        or local_substitutes.get("cuda_source")
+        != "local-driver-and-compatibility-libraries"
+    ):
+        raise RunpodSessionError("active session GPU preflight local evidence is incomplete")
+    if evidence_boundary.get("approval_bound_but_not_live_provider_verified") != [
+        "global_networking_enabled",
+        "interruptible",
+        "locked",
+    ]:
+        raise RunpodSessionError("active session GPU preflight residual evidence gaps mismatch")
+    _validate_local_gpu_evidence(
+        preflight,
+        provider_gpu_id=live_metadata.get("provider_gpu_id"),
+    )
+    for preflight_field, metadata_field in (
+        ("pod_id", "pod_id"),
+        ("execution_identity_hash", "execution_identity_hash"),
+        ("machine_id_hash", "machine_id_hash"),
+        ("direct_ssh_endpoint_hash", "direct_ssh_endpoint_hash"),
+        ("provider_gpu_id", "provider_gpu_id"),
+        ("data_center_id", "data_center_id"),
+        ("container_image_digest", "container_image"),
+    ):
+        if preflight.get(preflight_field) != live_metadata.get(metadata_field):
+            raise RunpodSessionError(
+                f"active session GPU preflight {preflight_field} disagrees with watchdog"
+            )
     gate = preflight.get("gpu_budget_reservation")
     if not isinstance(gate, dict):
         raise RunpodSessionError("active session GPU preflight lacks budget binding")
@@ -398,6 +808,10 @@ def validate_active_runpod_session(
         raise RunpodSessionError("active session GPU preflight watchdog binding is missing")
     if preflight_watchdog.get("pid") != pid:
         raise RunpodSessionError("active session GPU preflight watchdog PID mismatch")
+    if preflight_watchdog.get("process_identity_hash") != process_identity.get("record_hash"):
+        raise RunpodSessionError(
+            "active session GPU preflight watchdog process identity mismatch"
+        )
     state_path = preflight_watchdog.get("state_path")
     if not isinstance(state_path, str) or Path(state_path).resolve() != watchdog_path.resolve():
         raise RunpodSessionError("active session GPU preflight watchdog path mismatch")
@@ -425,6 +839,7 @@ def validate_active_runpod_session(
         "reservation_id": reservation.reservation_id,
         "reservation_record_hash": reservation.manifest()["record_hash"],
         "watchdog_updated_at": updated.astimezone(UTC).isoformat(),
+        "watchdog_process_identity_hash": process_identity["record_hash"],
         "gpu_preflight_hash": stable_hash(preflight),
         "passed": True,
     }
@@ -440,6 +855,8 @@ __all__ = [
     "WATCHDOG_STATE_FILENAME",
     "RunpodSessionError",
     "prepare_runpod_session_directory",
+    "record_watchdog_process_identity",
     "validate_active_runpod_session",
     "validate_completed_runpod_sessions",
+    "validate_watchdog_process_identity",
 ]

@@ -52,8 +52,10 @@ def test_runpod_docs_match_bootstrap_watchdog_and_budget_interfaces() -> None:
     ):
         assert argument in bootstrap
     assert "nohup python3 scripts/runpod_watchdog.py" in bootstrap
-    assert "v2 `cost`" in runpod
-    assert '`{"action":"stop"}`' in runpod
+    assert "v1 `costPerHr`" in runpod
+    assert "`provider_evidence_unavailable`" in runpod
+    assert "never turns absence into a false provider attestation" in runpod
+    assert "`POST /v1/pods/{podId}/stop` with no request body" in runpod
     assert "config/gpu_lock.yaml" in runpod
     assert "container image digest" in runpod
     assert "wheel hash" in runpod

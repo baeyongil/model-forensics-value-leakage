@@ -4,17 +4,35 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 
 from model_forensics.runpod_watchdog import (
     RunpodStopClient,
     WatchdogLimits,
+    bind_lifecycle_pod,
     run_watchdog,
+    wait_for_rearm_then_run_watchdog,
 )
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pod-id", required=True)
+    parser.add_argument(
+        "--pod-id",
+        help=(
+            "optional ambient Pod id; when supplied it must equal the authenticated "
+            "private lifecycle target"
+        ),
+    )
+    parser.add_argument("--lifecycle-state", required=True)
+    parser.add_argument("--expected-session-hash", required=True)
+    parser.add_argument("--expected-phase", required=True)
+    parser.add_argument(
+        "--host-wait-for-rearm",
+        action="store_true",
+        help="acknowledge locally while EXITED, then watch a fresh re-arm/start",
+    )
+    parser.add_argument("--running-readiness-timeout-seconds", type=float, default=300)
     parser.add_argument(
         "--expected-gpu-family",
         choices=("H100", "H100_80GB", "A100", "A100_80GB"),
@@ -35,21 +53,37 @@ def main() -> int:
     parser.add_argument("--state", required=True)
     parser.add_argument("--stop-request")
     parser.add_argument("--api-key-env", default="RUNPOD_API_KEY")
-    args = parser.parse_args()
+    parser.add_argument("--hf-token-env", default="HF_TOKEN")
+    args = parser.parse_args(argv)
+    bound_pod_id = bind_lifecycle_pod(
+        lifecycle_state_path=args.lifecycle_state,
+        expected_session_hash=args.expected_session_hash,
+        expected_phase=args.expected_phase,
+        ambient_pod_id=args.pod_id,
+        waiting_for_rearm=args.host_wait_for_rearm,
+    )
+    approved_compute_hourly_usd = (
+        args.maximum_approved_hourly_per_gpu_usd * args.expected_gpu_count
+    )
     limits = WatchdogLimits(
         gpu_hard_stop_usd=args.gpu_hard_stop_usd,
         maximum_runtime_hours=args.maximum_runtime_hours,
         safety_margin_fraction=args.safety_margin_fraction,
         maximum_approved_hourly_total_usd=(
-            args.maximum_approved_hourly_per_gpu_usd * args.expected_gpu_count
-            + args.maximum_approved_storage_hourly_usd
+            approved_compute_hourly_usd + args.maximum_approved_storage_hourly_usd
         ),
+        maximum_approved_compute_hourly_usd=approved_compute_hourly_usd,
         maximum_approved_storage_hourly_usd=args.maximum_approved_storage_hourly_usd,
         prior_committed_gpu_usd=args.prior_committed_gpu_usd,
     )
-    client = RunpodStopClient(pod_id=args.pod_id, api_key_env=args.api_key_env)
-    run_watchdog(
-        pod_id=args.pod_id,
+    client = RunpodStopClient(
+        pod_id=bound_pod_id,
+        expected_session_hash=args.expected_session_hash,
+        api_key_env=args.api_key_env,
+        hf_token_env=args.hf_token_env,
+    )
+    common = dict(
+        pod_id=bound_pod_id,
         expected_gpu_family=args.expected_gpu_family,
         expected_provider_gpu_id=args.expected_provider_gpu_id,
         allowed_data_center_ids=tuple(args.allowed_data_center_id),
@@ -62,6 +96,16 @@ def main() -> int:
         stop_request_path=args.stop_request,
         poll_seconds=args.poll_seconds,
     )
+    if args.host_wait_for_rearm:
+        wait_for_rearm_then_run_watchdog(
+            lifecycle_state_path=args.lifecycle_state,
+            expected_session_hash=args.expected_session_hash,
+            expected_phase=args.expected_phase,
+            running_readiness_timeout_seconds=args.running_readiness_timeout_seconds,
+            **common,
+        )
+    else:
+        run_watchdog(**common)
     return 0
 
 

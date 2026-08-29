@@ -2,7 +2,8 @@
 
 `scripts/runpod_pod_lifecycle.py` is the only supported creator/re-arm path for the paid Pod. It
 is intentionally not a general RunPod client: there is no delete, terminate, stop, restart, or
-arbitrary update operation. Stopping remains the independently armed watchdog's responsibility.
+arbitrary update operation. Stopping remains the independently armed watchdog's responsibility;
+that process uses only official REST v1 GET and non-destructive `/stop` operations.
 
 The helper authenticates, before constructing an HTTP client:
 
@@ -101,6 +102,14 @@ make gpu-bootstrap GPU_PHASE="$GPU_PHASE"
 
 The watchdog must remain armed for the entire paid phase. It performs stop—not this helper—and the
 reservation must be settled after the stopped state and provider cost are confirmed.
+
+The watchdog's private state protocol remains `schema_version: 2` /
+`runpod-gpu-cost-watchdog-v2`; that is an internal record-format version, not a claim that the
+provider endpoint is v2. `live_metadata.provider_api: rest-v1` identifies the authoritative
+provider source. REST v1 cannot report CUDA placement, runtime GPU inventory, global-networking
+state, or the lock flag, so those values remain null and are disclosed as unavailable. Bootstrap
+supplies local `nvidia-smi` inventory and CUDA compatibility evidence; networking and lock remain
+explicit provider-evidence limitations rather than inferred values.
 
 ## Re-arm the same stopped Pod
 

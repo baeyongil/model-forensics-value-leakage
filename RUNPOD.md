@@ -69,14 +69,23 @@ Do not attach a network volume: the watchdog uses the non-destructive stop opera
 network-volume Pod may require termination. Inject `RUNPOD_API_KEY`, `HF_TOKEN`, and any other
 secret using RunPod Secrets; never serialize their values into the launch spec or its hash.
 
-Creation and watchdog observation both use the approved v2 base
-`https://api.runpod.io/v2`. The watchdog reads the exact Pod with
-`GET /v2/pods/{podId}` and performs only the non-destructive
-`POST /v2/pods/{podId}/action` body `{"action":"stop"}`. The v2 resource is required because it
-exposes the approval-bound image, exact GPU/count, Secure cloud, data center, CUDA host version,
-disks/mounts, ports, networking state, environment shape, SSH readiness, runtime inventory, start
-time, and current compute rate in one authoritative response. Secret values and SSH routes are
-validated in memory and never persisted.
+Creation uses the approval-bound v2 request described above. The independent watchdog observes
+and stops the Pod only through RunPod's official REST v1 Pod API: it reads
+`GET /v1/pods/{podId}?includeMachine=true&includeNetworkVolume=true&includeTemplate=true` and can
+send only the non-destructive `POST /v1/pods/{podId}/stop` request with no body. A live v1 response attests the
+Pod identity, desired status, image, GPU/count, Secure cloud, machine/data center, disks/mount,
+ports, allow-listed environment, direct-SSH readiness, start time, and current `costPerHr`.
+Secret values, machine IDs, public addresses, and SSH routes are validated in memory and never
+persisted; only one-way identity/endpoint hashes survive in the private watchdog state.
+
+REST v1 does **not** expose the placement CUDA version, runtime GPU inventory, global-networking
+flag, or Pod lock flag. The watchdog records those four fields as null and lists them under
+`provider_evidence_unavailable`; it never turns absence into a false provider attestation.
+Bootstrap independently verifies eight unique full GPUs with `nvidia-smi`, records driver
+versions, and verifies the pinned CUDA 13 forward-compatibility libraries. Global networking and
+lock state remain explicit live-provider evidence gaps, bounded by the content-addressed launch
+approval/lifecycle record, exact SSH-only port and environment checks, and the watchdog's
+fail-closed stop retries. They are not described as provider-verified facts.
 
 ## Hard budget and hardware gate
 
@@ -97,11 +106,11 @@ Pro Preview; it does not substitute entry-tier or economy models. This does not 
 API hard stop or authorize a call before the exact paid bundle is explicitly approved.
 
 The approval input uses the provider-displayed **per-GPU hourly price**. The watchdog independently
-reads the live Pod-level v2 `cost` from RunPod and refuses a live compute rate above the frozen
-all-in compute-plus-storage ceiling. The approved GPU projection includes running
-storage. Under the currently reviewed USD 0.10/GB-month schedule, the frozen 50 GB container plus
-650 GB volume is encoded as `700 × 0.10 ÷ 720 ≈ 0.0972222222` USD/hour; the authenticated quote must
-record that derivation's source and timestamp.
+reads the live Pod-level v1 `costPerHr` from RunPod and refuses a live compute rate above the frozen
+compute-only ceiling. It then adds the separately frozen running-storage rate when deriving cost
+and deadline ceilings. Under the currently reviewed USD 0.10/GB-month schedule, the frozen 50 GB
+container plus 650 GB volume is encoded as `700 × 0.10 ÷ 720 ≈ 0.0972222222` USD/hour; the
+authenticated quote must record that derivation's source and timestamp.
 
 ## Reserve once before starting a phase
 
@@ -163,8 +172,8 @@ requires the exact container digest, 64-character wheel SHA-256, pinned 40-chara
 and Jacobian Lens Git commits, environment-manifest hash, smoke hashes, and live `pip freeze` to match. A stale
 active session, an incomplete prior stop, or an unsettled prior reservation blocks re-arm.
 
-The watchdog derives current incurred cost and two absolute deadlines from the provider's live v2
-`startedAt` and `cost`: the 97% safe-budget deadline and approved maximum
+The watchdog derives current incurred cost and two absolute deadlines from the provider's live v1
+`lastStartedAt` and `costPerHr`: the 97% safe-budget deadline and approved maximum
 runtime deadline. It uses the earlier one, never extends the deadline after a reported rate drop,
 and stops early if live metadata becomes unsafe. The private persisted state intentionally omits
 the API response's `env` object and all credentials.
@@ -256,7 +265,7 @@ the 122B model's internal state.
 - After verified sync, request an immediate non-destructive stop with
   `touch "$SESSION_DIR/runpod_stop.request"`; do not wait for the watchdog deadline.
 - Wait until `$SESSION_DIR/runpod_watchdog.json` reports `stopped_confirmed`. The watchdog calls
-  only `POST /v2/pods/{podId}/action` with `{"action":"stop"}` and confirms `status=EXITED`; it
+  only `POST /v1/pods/{podId}/stop` with no request body and confirms `desiredStatus=EXITED`; it
   never calls DELETE.
 - Confirm in the RunPod UI that GPU billing stopped. A stopped Pod may still incur volume/storage
   charges, so remove no-longer-needed storage through the UI only after the local checksum audit.

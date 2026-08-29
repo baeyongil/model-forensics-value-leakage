@@ -26,6 +26,7 @@ def main() -> int:
     parser.add_argument("--gpu-hard-stop-usd", type=float, required=True)
     parser.add_argument("--api-hard-stop-usd", type=float, required=True)
     parser.add_argument("--total-hard-stop-usd", type=float, required=True)
+    parser.add_argument("--proc-root", type=Path, default=Path("/proc"), help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     private_root = (Path.cwd() / ".runpod").resolve()
@@ -54,6 +55,7 @@ def main() -> int:
             reservation=load_gpu_phase_budget_reservation(args.reservation_receipt),
             phase=args.phase,
             session_id=session_id,
+            proc_root=args.proc_root,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
