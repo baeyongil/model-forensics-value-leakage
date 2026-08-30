@@ -72,6 +72,15 @@ entries:
   started_at: '2026-08-29T21:14:14+00:00'
   ended_at: '2026-08-29T22:03:04+00:00'
   elapsed_seconds: 2930.0
+- category: replication
+  minutes: 1050
+  description: Provider-free execution-safety implementation, recovery hardening,
+    independent audits, and automated release-test wall time; includes inactive
+    waits and contains no hypothesis/result interpretation.
+  status: excluded
+  started_at: '2026-08-29T22:03:04+00:00'
+  ended_at: '2026-08-30T15:32:53+00:00'
+  elapsed_seconds: 62989.0
 categories:
   counted:
     hypotheses_and_preregistration: 35

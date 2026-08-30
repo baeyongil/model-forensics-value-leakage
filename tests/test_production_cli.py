@@ -79,6 +79,81 @@ def test_behavior_generate_validates_approval_before_backend_construction(
     assert events == ["approval"]
 
 
+def test_behavior_generate_rejects_source_drift_before_backend_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    placeholder_bindings = SimpleNamespace()
+    placeholder_approval = SimpleNamespace(
+        content_hash="sha256:" + "1" * 64,
+        user_approval=SimpleNamespace(approval_id="reviewed-approval-id"),
+    )
+    monkeypatch.setattr(cli, "load_gpu_quote_lock", lambda path: object())
+    monkeypatch.setattr(cli, "load_api_route_quote_lock", lambda path: object())
+    monkeypatch.setattr(
+        cli,
+        "build_approval_bindings",
+        lambda **kwargs: placeholder_bindings,
+    )
+    monkeypatch.setattr(cli, "load_paid_run_approval", lambda path: placeholder_approval)
+
+    def dirty_source(*args, **kwargs):  # type: ignore[no-untyped-def]
+        events.append("source")
+        raise ValueError("tracked project source differs from the reviewed Git commit")
+
+    def forbidden_backend(*args, **kwargs):  # type: ignore[no-untyped-def]
+        events.append("backend")
+        raise AssertionError("backend must not be constructed")
+
+    monkeypatch.setattr(cli, "require_clean_source_commit", dirty_source)
+    monkeypatch.setattr(cli, "VLLMOfflineBackend", forbidden_backend)
+
+    with pytest.raises(cli.CLIError, match="tracked project source"):
+        cli._command_behavior_generate(_args(tmp_path))
+    assert events == ["source"]
+
+
+def test_paid_gate_passes_authenticated_head_into_approval_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = cli.load_run_config(ROOT / "config/run_122b.yaml")
+    preregistration = cli.load_preregistration(config)
+    placeholder_bindings = SimpleNamespace()
+    placeholder_approval = SimpleNamespace(
+        content_hash="sha256:" + "1" * 64,
+        user_approval=SimpleNamespace(approval_id="reviewed-approval-id"),
+    )
+    source_commit = "a" * 40
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(cli, "load_gpu_quote_lock", lambda path: object())
+    monkeypatch.setattr(cli, "load_api_route_quote_lock", lambda path: object())
+    monkeypatch.setattr(
+        cli,
+        "build_approval_bindings",
+        lambda **kwargs: placeholder_bindings,
+    )
+    monkeypatch.setattr(cli, "load_paid_run_approval", lambda path: placeholder_approval)
+    monkeypatch.setattr(
+        cli,
+        "require_clean_source_commit",
+        lambda *args, **kwargs: source_commit,
+    )
+
+    def validate(*args, **kwargs):  # type: ignore[no-untyped-def]
+        observed.update(kwargs)
+
+    monkeypatch.setattr(cli, "validate_paid_run_approval", validate)
+    cli._validate_paid_phase(
+        _args(Path("unused")),
+        config=config,
+        preregistration=preregistration,
+        command_phase="behavior_baseline_gpu",
+    )
+
+    assert observed["expected_source_commit"] == source_commit
+    assert observed["expected_ledger_path"] == "data/manifests/cost_ledger.yaml"
+
+
 def test_behavior_generate_is_gpu_only_and_resume_skips_model_reload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

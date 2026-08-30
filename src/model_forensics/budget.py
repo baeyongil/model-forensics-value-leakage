@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -11,11 +13,177 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
+try:  # Fresh RunPod images need the read-only budget gate before dependency install.
+    import yaml
+except ImportError:  # pragma: no cover - exercised in an isolated subprocess test
+    yaml = None  # type: ignore[assignment]
 
 from model_forensics.io import atomic_write_text, stable_hash
 
 CostKind = Literal["gpu", "api", "storage", "other"]
+
+_CANONICAL_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z")
+_YAML_IMPLICIT_SCALARS = frozenset(
+    {
+        "null",
+        "~",
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off",
+        ".nan",
+        ".inf",
+        "+.inf",
+        "-.inf",
+    }
+)
+
+
+def _canonical_yaml_scalar(raw: str, *, field: str) -> str:
+    """Decode the scalar forms emitted by ``yaml.safe_dump`` for this ledger.
+
+    This is deliberately not a general YAML parser.  It accepts only the
+    single-line plain, single-quoted, or JSON-compatible double-quoted strings
+    that ``CostLedger`` itself emits.  A fresh image can therefore validate an
+    already-created canonical ledger without installing PyYAML before its
+    watchdog is armed; any broader YAML syntax fails closed.
+    """
+
+    if not raw or raw != raw.strip() or any(ord(character) < 0x20 for character in raw):
+        raise ValueError(f"canonical cost ledger {field} scalar is malformed")
+    if raw.startswith("'"):
+        if len(raw) < 2 or not raw.endswith("'"):
+            raise ValueError(f"canonical cost ledger {field} quote is malformed")
+        inner = raw[1:-1]
+        decoded: list[str] = []
+        index = 0
+        while index < len(inner):
+            character = inner[index]
+            if character != "'":
+                decoded.append(character)
+                index += 1
+                continue
+            if index + 1 >= len(inner) or inner[index + 1] != "'":
+                raise ValueError(f"canonical cost ledger {field} quote is malformed")
+            decoded.append("'")
+            index += 2
+        return "".join(decoded)
+    if raw.startswith('"'):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"canonical cost ledger {field} quote is malformed") from exc
+        if not isinstance(value, str):
+            raise ValueError(f"canonical cost ledger {field} must be text")
+        return value
+    if (
+        raw[0] in "!&*{}[],#|>@`"
+        or raw.startswith(("- ", "? ", ": "))
+        or " #" in raw
+        or ": " in raw
+        or raw.endswith(":")
+        or raw.casefold() in _YAML_IMPLICIT_SCALARS
+        or _CANONICAL_NUMBER_RE.fullmatch(raw) is not None
+        or (field == "occurred_at")
+    ):
+        raise ValueError(f"canonical cost ledger {field} plain scalar is unsafe")
+    return raw
+
+
+def _canonical_number(raw: str, *, field: str) -> float:
+    if _CANONICAL_NUMBER_RE.fullmatch(raw) is None:
+        raise ValueError(f"canonical cost ledger {field} must be numeric")
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"canonical cost ledger {field} must be finite")
+    return value
+
+
+def _stdlib_load_canonical_ledger(text: str) -> dict[str, Any]:
+    """Parse exactly the stable subset emitted by this class's PyYAML writer."""
+
+    if "\r" in text or "\t" in text or not text.endswith("\n"):
+        raise ValueError("canonical cost ledger encoding is malformed")
+    lines = text.splitlines()
+    if len(lines) < 7 or lines[:3] != ["schema_version: 1", "currency: USD", "hard_stops:"]:
+        raise ValueError("canonical cost ledger header is malformed")
+    hard_stop_names = ("gpu", "api", "total")
+    hard_stops: dict[str, float] = {}
+    for offset, name in enumerate(hard_stop_names, start=3):
+        prefix = f"  {name}: "
+        if not lines[offset].startswith(prefix):
+            raise ValueError("canonical cost ledger hard stops are malformed")
+        hard_stops[name] = _canonical_number(
+            lines[offset][len(prefix) :],
+            field=f"hard_stops.{name}",
+        )
+    if lines[6] == "entries: []":
+        if len(lines) != 7:
+            raise ValueError("canonical empty cost ledger has trailing content")
+        return {
+            "schema_version": 1,
+            "currency": "USD",
+            "hard_stops": hard_stops,
+            "entries": [],
+        }
+    if lines[6] != "entries:":
+        raise ValueError("canonical cost ledger entries header is malformed")
+
+    entries: list[dict[str, Any]] = []
+    index = 7
+    expected_fields = ("amount_usd", "description", "status", "occurred_at")
+    while index < len(lines):
+        kind_prefix = "- kind: "
+        if not lines[index].startswith(kind_prefix):
+            raise ValueError("canonical cost ledger entry boundary is malformed")
+        entry: dict[str, Any] = {
+            "kind": _canonical_yaml_scalar(
+                lines[index][len(kind_prefix) :],
+                field="kind",
+            )
+        }
+        index += 1
+        for name in expected_fields:
+            if index >= len(lines):
+                raise ValueError("canonical cost ledger entry is truncated")
+            prefix = f"  {name}: "
+            if not lines[index].startswith(prefix):
+                raise ValueError("canonical cost ledger entry field order is malformed")
+            raw = lines[index][len(prefix) :]
+            entry[name] = (
+                _canonical_number(raw, field=name)
+                if name == "amount_usd"
+                else _canonical_yaml_scalar(raw, field=name)
+            )
+            index += 1
+        if index < len(lines) and lines[index].startswith("  entry_id: "):
+            prefix = "  entry_id: "
+            entry["entry_id"] = _canonical_yaml_scalar(
+                lines[index][len(prefix) :],
+                field="entry_id",
+            )
+            index += 1
+        entries.append(entry)
+    return {
+        "schema_version": 1,
+        "currency": "USD",
+        "hard_stops": hard_stops,
+        "entries": entries,
+    }
+
+
+def _load_cost_ledger(text: str) -> Any:
+    if yaml is not None:
+        return yaml.safe_load(text)
+    return _stdlib_load_canonical_ledger(text)
+
+
+def _dump_cost_ledger(value: Any) -> str:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to mutate the canonical cost ledger")
+    return str(yaml.safe_dump(value, sort_keys=False, allow_unicode=True))
 
 
 @dataclass(frozen=True)
@@ -143,7 +311,7 @@ class CostLedger:
                 "hard_stops": asdict(self.limits),
                 "entries": [],
             }
-        value = yaml.safe_load(self.path.read_text(encoding="utf-8"))
+        value = _load_cost_ledger(self.path.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or not isinstance(value.get("entries"), list):
             raise ValueError(f"invalid cost ledger: {self.path}")
         if value.get("schema_version") != 1 or value.get("currency") != "USD":
@@ -242,7 +410,7 @@ class CostLedger:
             self._assert_limits(self.totals(candidate, include_estimates=True))
             atomic_write_text(
                 self.path,
-                yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
+                _dump_cost_ledger(candidate),
             )
             return self.totals(candidate)
 
@@ -281,7 +449,7 @@ class CostLedger:
             self._assert_limits(totals)
             atomic_write_text(
                 self.path,
-                yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
+                _dump_cost_ledger(candidate),
             )
             return totals
 
@@ -377,7 +545,7 @@ class CostLedger:
             if additions:
                 atomic_write_text(
                     self.path,
-                    yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
+                    _dump_cost_ledger(candidate),
                 )
             return BatchReservationSnapshot(
                 incurred_before=incurred_before,
@@ -454,7 +622,7 @@ class CostLedger:
                     )
             atomic_write_text(
                 self.path,
-                yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
+                _dump_cost_ledger(candidate),
             )
             return ReservationSnapshot(
                 incurred_before=incurred_before,
@@ -495,7 +663,7 @@ class CostLedger:
             self._assert_limits(self.totals(candidate, include_estimates=True))
             atomic_write_text(
                 self.path,
-                yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
+                _dump_cost_ledger(candidate),
             )
             return self.totals(candidate)
 

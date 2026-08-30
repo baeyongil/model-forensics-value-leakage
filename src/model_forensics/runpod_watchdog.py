@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -31,6 +32,9 @@ RUNPOD_API_BASE = RUNPOD_REST_BASE
 RUNPOD_POD_LOOKUP_DOC = "https://docs.runpod.io/api-reference/pods/GET/pods/podId"
 RUNPOD_POD_STOP_DOC = "https://docs.runpod.io/api-reference/pods/POST/pods/podId/stop"
 WATCHDOG_VERSION = "runpod-gpu-cost-watchdog-v2"
+HOST_REARM_ACK_PROTOCOL = "runpod-host-rearm-watchdog-ack-v2"
+HOST_REARM_ACK_FILENAME = "host_rearm_watchdog_ack.json"
+HOST_REARM_HEARTBEAT_MAX_AGE_SECONDS = 20.0
 PROVIDER_API = "rest-v1"
 _POD_ID_RE = re.compile(r"[A-Za-z0-9_-]{3,128}\Z")
 _GPU_FAMILY_RE = {
@@ -63,10 +67,317 @@ _EXPECTED_STATIC_ENV = {
 _EXPECTED_SECRET_ENV_KEYS = frozenset({"HF_TOKEN", "GPU_BUDGET_SESSION_ID"})
 _ALLOWED_PROVIDER_ENV_KEYS = frozenset({"PUBLIC_KEY"})
 _NAMESPACED_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_HOST_REARM_ACK_KEYS = frozenset(
+    {
+        "schema_version",
+        "protocol_version",
+        "status",
+        "expected_session_hash",
+        "expected_phase",
+        "lifecycle_before_hash",
+        "pod_id_hash",
+        "watcher_pid",
+        "watcher_process_identity_hash",
+        "acknowledged_at",
+        "record_hash",
+    }
+)
+_WATCHDOG_STATE_KEYS = frozenset(
+    {
+        "schema_version",
+        "watchdog_version",
+        "pod_id",
+        "status",
+        "armed_at",
+        "updated_at",
+        "live_metadata",
+        "limits",
+        "deadline",
+        "stop_reason",
+        "action",
+        "deletion",
+        "error",
+    }
+)
 
 
 class WatchdogError(RuntimeError):
     """The watchdog cannot establish or enforce a safe stop deadline."""
+
+
+def _host_ack_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise WatchdogError("host re-arm watchdog acknowledgement timestamp is malformed")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise WatchdogError(
+            "host re-arm watchdog acknowledgement timestamp is malformed"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise WatchdogError("host re-arm watchdog acknowledgement timestamp is malformed")
+    return parsed.astimezone(UTC)
+
+
+def _host_process_identity_hash(pid: int) -> str:
+    """Return a stable boot/process-start identity, not merely a reusable PID."""
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        raise WatchdogError("host re-arm watchdog process identity is malformed")
+    proc = Path("/proc") / str(pid)
+    try:
+        if proc.is_dir():
+            stat_raw = (proc / "stat").read_text(encoding="utf-8")
+            closing = stat_raw.rfind(")")
+            fields = stat_raw[closing + 2 :].split() if closing >= 0 else []
+            if len(fields) <= 19:
+                raise WatchdogError("host re-arm watchdog process identity is unavailable")
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="ascii"
+            ).strip()
+            if not boot_id:
+                raise WatchdogError("host re-arm watchdog boot identity is unavailable")
+            return stable_hash(
+                {
+                    "boot_id": boot_id,
+                    "pid": pid,
+                    "process_start_ticks": fields[19],
+                }
+            )
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as exc:
+        raise WatchdogError("host re-arm watchdog process identity is unavailable") from exc
+    started = result.stdout.strip()
+    if result.returncode != 0 or not started:
+        raise WatchdogError("host re-arm watchdog process is not live")
+    return stable_hash({"pid": pid, "process_started_at": started})
+
+
+def _host_ack_payload(
+    *,
+    expected_session_hash: str,
+    expected_phase: str,
+    lifecycle_before_hash: str,
+    pod_id: str,
+    watcher_pid: int,
+    acknowledged_at: datetime,
+    watcher_process_identity_hash: str | None = None,
+) -> dict[str, Any]:
+    process_identity = watcher_process_identity_hash or _host_process_identity_hash(
+        watcher_pid
+    )
+    if _NAMESPACED_HASH_RE.fullmatch(process_identity) is None:
+        raise WatchdogError("host re-arm watchdog process identity hash is malformed")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol_version": HOST_REARM_ACK_PROTOCOL,
+        "status": "armed_and_provider_exited_verified",
+        "expected_session_hash": expected_session_hash,
+        "expected_phase": expected_phase,
+        "lifecycle_before_hash": lifecycle_before_hash,
+        "pod_id_hash": stable_hash({"runpod_pod_id": pod_id}),
+        "watcher_pid": watcher_pid,
+        "watcher_process_identity_hash": process_identity,
+        "acknowledged_at": acknowledged_at.astimezone(UTC).isoformat().replace(
+            "+00:00", "Z"
+        ),
+    }
+    payload["record_hash"] = stable_hash(payload)
+    return payload
+
+
+def _write_host_rearm_ack(path: str | Path, payload: Mapping[str, Any]) -> None:
+    destination = Path(path)
+    if os.path.lexists(destination):
+        raise WatchdogError("host re-arm watchdog acknowledgement is already claimed")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(dict(payload), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+    except FileExistsError as exc:
+        raise WatchdogError(
+            "host re-arm watchdog acknowledgement was concurrently claimed"
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def validate_host_rearm_ack(
+    path: str | Path,
+    *,
+    expected_session_hash: str,
+    expected_phase: str,
+    expected_lifecycle_hash: str,
+    expected_pod_id: str,
+    observed_at: datetime | None = None,
+    maximum_age_seconds: float = 600,
+) -> dict[str, Any]:
+    """Authenticate a live host watcher before a re-arm can request start."""
+
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise WatchdogError("host re-arm watchdog acknowledgement is missing or unsafe")
+    details = source.lstat()
+    if details.st_nlink != 1 or details.st_uid != os.getuid():
+        raise WatchdogError("host re-arm watchdog acknowledgement ownership is unsafe")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WatchdogError("host re-arm watchdog acknowledgement is unreadable") from exc
+    if not isinstance(payload, dict) or set(payload) != _HOST_REARM_ACK_KEYS:
+        raise WatchdogError("host re-arm watchdog acknowledgement schema is unsupported")
+    unsigned = {key: value for key, value in payload.items() if key != "record_hash"}
+    if payload.get("record_hash") != stable_hash(unsigned):
+        raise WatchdogError("host re-arm watchdog acknowledgement hash mismatch")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("protocol_version") != HOST_REARM_ACK_PROTOCOL
+        or payload.get("status") != "armed_and_provider_exited_verified"
+        or payload.get("expected_session_hash") != expected_session_hash
+        or payload.get("expected_phase") != expected_phase
+        or payload.get("lifecycle_before_hash") != expected_lifecycle_hash
+        or payload.get("pod_id_hash")
+        != stable_hash({"runpod_pod_id": expected_pod_id})
+    ):
+        raise WatchdogError("host re-arm watchdog acknowledgement binding mismatch")
+    if (
+        not math.isfinite(maximum_age_seconds)
+        or maximum_age_seconds <= 0
+        or maximum_age_seconds > 600
+    ):
+        raise ValueError("host re-arm acknowledgement age limit is invalid")
+    current = (observed_at or datetime.now(UTC)).astimezone(UTC)
+    acknowledged_at = _host_ack_timestamp(payload.get("acknowledged_at"))
+    age = (current - acknowledged_at).total_seconds()
+    if age < -60 or age > maximum_age_seconds:
+        raise WatchdogError("host re-arm watchdog acknowledgement is stale or future-dated")
+    pid = payload.get("watcher_pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        raise WatchdogError("host re-arm watchdog process identity is malformed")
+    expected_process_identity = payload.get("watcher_process_identity_hash")
+    if (
+        not isinstance(expected_process_identity, str)
+        or _NAMESPACED_HASH_RE.fullmatch(expected_process_identity) is None
+        or not hmac.compare_digest(
+            expected_process_identity,
+            _host_process_identity_hash(pid),
+        )
+    ):
+        raise WatchdogError("host re-arm watchdog process identity changed")
+    return payload
+
+
+def validate_host_rearm_waiting_state(
+    path: str | Path,
+    *,
+    expected_pod_id: str,
+    expected_maximum_runtime_hours: float,
+    expected_hourly_total_usd: float,
+    observed_at: datetime | None = None,
+    maximum_age_seconds: float = HOST_REARM_HEARTBEAT_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
+    """Validate the live heartbeat written by the pre-start host watcher."""
+
+    if (
+        not math.isfinite(maximum_age_seconds)
+        or maximum_age_seconds <= 0
+        or maximum_age_seconds > HOST_REARM_HEARTBEAT_MAX_AGE_SECONDS
+    ):
+        raise ValueError("host re-arm heartbeat age limit is invalid")
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise WatchdogError("host re-arm watchdog heartbeat is missing or unsafe")
+    before = source.lstat()
+    if before.st_nlink != 1 or before.st_uid != os.getuid():
+        raise WatchdogError("host re-arm watchdog heartbeat ownership is unsafe")
+    try:
+        raw = source.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WatchdogError("host re-arm watchdog heartbeat is unreadable") from exc
+    after = source.lstat()
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise WatchdogError("host re-arm watchdog heartbeat changed while read")
+    if not isinstance(payload, dict) or set(payload) != _WATCHDOG_STATE_KEYS:
+        raise WatchdogError("host re-arm watchdog heartbeat schema is unsupported")
+    if (
+        payload.get("schema_version") != 2
+        or payload.get("watchdog_version") != WATCHDOG_VERSION
+        or payload.get("pod_id") != expected_pod_id
+        or payload.get("status") != "waiting_for_start"
+        or payload.get("live_metadata") is not None
+        or payload.get("deadline") is not None
+        or payload.get("stop_reason") is not None
+        or payload.get("action") != "stop_only_preserve_volume"
+        or payload.get("deletion") != "manual_after_verified_sync"
+        or payload.get("error") is not None
+    ):
+        raise WatchdogError("host re-arm watchdog heartbeat binding mismatch")
+    limits = payload.get("limits")
+    if not isinstance(limits, dict):
+        raise WatchdogError("host re-arm watchdog heartbeat limits are missing")
+    runtime = limits.get("maximum_runtime_hours")
+    hourly_total = limits.get("maximum_approved_hourly_total_usd")
+    if (
+        isinstance(runtime, bool)
+        or not isinstance(runtime, (int, float))
+        or not math.isfinite(float(runtime))
+        or float(runtime) <= 0
+        or float(runtime) > expected_maximum_runtime_hours + 1e-9
+        or isinstance(hourly_total, bool)
+        or not isinstance(hourly_total, (int, float))
+        or not math.isclose(
+            float(hourly_total),
+            expected_hourly_total_usd,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    ):
+        raise WatchdogError("host re-arm watchdog heartbeat limit binding mismatch")
+    current = (observed_at or datetime.now(UTC)).astimezone(UTC)
+    armed_at = _host_ack_timestamp(payload.get("armed_at"))
+    updated_at = _host_ack_timestamp(payload.get("updated_at"))
+    age = (current - updated_at).total_seconds()
+    if age < -5 or age > maximum_age_seconds or updated_at < armed_at:
+        raise WatchdogError("host re-arm watchdog heartbeat is stale or future-dated")
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,18 +1036,18 @@ class LifecyclePodBinding:
 def _load_lifecycle_binding(lifecycle_state_path: str | Path) -> tuple[LifecyclePodBinding, dict[str, Any]]:
     """Load the lifecycle record through its secure owner/link/hash/schema checks."""
 
-    # Import lazily so the provider-neutral lifecycle module remains usable
-    # without importing this long-running watcher.
-    from model_forensics.runpod_lifecycle import (
-        RunpodLifecycleError,
-        _authorization_from_state,
-        _load_state,
+    # Import the stdlib-only reader: this must run on a fresh provider image
+    # before Pydantic, PyYAML, or the project virtual environment is installed.
+    from model_forensics.runpod_lifecycle_state import (
+        RunpodLifecycleStateError,
+        authorization_from_state,
+        load_lifecycle_state,
     )
 
     try:
-        state = _load_state(Path(lifecycle_state_path))
-        authorization = _authorization_from_state(state)
-    except (OSError, TypeError, ValueError, RunpodLifecycleError) as exc:
+        state = load_lifecycle_state(Path(lifecycle_state_path))
+        authorization = authorization_from_state(state)
+    except (OSError, TypeError, ValueError, RunpodLifecycleStateError) as exc:
         raise WatchdogError("private RunPod lifecycle binding is invalid") from exc
     pod = state.get("pod")
     if not isinstance(pod, Mapping):
@@ -1444,6 +1755,7 @@ def wait_for_rearm_then_run_watchdog(
     expected_container_image: str,
     limits: WatchdogLimits,
     state_path: str | Path,
+    acknowledgement_path: str | Path,
     client: RunpodStopClient,
     expected_gpu_count: int = 8,
     stop_request_path: str | Path | None = None,
@@ -1472,9 +1784,18 @@ def wait_for_rearm_then_run_watchdog(
     )
     if client.pod_id != bound_id:
         raise ValueError("stop client targets a different lifecycle-bound Pod")
+    state_destination = Path(state_path).resolve()
+    acknowledgement_destination = Path(acknowledgement_path).resolve()
+    if (
+        acknowledgement_destination.name != HOST_REARM_ACK_FILENAME
+        or acknowledgement_destination.parent != state_destination.parent
+    ):
+        raise ValueError(
+            "host re-arm acknowledgement must use its canonical name beside watchdog state"
+        )
     if (
         poll_seconds <= 0
-        or poll_seconds > 60
+        or poll_seconds > 5
         or not math.isfinite(running_readiness_timeout_seconds)
         or running_readiness_timeout_seconds <= 0
         or running_readiness_timeout_seconds > 600
@@ -1482,6 +1803,7 @@ def wait_for_rearm_then_run_watchdog(
         raise ValueError("start polling/readiness limits are invalid")
 
     waiting_at = now().astimezone(UTC)
+    readiness_deadline = monotonic() + running_readiness_timeout_seconds
     waiting_state = _state(
         pod_id=bound_id,
         limits=limits,
@@ -1492,10 +1814,11 @@ def wait_for_rearm_then_run_watchdog(
         now=waiting_at,
     )
     write_json(state_path, waiting_state)
-    first_running_monotonic: float | None = None
+    acknowledged = False
     allowed_transition_operations = {
         "rearm_intent",
         "rearm_patched",
+        "rearm_start_intent",
         "rearm_start_requested",
         "rearm_start_pending",
         "rearm_timeout",
@@ -1506,6 +1829,20 @@ def wait_for_rearm_then_run_watchdog(
 
     while True:
         current_time = now().astimezone(UTC)
+        if monotonic() >= readiness_deadline:
+            _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="rearm_start_or_readiness_timeout",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
+            raise WatchdogError("RunPod re-arm start/readiness observation timed out")
         if stop_request_path is not None and Path(stop_request_path).exists():
             return _stop_until_confirmed(
                 client=client,
@@ -1520,8 +1857,62 @@ def wait_for_rearm_then_run_watchdog(
                 now=now,
             )
 
-        binding, _state_record = _load_lifecycle_binding(lifecycle_state_path)
+        heartbeat_error = _try_write_state(
+            state_path,
+            _state(
+                pod_id=bound_id,
+                limits=limits,
+                status="waiting_for_start",
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                now=current_time,
+            ),
+        )
+        if heartbeat_error is not None:
+            _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="host_heartbeat_persistence_failed",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
+            raise WatchdogError("host re-arm watchdog heartbeat persistence failed")
+
+        try:
+            binding, state_record = _load_lifecycle_binding(lifecycle_state_path)
+        except WatchdogError as exc:
+            _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="lifecycle_read_failed_during_rearm",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
+            raise exc
         if not hmac.compare_digest(binding.pod_id, bound_id):
+            _stop_until_confirmed(
+                client=client,
+                state_path=state_path,
+                limits=limits,
+                armed_at=waiting_at,
+                metadata=None,
+                derived=None,
+                stop_reason="lifecycle_pod_identity_changed_during_rearm",
+                stop_attempts=stop_attempts,
+                sleep=sleep,
+                now=now,
+            )
             raise WatchdogError("private lifecycle Pod identity changed while awaiting re-arm")
         pre_transition = binding.operation == "stopped" and binding.pod_status == "EXITED"
         transition_bound = (
@@ -1551,6 +1942,27 @@ def wait_for_rearm_then_run_watchdog(
             continue
         if provider_status in _TERMINAL_STATUSES:
             if provider_status == "EXITED":
+                if pre_transition and not acknowledged:
+                    lifecycle_hash = state_record.get("record_hash")
+                    if (
+                        not isinstance(lifecycle_hash, str)
+                        or _NAMESPACED_HASH_RE.fullmatch(lifecycle_hash) is None
+                    ):
+                        raise WatchdogError(
+                            "private stopped lifecycle hash is unavailable for host acknowledgement"
+                        )
+                    _write_host_rearm_ack(
+                        acknowledgement_destination,
+                        _host_ack_payload(
+                            expected_session_hash=expected_session_hash,
+                            expected_phase=expected_phase,
+                            lifecycle_before_hash=lifecycle_hash,
+                            pod_id=bound_id,
+                            watcher_pid=os.getpid(),
+                            acknowledged_at=current_time,
+                        ),
+                    )
+                    acknowledged = True
                 sleep(poll_seconds)
                 continue
             terminal = _state(
@@ -1593,10 +2005,7 @@ def wait_for_rearm_then_run_watchdog(
                 limits=limits,
             )
         except WatchdogError as exc:
-            current_monotonic = monotonic()
-            if first_running_monotonic is None:
-                first_running_monotonic = current_monotonic
-            if current_monotonic - first_running_monotonic < running_readiness_timeout_seconds:
+            if monotonic() < readiness_deadline:
                 sleep(poll_seconds)
                 continue
             _stop_until_confirmed(

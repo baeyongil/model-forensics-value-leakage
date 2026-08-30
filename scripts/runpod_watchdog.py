@@ -32,6 +32,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="acknowledge locally while EXITED, then watch a fresh re-arm/start",
     )
+    parser.add_argument(
+        "--host-rearm-ack",
+        help="private acknowledgement written only after the stopped provider Pod is verified",
+    )
     parser.add_argument("--running-readiness-timeout-seconds", type=float, default=300)
     parser.add_argument(
         "--expected-gpu-family",
@@ -97,13 +101,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         poll_seconds=args.poll_seconds,
     )
     if args.host_wait_for_rearm:
+        if args.host_rearm_ack is None:
+            parser.error("--host-wait-for-rearm requires --host-rearm-ack")
         wait_for_rearm_then_run_watchdog(
             lifecycle_state_path=args.lifecycle_state,
             expected_session_hash=args.expected_session_hash,
             expected_phase=args.expected_phase,
+            acknowledgement_path=args.host_rearm_ack,
             running_readiness_timeout_seconds=args.running_readiness_timeout_seconds,
             **common,
         )
+    elif args.host_rearm_ack is not None:
+        parser.error("--host-rearm-ack requires --host-wait-for-rearm")
     else:
         run_watchdog(**common)
     return 0

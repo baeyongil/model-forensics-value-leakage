@@ -17,7 +17,12 @@ from model_forensics.gpu_budget import (
     GpuPhaseBudgetReservation,
     validate_existing_gpu_phase_reservation,
 )
-from model_forensics.io import read_json, stable_hash, write_json
+from model_forensics.io import read_json, sha256_file, stable_hash, write_json
+from model_forensics.runpod_no_start import (
+    NO_START_RECEIPT_FILENAME,
+    NoStartReconciliationError,
+    load_no_start_receipt,
+)
 from model_forensics.runpod_recovery import (
     EXTERNAL_STOP_RECEIPT_FILENAME,
     RunpodRecoveryError,
@@ -27,6 +32,7 @@ from model_forensics.runpod_recovery import (
 GPU_BUDGET_BOOTSTRAP_FILENAME = "gpu_budget_bootstrap.json"
 WATCHDOG_STATE_FILENAME = "runpod_watchdog.json"
 SETTLEMENT_FILENAME = "settlement.json"
+LEGACY_SETTLEMENT_V1_FILENAME = "settlement.v1.json"
 GPU_PREFLIGHT_FILENAME = "gpu_preflight.json"
 WATCHDOG_PID_FILENAME = "runpod_watchdog.pid"
 _RAW_HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -432,19 +438,86 @@ def _validated_settlement(
     ):
         raise RunpodSessionError("prior settlement incurred cost is invalid")
     if version == 2:
-        for field in (
-            "external_stop_receipt_hash",
-            "stop_evidence_hash",
-            "billing_evidence_hash",
-        ):
+        no_start = payload.get("billing_status") == "not_started"
+        evidence_fields = (
+            (
+                "no_start_receipt_hash",
+                "provider_evidence_hash",
+                "billing_evidence_hash",
+            )
+            if no_start
+            else (
+                "external_stop_receipt_hash",
+                "stop_evidence_hash",
+                "billing_evidence_hash",
+            )
+        )
+        for field in evidence_fields:
             if (
                 not isinstance(payload.get(field), str)
                 or _NAMESPACED_HASH_RE.fullmatch(str(payload[field])) is None
             ):
                 raise RunpodSessionError(f"prior settlement {field} is invalid")
-        if payload.get("billing_status") not in {"final", "pending"}:
+        if no_start:
+            if (
+                payload.get("evidence_kind") != "provider_no_start"
+                or float(incurred) != 0.0
+                or payload.get("provider_incurred_usd") != 0.0
+            ):
+                raise RunpodSessionError("prior no-start settlement is inconsistent")
+        elif payload.get("billing_status") not in {"final", "pending"}:
             raise RunpodSessionError("prior settlement billing status is invalid")
     return payload
+
+
+def _validate_legacy_settlement_archive(
+    *,
+    directory: Path,
+    bootstrap: dict[str, Any],
+    settlement: dict[str, Any],
+) -> None:
+    """Validate the exact v1 provenance declared by an upgraded v2 receipt."""
+
+    legacy_fields = {
+        "legacy_settlement_v1_record_hash",
+        "legacy_settlement_v1_file_hash",
+        "legacy_watchdog_state_hash",
+    }
+    present = legacy_fields & set(settlement)
+    if not present:
+        return
+    if present != legacy_fields:
+        raise RunpodSessionError("prior settlement legacy archive binding is incomplete")
+    archive_path = directory / LEGACY_SETTLEMENT_V1_FILENAME
+    legacy = _validated_settlement(archive_path, bootstrap=bootstrap)
+    if legacy.get("schema_version") != 1:
+        raise RunpodSessionError("prior settlement legacy archive is not schema v1")
+    if settlement.get("legacy_settlement_v1_record_hash") != legacy.get("record_hash"):
+        raise RunpodSessionError("prior settlement legacy record hash mismatch")
+    if settlement.get("phase") != legacy.get("phase"):
+        raise RunpodSessionError("prior settlement legacy phase mismatch")
+    file_hash = "sha256:" + sha256_file(archive_path)
+    if settlement.get("legacy_settlement_v1_file_hash") != file_hash:
+        raise RunpodSessionError("prior settlement legacy file hash mismatch")
+    watchdog = _validated_watchdog(directory / WATCHDOG_STATE_FILENAME)
+    watchdog_hash = stable_hash(watchdog)
+    if (
+        legacy.get("watchdog_state_hash") != watchdog_hash
+        or settlement.get("legacy_watchdog_state_hash") != watchdog_hash
+    ):
+        raise RunpodSessionError("prior settlement legacy watchdog state hash mismatch")
+    legacy_amount = _finite_number(
+        legacy.get("provider_incurred_usd"),
+        field="legacy settlement incurred cost",
+        allow_zero=True,
+    )
+    accounted_amount = _finite_number(
+        settlement.get("accounted_gpu_usd"),
+        field="upgraded settlement accounted cost",
+        allow_zero=True,
+    )
+    if abs(legacy_amount - accounted_amount) > 1e-6:
+        raise RunpodSessionError("prior settlement legacy amount mismatch")
 
 
 def validate_completed_runpod_sessions(
@@ -466,7 +539,59 @@ def validate_completed_runpod_sessions(
         if _RAW_HASH_RE.fullmatch(directory.name) is None:
             raise RunpodSessionError(f"private session directory name is invalid: {directory}")
         external_path = directory / EXTERNAL_STOP_RECEIPT_FILENAME
-        if external_path.exists():
+        no_start_path = directory / NO_START_RECEIPT_FILENAME
+        if external_path.exists() and no_start_path.exists():
+            raise RunpodSessionError("prior session has conflicting stop evidence")
+        if no_start_path.exists():
+            try:
+                no_start = load_no_start_receipt(no_start_path)
+            except NoStartReconciliationError as exc:
+                raise RunpodSessionError("prior no-start receipt is invalid") from exc
+            bootstrap_path = directory / GPU_BUDGET_BOOTSTRAP_FILENAME
+            if bootstrap_path.exists():
+                bootstrap = _validated_bootstrap(bootstrap_path)
+            else:
+                bootstrap = {
+                    field: no_start[field]
+                    for field in (
+                        "session_hash",
+                        "reservation_id",
+                        "reservation_record_hash",
+                    )
+                }
+            if bootstrap["session_hash"] != f"sha256:{directory.name}":
+                raise RunpodSessionError("private session directory disagrees with session hash")
+            settlement = _validated_settlement(
+                directory / SETTLEMENT_FILENAME,
+                bootstrap=bootstrap,
+            )
+            for field in ("session_hash", "reservation_id", "reservation_record_hash"):
+                if no_start.get(field) != bootstrap.get(field):
+                    raise RunpodSessionError(
+                        f"prior no-start receipt {field} disagrees with bootstrap"
+                    )
+            if settlement.get("schema_version") != 2:
+                raise RunpodSessionError("no-start session requires settlement v2")
+            if settlement.get("no_start_receipt_hash") != no_start.get("record_hash"):
+                raise RunpodSessionError("prior settlement no-start receipt hash mismatch")
+            if settlement.get("provider_evidence_hash") != no_start.get(
+                "provider_evidence_hash"
+            ):
+                raise RunpodSessionError("prior settlement provider evidence hash mismatch")
+            if settlement.get("billing_evidence_hash") != no_start.get(
+                "billing_evidence_hash"
+            ):
+                raise RunpodSessionError("prior settlement billing evidence hash mismatch")
+            if (
+                settlement.get("billing_status") != "not_started"
+                or settlement.get("evidence_kind") != "provider_no_start"
+                or settlement.get("accounted_gpu_usd") != 0.0
+                or settlement.get("provider_incurred_usd") != 0.0
+                or no_start.get("accounted_gpu_usd") != 0.0
+            ):
+                raise RunpodSessionError("prior no-start settlement is not exactly zero")
+            incurred = 0.0
+        elif external_path.exists():
             try:
                 external = load_external_stop_receipt(external_path)
             except RunpodRecoveryError as exc:
@@ -500,6 +625,11 @@ def validate_completed_runpod_sessions(
                     )
             if settlement.get("schema_version") != 2:
                 raise RunpodSessionError("external-stop session requires settlement v2")
+            _validate_legacy_settlement_archive(
+                directory=directory,
+                bootstrap=bootstrap,
+                settlement=settlement,
+            )
             if settlement.get("external_stop_receipt_hash") != external.get("record_hash"):
                 raise RunpodSessionError("prior settlement external-stop receipt hash mismatch")
             if settlement.get("stop_evidence_hash") != external.get("stop_evidence_hash"):
@@ -508,6 +638,49 @@ def validate_completed_runpod_sessions(
                 "billing_evidence_hash"
             ):
                 raise RunpodSessionError("prior settlement billing evidence hash mismatch")
+            for field in ("billing_status", "evidence_kind"):
+                if settlement.get(field) != external.get(field):
+                    raise RunpodSessionError(
+                        f"prior settlement {field} disagrees with external-stop evidence"
+                    )
+            external_amount = _finite_number(
+                external.get("settlement_amount_usd"),
+                field="external-stop settlement cost",
+                allow_zero=True,
+            )
+            settlement_amount = _finite_number(
+                settlement.get("accounted_gpu_usd"),
+                field="settlement accounted cost",
+                allow_zero=True,
+            )
+            if abs(external_amount - settlement_amount) > 1e-6:
+                raise RunpodSessionError(
+                    "prior settlement amount disagrees with external-stop evidence"
+                )
+            billing = external.get("billing_evidence")
+            if not isinstance(billing, dict):  # authenticated loader also enforces this
+                raise RunpodSessionError("prior external-stop billing evidence is missing")
+            expected_provider_amount = billing.get("provider_amount_usd")
+            if expected_provider_amount is None:
+                if settlement.get("provider_incurred_usd") is not None:
+                    raise RunpodSessionError(
+                        "pending prior settlement claims a provider-incurred amount"
+                    )
+            else:
+                provider_amount = _finite_number(
+                    settlement.get("provider_incurred_usd"),
+                    field="settlement provider-incurred cost",
+                    allow_zero=True,
+                )
+                expected_provider = _finite_number(
+                    expected_provider_amount,
+                    field="external-stop provider-incurred cost",
+                    allow_zero=True,
+                )
+                if abs(provider_amount - expected_provider) > 1e-6:
+                    raise RunpodSessionError(
+                        "prior settlement provider amount disagrees with external-stop evidence"
+                    )
             incurred = settlement.get("accounted_gpu_usd")
         else:
             bootstrap = _validated_bootstrap(directory / GPU_BUDGET_BOOTSTRAP_FILENAME)
@@ -850,6 +1023,7 @@ def validate_active_runpod_session(
 __all__ = [
     "GPU_BUDGET_BOOTSTRAP_FILENAME",
     "GPU_PREFLIGHT_FILENAME",
+    "LEGACY_SETTLEMENT_V1_FILENAME",
     "SETTLEMENT_FILENAME",
     "WATCHDOG_PID_FILENAME",
     "WATCHDOG_STATE_FILENAME",

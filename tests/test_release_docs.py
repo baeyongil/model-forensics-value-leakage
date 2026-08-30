@@ -104,7 +104,7 @@ def test_runpod_docs_match_bootstrap_watchdog_and_budget_interfaces() -> None:
     assert "settled" in runpod
     assert "data/manifests/runpod_watchdog.json" not in runpod
     assert "data/manifests/gpu_preflight.json" not in runpod
-    assert "schema-v2" in runpod
+    assert "schema-v4" in runpod
     assert "full\nsoftware/GPU lock" in runpod
     assert "make behavior-baseline-generate" in runpod
     assert "make behavior-baseline-adjudicate" in runpod
@@ -236,10 +236,10 @@ def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
         text=True,
     ).stdout
     assert "scripts/gpu_budget_reserve.py" in reserve
-    assert "load_gpu_quote_lock" in reserve
-    assert "--approved-phase-runtime-hours" in reserve
-    assert "--quote-hourly-per-gpu-usd" in reserve
-    assert "--running-storage-hourly-usd" in reserve
+    assert "--gpu-quote-lock" in reserve
+    assert "--approved-phase-runtime-hours" not in reserve
+    assert "--quote-hourly-per-gpu-usd" not in reserve
+    assert "--running-storage-hourly-usd" not in reserve
 
     bootstrap_target = subprocess.run(
         [*common, "gpu-bootstrap", "GPU_PHASE=behavior_baseline_gpu"],
@@ -264,20 +264,37 @@ def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
     assert "--session-directory" in active_verify
     assert "--reservation-receipt" in active_verify
 
+    stop_request = subprocess.run(
+        [*common, "gpu-stop-request", "GPU_PHASE=lens_gpu"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "scripts/runpod_host_stop.py request" in stop_request
+    assert "--reservation" in stop_request
+
+    recover_stop = subprocess.run(
+        [*common, "gpu-recover-stop", "GPU_PHASE=lens_gpu"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "scripts/runpod_recover_stop.py" in recover_stop
+    assert "--host-watchdog" in recover_stop
+    assert "--host-stop-request" in recover_stop
+    assert "external_stop_receipt.json" in recover_stop
+
     settle = subprocess.run(
-        [
-            *common,
-            "gpu-settle",
-            "GPU_PHASE=lens_gpu",
-            "PROVIDER_INCURRED_USD=1.25",
-        ],
+        [*common, "gpu-settle", "GPU_PHASE=lens_gpu"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
     assert "scripts/gpu_budget_settle.py" in settle
-    assert "--watchdog-state" in settle
-    assert "--provider-incurred-usd" in settle
+    assert "--external-stop-receipt" in settle
+    assert "--lifecycle-state" in settle
+    assert "--watchdog-state" not in settle
+    assert "--provider-incurred-usd" not in settle
     assert "API_KEY" not in "\n".join(
         (sample, behavior_gpu, behavior_api, anchors, resample_gpu, resample_api)
     )
@@ -292,23 +309,52 @@ def test_make_dry_runs_expose_the_real_nonsecret_cli_arguments() -> None:
     )
 
 
-def test_makefile_scopes_provider_credentials_to_paid_targets() -> None:
+def test_makefile_scopes_provider_credentials_to_paid_targets(tmp_path: Path) -> None:
     makefile = _text("Makefile")
 
-    assert re.search(
-        r"(?m)^export HF_TOKEN OPENROUTER_API_KEY RUNPOD_API_KEY$", makefile
-    ) is None
+    assert re.search(r"(?m)^export HF_TOKEN OPENROUTER_API_KEY RUNPOD_API_KEY$", makefile) is None
     assert "unexport HF_TOKEN OPENROUTER_API_KEY RUNPOD_API_KEY" in makefile
     assert "$(HF_TARGETS): export HF_TOKEN := $(LOCAL_HF)" in makefile
-    assert (
-        "$(OPENROUTER_TARGETS): export OPENROUTER_API_KEY := $(LOCAL_OPENROUTER)"
-        in makefile
-    )
+    assert "$(OPENROUTER_TARGETS): export OPENROUTER_API_KEY := $(LOCAL_OPENROUTER)" in makefile
     assert "gpu-bootstrap: export RUNPOD_API_KEY := $(LOCAL_RUNPOD)" in makefile
+    hf_targets = makefile.split("HF_TARGETS :=", 1)[1].split("OPENROUTER_TARGETS :=", 1)[0]
+    assert "gpu-sync" in hf_targets
+    assert re.search(
+        r"gpu-host-watch-rearm gpu-rearm gpu-recover-stop gpu-sync: "
+        r"export RUNPOD_API_KEY := \$\(LOCAL_RUNPOD\)",
+        makefile,
+    )
     release_recipe = makefile.split("release-check:", 1)[1]
     assert "HF_TOKEN" not in release_recipe
     assert "OPENROUTER_API_KEY" not in release_recipe
     assert "RUNPOD_API_KEY" not in release_recipe
+
+    included_makefile = str(ROOT / "Makefile").replace(" ", r"\ ")
+    probe = tmp_path / "credential-probe.mk"
+    probe.write_text(
+        f"include {included_makefile}\n\n"
+        "gpu-sync:\n"
+        '\t@test "$$HF_TOKEN" = "fixture-hf"\n'
+        '\t@test "$$RUNPOD_API_KEY" = "fixture-runpod"\n',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "make",
+            "--no-print-directory",
+            "-s",
+            "-f",
+            str(probe),
+            "gpu-sync",
+            "HF_TOKEN=fixture-hf",
+            "RUNPOD_API_KEY=fixture-runpod",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
 
 def test_markdown_fences_and_relative_links_are_valid() -> None:
     for name in ("README.md", "RUNPOD.md", "THIRD_PARTY_NOTICES.md"):
@@ -319,6 +365,16 @@ def test_markdown_fences_and_relative_links_are_valid() -> None:
                 continue
             clean = target.split("#", 1)[0]
             assert (ROOT / clean).exists(), f"broken relative link in {name}: {target}"
+            if "#" in target:
+                fragment = target.split("#", 1)[1]
+                headings = re.findall(r"(?m)^#{1,6}\s+(.+?)\s*$", _text(clean))
+                slugs = {
+                    re.sub(r"-+", "-", re.sub(r"[^a-z0-9 _-]", "", heading.lower()))
+                    .strip()
+                    .replace(" ", "-")
+                    for heading in headings
+                }
+                assert fragment in slugs, f"broken relative anchor in {name}: {target}"
 
 
 def test_third_party_notice_preserves_no_license_nonredistribution_boundary() -> None:

@@ -29,6 +29,53 @@ GPU_PHASE="${20}"
 GPU_RESERVATION_RECEIPT="${21}"
 COST_LEDGER="${22}"
 
+EXPECTED_BOOTSTRAP_ROOT="/workspace/model-forensics-value-leakage"
+bootstrap_failure_stop() (
+  local emergency_api_key="${RUNPOD_API_KEY_PRIVATE:-${RUNPOD_API_KEY:-}}"
+  local emergency_session_id="${GPU_BUDGET_SESSION_ID_PRIVATE:-${GPU_BUDGET_SESSION_ID:-}}"
+  if [[ "$PWD" != "$EXPECTED_BOOTSTRAP_ROOT" ]] \
+    || [[ -z "${RUNPOD_POD_ID:-}" ]] \
+    || [[ -z "$emergency_api_key" ]] \
+    || [[ -z "$emergency_session_id" ]] \
+    || [[ ! -f scripts/runpod_bootstrap_failure_stop.py ]]; then
+    return 1
+  fi
+  printf -v RUNPOD_API_KEY '%s' "$emergency_api_key"
+  printf -v GPU_BUDGET_SESSION_ID '%s' "$emergency_session_id"
+  export RUNPOD_API_KEY GPU_BUDGET_SESSION_ID
+  unset HF_TOKEN RUNPOD_API_KEY_PRIVATE GPU_BUDGET_SESSION_ID_PRIVATE \
+    HF_TOKEN_PRIVATE
+  python3 -I -S scripts/runpod_bootstrap_failure_stop.py \
+    --project-root "$EXPECTED_BOOTSTRAP_ROOT" \
+    --phase "$GPU_PHASE" \
+    --reservation "$GPU_RESERVATION_RECEIPT" \
+    --expected-provider-gpu-id "$PROVIDER_GPU_ID" \
+    --allowed-data-center-ids-csv "$DATA_CENTER_IDS_CSV" \
+    --expected-container-image "$CONTAINER_IMAGE_DIGEST" \
+    >/dev/null 2>&1
+)
+early_bootstrap_failure_exit() {
+  local status="$?"
+  if [[ "$status" -ne 0 ]]; then
+    bootstrap_failure_stop || true
+  fi
+  return "$status"
+}
+trap early_bootstrap_failure_exit EXIT
+
+if [[ "$PWD" != "$EXPECTED_BOOTSTRAP_ROOT" ]]; then
+  echo "GPU bootstrap must run from the exact verified project destination" >&2
+  exit 2
+fi
+if [[ ! -f scripts/verify_runpod_sync_bundle.py ]]; then
+  echo "selective-sync verifier is missing" >&2
+  exit 2
+fi
+env -u RUNPOD_API_KEY -u HF_TOKEN -u GPU_BUDGET_SESSION_ID \
+  python3 -I -S scripts/verify_runpod_sync_bundle.py \
+  --project-root "$EXPECTED_BOOTSTRAP_ROOT" \
+  --source-checkout "$EXPECTED_BOOTSTRAP_ROOT"
+
 if [[ "$ALLOWED_CUDA_VERSIONS_CSV" != "12.8" ]]; then
   echo "approved CUDA host version set must be exactly 12.8" >&2
   exit 2
@@ -51,12 +98,13 @@ done
 umask 077
 mkdir -p .runpod
 RUNPOD_SESSIONS_ROOT=".runpod/sessions"
-WATCHDOG_STATE=".runpod/emergency_watchdog.json"
+EMERGENCY_WATCHDOG_STATE=".runpod/emergency_watchdog.json"
+WATCHDOG_STATE="$EMERGENCY_WATCHDOG_STATE"
 WATCHDOG_PID_FILE=".runpod/emergency_watchdog.pid"
 WATCHDOG_LOG=".runpod/emergency_watchdog.log"
 STOP_REQUEST_PATH=".runpod/emergency_stop.request"
 GPU_BUDGET_BOOTSTRAP_STATE=".runpod/gpu_budget_bootstrap.pending.json"
-LIFECYCLE_STATE=".runpod/pod_lifecycle.json"
+LIFECYCLE_STATE="$PWD/.runpod/pod_lifecycle.json"
 EXPECTED_SESSION_HASH=""
 GPU_BOOTSTRAP_TMP=""
 BOOTSTRAP_SUCCEEDED=0
@@ -113,6 +161,10 @@ cleanup_on_exit() {
   local status="$?"
   if [[ "$BOOTSTRAP_SUCCEEDED" != "1" ]]; then
     : > "$STOP_REQUEST_PATH" || true
+    local direct_stop_confirmed=0
+    if bootstrap_failure_stop; then
+      direct_stop_confirmed=1
+    fi
     local watchdog_identity_live=0
     if [[ -n "$WATCHDOG_PID" && -f "$WATCHDOG_PID_FILE" ]] \
       && [[ -f scripts/runpod_process_identity.py ]] \
@@ -121,7 +173,8 @@ cleanup_on_exit() {
         --identity "$WATCHDOG_PID_FILE" >/dev/null 2>&1; then
       watchdog_identity_live=1
     fi
-    if [[ "$watchdog_identity_live" != "1" ]] \
+    if [[ "$direct_stop_confirmed" != "1" ]] \
+      && [[ "$watchdog_identity_live" != "1" ]] \
       && [[ -n "${RUNPOD_POD_ID:-}" ]] \
       && [[ -n "$RUNPOD_API_KEY_PRIVATE" ]] \
       && [[ -n "$HF_TOKEN_PRIVATE" ]] \
@@ -150,7 +203,7 @@ cleanup_on_exit() {
         --maximum-runtime-hours 0.000001 \
         --safety-margin-fraction 0.03 \
         --poll-seconds 1 \
-        --state ".runpod/emergency_stop.json" \
+        --state "$EMERGENCY_WATCHDOG_STATE" \
         >/dev/null 2>&1 || true
     fi
   fi
@@ -438,7 +491,7 @@ else
     echo "frozen GPU bootstrap constraints are absent" >&2
     exit 2
   fi
-  ACTUAL_CONSTRAINTS_SHA256="$(secret_free shasum -a 256 "$BOOTSTRAP_CONSTRAINTS_PATH" | awk '{print $1}')"
+  ACTUAL_CONSTRAINTS_SHA256="$(secret_free sha256sum "$BOOTSTRAP_CONSTRAINTS_PATH" | awk '{print $1}')"
   if [[ "$ACTUAL_CONSTRAINTS_SHA256" != "$BOOTSTRAP_CONSTRAINTS_SHA256" ]]; then
     echo "GPU bootstrap constraints SHA-256 mismatch" >&2
     exit 2
@@ -451,7 +504,7 @@ else
   fi
   VLLM_WHEEL_PATH="$GPU_BOOTSTRAP_TMP/$VLLM_WHEEL_NAME"
   secret_free curl --fail --location --retry 3 --output "$VLLM_WHEEL_PATH" "$VLLM_WHEEL_URL"
-  ACTUAL_VLLM_SHA256="$(secret_free shasum -a 256 "$VLLM_WHEEL_PATH" | awk '{print $1}')"
+  ACTUAL_VLLM_SHA256="$(secret_free sha256sum "$VLLM_WHEEL_PATH" | awk '{print $1}')"
   if [[ "$ACTUAL_VLLM_SHA256" != "$VLLM_WHEEL_SHA256" ]]; then
     echo "vLLM wheel SHA-256 mismatch" >&2
     exit 2
@@ -464,7 +517,7 @@ else
   fi
   SEMANTIC_WHEEL_PATH="$GPU_BOOTSTRAP_TMP/$SEMANTIC_WHEEL_NAME"
   secret_free curl --fail --location --retry 3 --output "$SEMANTIC_WHEEL_PATH" "$SEMANTIC_WHEEL_URL"
-  ACTUAL_SEMANTIC_SHA256="$(secret_free shasum -a 256 "$SEMANTIC_WHEEL_PATH" | awk '{print $1}')"
+  ACTUAL_SEMANTIC_SHA256="$(secret_free sha256sum "$SEMANTIC_WHEEL_PATH" | awk '{print $1}')"
   if [[ "$ACTUAL_SEMANTIC_SHA256" != "$SEMANTIC_WHEEL_SHA256" ]]; then
     echo "sentence-transformers wheel SHA-256 mismatch" >&2
     exit 2

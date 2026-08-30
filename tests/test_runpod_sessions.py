@@ -154,13 +154,21 @@ def _complete_external_stop_session(
         (session_dir / GPU_BUDGET_BOOTSTRAP_FILENAME).read_text(encoding="utf-8")
     )
     pod_id_hash = stable_hash({"runpod_pod_id": "private-pod"})
-    stop = {"desired_status": "EXITED", "environment_verified": True}
+    stop = {
+        "desired_status": "EXITED",
+        "environment_verified": True,
+        "started_at": "2026-08-29T19:00:00Z",
+        "exited_at": "2026-08-29T19:30:00Z",
+        "runtime_ms": 1_800_000,
+    }
     query = {
         "provider_api": "rest-v1",
         "method": "GET",
         "path": "/v1/billing/pods",
         "grouping": "podId",
         "pod_id_hash": pod_id_hash,
+        "start_time": "2026-08-29T19:00:00Z",
+        "end_time": "2026-08-29T19:30:00Z",
     }
     billing = {
         "billing_status": "pending",
@@ -216,6 +224,100 @@ def _complete_external_stop_session(
         "external_stop_receipt_hash": external["record_hash"],
         "stop_evidence_hash": external["stop_evidence_hash"],
         "billing_evidence_hash": external["billing_evidence_hash"],
+        "status": "settled",
+    }
+    settlement["record_hash"] = stable_hash(settlement)
+    write_json(session_dir / SETTLEMENT_FILENAME, settlement)
+
+
+def _complete_no_start_session(
+    *,
+    session_dir: Path,
+    ledger: CostLedger,
+    reservation: GpuPhaseBudgetReservation,
+) -> None:
+    bootstrap = json.loads(
+        (session_dir / GPU_BUDGET_BOOTSTRAP_FILENAME).read_text(encoding="utf-8")
+    )
+    pod_id_hash = stable_hash({"runpod_pod_id": "private-no-start-pod"})
+    observation = {
+        "desired_status": "EXITED",
+        "pod_id_hash": pod_id_hash,
+        "name_hash": stable_hash({"runpod_pod_name": "private-name"}),
+        "image_hash": stable_hash({"runpod_image": "private-image"}),
+        "machine_id_hash": stable_hash({"runpod_machine_id": "private-machine"}),
+        "provider_binding_hash": stable_hash({"provider": "binding"}),
+        "immutable_spec_hash": stable_hash({"immutable": "spec"}),
+        "gpu": {"id": "NVIDIA H100 80GB HBM3", "count": 8},
+        "cloud": "SECURE",
+        "data_center_id": "CA-MTL-1",
+        "container_disk_gb": 50,
+        "persistent_disk_gb": 650,
+        "persistent_mount_path": "/workspace",
+        "ports": ["22/tcp"],
+        "environment_verified": True,
+        "environment_session_context": "current",
+        "pre_start_last_started_at": "2026-08-29T23:00:00Z",
+        "observed_last_started_at": "2026-08-29T23:00:00Z",
+        "last_started_at_unchanged": True,
+        "provider_hourly_compute_usd": 24.0,
+        "approved_hourly_all_in_usd": 24.5,
+    }
+    provider = {
+        **observation,
+        "observation_count": 1,
+        "quiet_window_seconds": 0.0,
+        "first_observation_hash": stable_hash(observation),
+        "second_observation_hash": None,
+    }
+    query = {
+        "provider_api": "rest-v1",
+        "method": "GET",
+        "path": "/v1/billing/pods",
+        "grouping": "podId",
+        "pod_id_hash": pod_id_hash,
+        "start_time": "2026-08-30T00:01:00Z",
+        "end_time": "2026-08-30T00:10:00Z",
+    }
+    billing = {"row_count": 0, "response_hash": stable_hash([])}
+    receipt = {
+        "schema_version": 1,
+        "protocol_version": "runpod-no-start-v1",
+        "status": "no_start_verified",
+        "provider_api": "rest-v1-read-only",
+        "observed_at": "2026-08-30T00:10:00Z",
+        "prior_lifecycle_operation": "rearm_patched",
+        "lifecycle_before_hash": stable_hash({"lifecycle": "before"}),
+        "lifecycle_stopped_hash": stable_hash({"lifecycle": "stopped"}),
+        "session_hash": bootstrap["session_hash"],
+        "reservation_id": bootstrap["reservation_id"],
+        "reservation_record_hash": bootstrap["reservation_record_hash"],
+        "pod_id_hash": pod_id_hash,
+        "provider_evidence": provider,
+        "provider_evidence_hash": stable_hash(provider),
+        "billing_query": query,
+        "billing_query_hash": stable_hash(query),
+        "billing_evidence": billing,
+        "billing_evidence_hash": stable_hash(billing),
+        "accounted_gpu_usd": 0.0,
+    }
+    receipt["record_hash"] = stable_hash(receipt)
+    write_json(session_dir / "no_start_receipt.json", receipt)
+    settle_gpu_phase_budget(ledger=ledger, reservation=reservation, incurred_usd=0.0)
+    settlement = {
+        "schema_version": 2,
+        "protocol_version": "cumulative-gpu-phase-settlement-v2",
+        "phase": bootstrap["phase"],
+        "reservation_id": bootstrap["reservation_id"],
+        "reservation_record_hash": bootstrap["reservation_record_hash"],
+        "session_hash": bootstrap["session_hash"],
+        "provider_incurred_usd": 0.0,
+        "accounted_gpu_usd": 0.0,
+        "billing_status": "not_started",
+        "evidence_kind": "provider_no_start",
+        "no_start_receipt_hash": receipt["record_hash"],
+        "provider_evidence_hash": receipt["provider_evidence_hash"],
+        "billing_evidence_hash": receipt["billing_evidence_hash"],
         "status": "settled",
     }
     settlement["record_hash"] = stable_hash(settlement)
@@ -308,6 +410,44 @@ def test_external_stop_receipt_and_settlement_v2_authorize_next_phase(tmp_path: 
         ledger=ledger,
     )
     assert next_dir != session_dir
+
+
+def test_no_start_zero_settlement_is_a_completed_prior_session(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    reservation, pending = _reserve_pending(
+        tmp_path=tmp_path,
+        ledger=ledger,
+        phase="behavior_treatment_gpu",
+        session_id="no-start-session",
+    )
+    session_dir = prepare_runpod_session_directory(
+        sessions_root=tmp_path / ".runpod" / "sessions",
+        pending_bootstrap_path=pending,
+        ledger=ledger,
+    )
+    _complete_no_start_session(
+        session_dir=session_dir,
+        ledger=ledger,
+        reservation=reservation,
+    )
+    (session_dir / GPU_BUDGET_BOOTSTRAP_FILENAME).unlink()
+
+    summaries = validate_completed_runpod_sessions(
+        sessions_root=session_dir.parent,
+        ledger=ledger,
+    )
+
+    assert summaries == [
+        {
+            "session_hash": reservation.session_hash,
+            "reservation_id": reservation.reservation_id,
+            "settlement_record_hash": json.loads(
+                (session_dir / SETTLEMENT_FILENAME).read_text()
+            )["record_hash"],
+            "status": "stopped_confirmed_and_settled",
+        }
+    ]
+    assert ledger.totals(ledger.document())["gpu"] == 0.0
 
 
 def test_stale_or_active_prior_private_session_blocks_next_phase(tmp_path: Path) -> None:

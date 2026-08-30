@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
+from decimal import ROUND_FLOOR, Decimal
+from pathlib import Path
 
 import pytest
 
 from model_forensics.approval import (
     APPROVAL_FILENAME,
     APPROVAL_SCHEMA_VERSION,
+    PAID_RUN_REVIEW_PROTOCOL_VERSION,
     PHASE_CONTRACT_VERSION,
     ApiQuoteBinding,
     ApprovalBindings,
@@ -16,13 +20,18 @@ from model_forensics.approval import (
     GpuQuote,
     PaidRunApproval,
     PaidRunApprovalError,
+    PaidRunReview,
+    PaidRunReviewPayload,
     RouteBinding,
     SpendingCaps,
     UserApproval,
     approval_content_hash,
     load_paid_run_approval,
+    paid_run_review_hash,
+    require_clean_source_commit,
     validate_paid_run_approval,
 )
+from model_forensics.gpu_budget import approved_gpu_phase_maximum_usd
 from model_forensics.io import stable_hash, write_json
 
 NOW = datetime(2026, 8, 29, 18, tzinfo=UTC)
@@ -38,6 +47,8 @@ RAW_E = stable_hash({"fixture": "other-container"}).removeprefix("sha256:")
 RAW_F = stable_hash({"fixture": "other-wheel"}).removeprefix("sha256:")
 GPU_QUOTE_HASH = stable_hash({"fixture": "gpu-quote"})
 API_QUOTE_HASH = stable_hash({"fixture": "api-quote"})
+LEDGER_BYTES_HASH = stable_hash({"fixture": "ledger-bytes"})
+LEDGER_DOCUMENT_HASH = stable_hash({"fixture": "ledger-document"})
 
 
 def _phase_allocations() -> tuple[GpuPhaseRuntimeAllocation, ...]:
@@ -119,10 +130,95 @@ def _bindings() -> ApprovalBindings:
     )
 
 
+def _review(
+    bindings: ApprovalBindings,
+    planned_command_phases: tuple[str, ...] = (
+        "behavior_baseline_gpu",
+        "behavior_baseline_api",
+    ),
+) -> PaidRunReview:
+    phase_maxima = [
+        {
+            "command_phase": allocation.command_phase,
+            "maximum_usd": approved_gpu_phase_maximum_usd(
+                gpu_count=bindings.gpu.count,
+                quote_hourly_per_gpu_usd=bindings.gpu.quote.usd_per_gpu_hour,
+                running_storage_hourly_usd=bindings.gpu.quote.running_storage_usd_per_hour,
+                approved_runtime_hours=allocation.maximum_runtime_hours,
+            ),
+        }
+        for allocation in bindings.gpu.phase_runtime_allocations
+    ]
+    planned = frozenset(planned_command_phases)
+    future = round(
+        sum(
+            item["maximum_usd"]
+            for item in phase_maxima
+            if item["command_phase"] in planned
+        ),
+        6,
+    )
+    safety_ceiling = float(
+        (Decimal(str(bindings.caps_usd.gpu)) * Decimal("0.97")).quantize(
+            Decimal("0.000001"),
+            rounding=ROUND_FLOOR,
+        )
+    )
+    cumulative = {
+        "ledger_incurred": {"gpu": 0.0, "api": 0.0, "storage": 0.0, "other": 0.0, "total": 0.0},
+        "ledger_committed": {
+            "gpu": 0.0,
+            "api": 0.0,
+            "storage": 0.0,
+            "other": 0.0,
+            "total": 0.0,
+        },
+        "future_gpu_phase_maxima_usd": future,
+        "gpu_worst_case_usd": future,
+        "gpu_safety_margin_fraction": 0.03,
+        "gpu_safety_adjusted_ceiling_usd": safety_ceiling,
+        "gpu_safety_headroom_usd": round(safety_ceiling - future, 6),
+        "gpu_hard_stop_headroom_usd": round(bindings.caps_usd.gpu - future, 6),
+        "api_hard_stop_usd": bindings.caps_usd.api,
+        "total_worst_case_usd": round(future + bindings.caps_usd.api, 6),
+        "total_hard_stop_headroom_usd": round(
+            bindings.caps_usd.total - future - bindings.caps_usd.api,
+            6,
+        ),
+    }
+    payload = PaidRunReviewPayload.model_validate(
+        {
+            "protocol_version": PAID_RUN_REVIEW_PROTOCOL_VERSION,
+            "source_commit": "a" * 40,
+            "context_hashes": {
+                "config": bindings.config_hash,
+                "preregistration": bindings.preregistration_hash,
+                "gpu_lock": bindings.gpu_lock_hash,
+                "gpu_quote_lock": bindings.gpu.quote.content_hash,
+                "api_quote_lock": bindings.api_quote.content_hash,
+                "bindings": stable_hash(bindings.model_dump(mode="json")),
+            },
+            "ledger": {
+                "path": "data/manifests/cost_ledger.yaml",
+                "bytes_sha256": LEDGER_BYTES_HASH,
+                "document_hash": LEDGER_DOCUMENT_HASH,
+                "byte_count": 123,
+            },
+            "planned_command_phases": list(planned_command_phases),
+            "phase_maxima_usd": phase_maxima,
+            "caps_usd": bindings.caps_usd.model_dump(mode="json"),
+            "cumulative_cost": cumulative,
+        }
+    )
+    return PaidRunReview(payload=payload, review_hash=paid_run_review_hash(payload))
+
+
 def _approval(bindings: ApprovalBindings | None = None) -> PaidRunApproval:
+    approval_bindings = bindings or _bindings()
     document = PaidRunApproval(
         schema_version=APPROVAL_SCHEMA_VERSION,
-        bindings=bindings or _bindings(),
+        bindings=approval_bindings,
+        review=_review(approval_bindings),
         allowed_command_phases=("behavior_baseline_gpu", "behavior_baseline_api"),
         user_approval=UserApproval(
             approval_id="approval-yib-20260829-01",
@@ -135,8 +231,24 @@ def _approval(bindings: ApprovalBindings | None = None) -> PaidRunApproval:
     )
 
 
-def _write_raw(tmp_path, raw: dict[str, object]):
+def _write_raw(
+    tmp_path,
+    raw: dict[str, object],
+    *,
+    refresh_review: bool = True,
+):
     path = tmp_path / APPROVAL_FILENAME
+    if refresh_review:
+        try:
+            bindings = ApprovalBindings.model_validate(raw["bindings"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            allowed = tuple(raw.get("allowed_command_phases", ()))
+            try:
+                raw["review"] = _review(bindings, allowed).model_dump(mode="json")
+            except ValueError:
+                pass
     raw["content_hash"] = approval_content_hash(raw)
     write_json(path, raw)
     return path
@@ -165,6 +277,63 @@ def test_load_and_validate_exact_content_addressed_approval(tmp_path) -> None:
     assert validated == approval
 
 
+def test_review_future_gpu_commitment_is_limited_to_the_reviewed_phase_scope() -> None:
+    bindings = _bindings()
+    baseline = _review(bindings, ("behavior_baseline_gpu",)).payload
+    treatment = _review(bindings, ("behavior_treatment_gpu",)).payload
+    api_only = _review(bindings, ("anchors_api",)).payload
+
+    baseline_maximum = baseline.phase_maxima_usd[0].maximum_usd
+    treatment_maximum = treatment.phase_maxima_usd[1].maximum_usd
+    assert baseline.cumulative_cost.future_gpu_phase_maxima_usd == baseline_maximum
+    assert treatment.cumulative_cost.future_gpu_phase_maxima_usd == treatment_maximum
+    assert api_only.cumulative_cost.future_gpu_phase_maxima_usd == 0.0
+    assert len(baseline.phase_maxima_usd) == 4
+
+
+def test_approval_scope_must_exactly_match_the_user_reviewed_scope(tmp_path) -> None:
+    raw = _approval().model_dump(mode="json")
+    raw["allowed_command_phases"] = ["behavior_treatment_gpu"]
+
+    with pytest.raises(PaidRunApprovalError, match="reviewed scope"):
+        load_paid_run_approval(_write_raw(tmp_path, raw, refresh_review=False))
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        ["behavior_baseline_gpu", "behavior_baseline_gpu"],
+        ["behavior_baseline_api", "behavior_baseline_gpu"],
+    ],
+)
+def test_approval_scope_rejects_duplicates_and_noncanonical_order(
+    tmp_path: Path,
+    scope: list[str],
+) -> None:
+    raw = _approval().model_dump(mode="json")
+    raw["allowed_command_phases"] = scope
+    raw["review"]["payload"]["planned_command_phases"] = scope  # type: ignore[index]
+    payload = raw["review"]["payload"]  # type: ignore[index]
+    raw["review"]["review_hash"] = paid_run_review_hash(payload)  # type: ignore[index]
+
+    with pytest.raises(PaidRunApprovalError, match="schema"):
+        load_paid_run_approval(_write_raw(tmp_path, raw, refresh_review=False))
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_approval_loader_rejects_linked_artifacts(tmp_path: Path, link_kind: str) -> None:
+    target = tmp_path / "approval-target.json"
+    write_json(target, _approval().model_dump(mode="json"))
+    claimed = tmp_path / APPROVAL_FILENAME
+    if link_kind == "symlink":
+        claimed.symlink_to(target)
+    else:
+        claimed.hardlink_to(target)
+
+    with pytest.raises(PaidRunApprovalError, match=r"safely open|non-linked"):
+        load_paid_run_approval(claimed)
+
+
 def test_validate_rechecks_content_hash_even_for_in_memory_document() -> None:
     approval = _approval().model_copy(update={"content_hash": SHA_A})
     with pytest.raises(PaidRunApprovalError, match="content hash"):
@@ -174,6 +343,198 @@ def test_validate_rechecks_content_hash_even_for_in_memory_document() -> None:
             command_phase="behavior_baseline_gpu",
             now=NOW,
         )
+
+
+def test_validate_rechecks_nested_schema_for_in_memory_model_copies() -> None:
+    approval = _approval()
+    invalid_payload = approval.review.payload.model_copy(
+        update={"source_commit": "not-a-commit"}
+    )
+    invalid_review = approval.review.model_copy(update={"payload": invalid_payload})
+    invalid = approval.model_copy(update={"review": invalid_review})
+    invalid = invalid.model_copy(update={"content_hash": approval_content_hash(invalid)})
+
+    with pytest.raises(PaidRunApprovalError, match="in-memory"):
+        validate_paid_run_approval(
+            invalid,
+            expected=_bindings(),
+            command_phase="behavior_baseline_gpu",
+            now=NOW,
+        )
+
+
+def test_validate_can_bind_execution_to_the_reviewed_source_commit() -> None:
+    approval = _approval()
+    assert (
+        validate_paid_run_approval(
+            approval,
+            expected=_bindings(),
+            command_phase="behavior_baseline_gpu",
+            now=NOW,
+            expected_source_commit="a" * 40,
+        )
+        == approval
+    )
+    with pytest.raises(PaidRunApprovalError, match="source commit"):
+        validate_paid_run_approval(
+            approval,
+            expected=_bindings(),
+            command_phase="behavior_baseline_gpu",
+            now=NOW,
+            expected_source_commit="b" * 40,
+        )
+
+
+def test_validate_can_bind_execution_to_the_canonical_ledger_path() -> None:
+    approval = _approval()
+    assert (
+        validate_paid_run_approval(
+            approval,
+            expected=_bindings(),
+            command_phase="behavior_baseline_gpu",
+            now=NOW,
+            expected_ledger_path="data/manifests/cost_ledger.yaml",
+        )
+        == approval
+    )
+    with pytest.raises(PaidRunApprovalError, match="canonical runner ledger"):
+        validate_paid_run_approval(
+            approval,
+            expected=_bindings(),
+            command_phase="behavior_baseline_gpu",
+            now=NOW,
+            expected_ledger_path="data/manifests/alternate.yaml",
+        )
+
+
+def _git(project: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_paid_source_commit_allows_only_bound_mutable_and_private_state(tmp_path: Path) -> None:
+    ledger = tmp_path / "data/manifests/cost_ledger.yaml"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text("reviewed ledger\n", encoding="utf-8")
+    source = tmp_path / "runner.py"
+    source.write_text("SOURCE = 'reviewed'\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".runpod/\n", encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "source-gate@example.invalid")
+    _git(tmp_path, "config", "user.name", "Source Gate Test")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "reviewed source")
+    expected = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    ledger.write_text("mutable accounted ledger\n", encoding="utf-8")
+    private = tmp_path / ".runpod/private_receipt.json"
+    private.parent.mkdir()
+    private.write_text("{}\n", encoding="utf-8")
+    assert require_clean_source_commit(tmp_path, mutable_paths=(ledger,)) == expected
+
+    source.write_text("SOURCE = 'dirty'\n", encoding="utf-8")
+    with pytest.raises(PaidRunApprovalError, match="tracked project source"):
+        require_clean_source_commit(tmp_path, mutable_paths=(ledger,))
+    _git(tmp_path, "restore", "runner.py")
+
+    (tmp_path / "unreviewed.py").write_text("SOURCE = 'unreviewed'\n", encoding="utf-8")
+    with pytest.raises(PaidRunApprovalError, match="untracked project source"):
+        require_clean_source_commit(tmp_path, mutable_paths=(ledger,))
+
+
+def test_paid_source_commit_rejects_hidden_index_flags(tmp_path: Path) -> None:
+    source = tmp_path / "runner.py"
+    source.write_text("SOURCE = 'reviewed'\n", encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "source-gate@example.invalid")
+    _git(tmp_path, "config", "user.name", "Source Gate Test")
+    _git(tmp_path, "add", "runner.py")
+    _git(tmp_path, "commit", "-qm", "reviewed source")
+    _git(tmp_path, "update-index", "--assume-unchanged", "runner.py")
+
+    with pytest.raises(PaidRunApprovalError, match="hidden worktree flags"):
+        require_clean_source_commit(tmp_path)
+
+
+def test_review_hash_must_recompute_from_the_complete_review_payload(tmp_path) -> None:
+    raw = _approval().model_dump(mode="json")
+    raw["review"]["payload"]["ledger"]["byte_count"] += 1  # type: ignore[index,operator]
+    path = _write_raw(tmp_path, raw, refresh_review=False)
+
+    with pytest.raises(PaidRunApprovalError, match="review_hash"):
+        load_paid_run_approval(path)
+
+
+@pytest.mark.parametrize(
+    "ledger_path",
+    ["/absolute/cost_ledger.yaml", "data//cost_ledger.yaml", "data/../cost_ledger.yaml"],
+)
+def test_review_ledger_path_must_be_normalized_and_project_relative(
+    tmp_path: Path,
+    ledger_path: str,
+) -> None:
+    raw = _approval().model_dump(mode="json")
+    payload = raw["review"]["payload"]  # type: ignore[index]
+    payload["ledger"]["path"] = ledger_path  # type: ignore[index]
+    raw["review"]["review_hash"] = paid_run_review_hash(payload)  # type: ignore[index]
+
+    with pytest.raises(PaidRunApprovalError, match="schema"):
+        load_paid_run_approval(_write_raw(tmp_path, raw, refresh_review=False))
+
+
+@pytest.mark.parametrize(
+    ("path", "delta"),
+    [
+        (("cumulative_cost", "ledger_incurred", "gpu"), 1.0),
+        (("cumulative_cost", "ledger_committed", "gpu"), 1.0),
+        (("cumulative_cost", "future_gpu_phase_maxima_usd"), 0.1),
+        (("cumulative_cost", "gpu_worst_case_usd"), 0.1),
+        (("cumulative_cost", "gpu_safety_adjusted_ceiling_usd"), 0.1),
+        (("cumulative_cost", "gpu_safety_headroom_usd"), 0.1),
+        (("cumulative_cost", "gpu_hard_stop_headroom_usd"), 0.1),
+        (("cumulative_cost", "api_hard_stop_usd"), 0.1),
+        (("cumulative_cost", "total_worst_case_usd"), 0.1),
+        (("cumulative_cost", "total_hard_stop_headroom_usd"), 0.1),
+        (("cumulative_cost", "ledger_committed", "total"), 0.1),
+    ],
+)
+def test_review_rejects_rehashed_but_internally_inconsistent_cost_equations(
+    tmp_path,
+    path: tuple[str, ...],
+    delta: float,
+) -> None:
+    raw = _approval().model_dump(mode="json")
+    payload = raw["review"]["payload"]  # type: ignore[index]
+    target = payload
+    for component in path[:-1]:
+        target = target[component]  # type: ignore[index,assignment]
+    target[path[-1]] += delta  # type: ignore[index,operator]
+    raw["review"]["review_hash"] = paid_run_review_hash(payload)  # type: ignore[index]
+
+    with pytest.raises(PaidRunApprovalError, match="schema"):
+        load_paid_run_approval(_write_raw(tmp_path, raw, refresh_review=False))
+
+
+def test_review_rejects_committed_api_cost_above_its_hard_stop(tmp_path) -> None:
+    raw = _approval().model_dump(mode="json")
+    payload = raw["review"]["payload"]  # type: ignore[index]
+    committed = payload["cumulative_cost"]["ledger_committed"]  # type: ignore[index]
+    committed["api"] = 101.0  # type: ignore[index]
+    committed["total"] = 101.0  # type: ignore[index]
+    raw["review"]["review_hash"] = paid_run_review_hash(payload)  # type: ignore[index]
+
+    with pytest.raises(PaidRunApprovalError, match="schema"):
+        load_paid_run_approval(_write_raw(tmp_path, raw, refresh_review=False))
 
 
 def test_strict_schema_rejects_coerced_numeric_values(tmp_path) -> None:
@@ -538,6 +899,10 @@ def test_placeholders_and_secret_like_approval_ids_are_rejected(
         (("bindings",), {"surprise": True}),
         (("bindings", "gpu", "quote"), {"surprise": True}),
         (("bindings", "routes", 0), {"surprise": True}),
+        (("review",), {"surprise": True}),
+        (("review", "payload"), {"surprise": True}),
+        (("review", "payload", "ledger"), {"surprise": True}),
+        (("review", "payload", "cumulative_cost"), {"surprise": True}),
         (("user_approval",), {"surprise": True}),
     ],
 )
@@ -552,7 +917,13 @@ def test_unknown_fields_are_rejected_at_every_schema_level(
         target = target[component]  # type: ignore[index]
     target.update(extra)  # type: ignore[union-attr]
     with pytest.raises(PaidRunApprovalError, match="schema"):
-        load_paid_run_approval(_write_raw(tmp_path, raw))
+        load_paid_run_approval(
+            _write_raw(
+                tmp_path,
+                raw,
+                refresh_review=not path or path[0] != "review",
+            )
+        )
 
 
 @pytest.mark.parametrize(

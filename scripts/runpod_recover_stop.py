@@ -9,6 +9,7 @@ import os
 import re
 from pathlib import Path
 
+from model_forensics.runpod_host_control import validate_host_stop_confirmation
 from model_forensics.runpod_recovery import (
     EXTERNAL_STOP_RECEIPT_FILENAME,
     RunpodRecoveryClient,
@@ -32,6 +33,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--failed-watchdog", type=Path)
     parser.add_argument("--failed-log", type=Path)
+    parser.add_argument("--phase")
+    parser.add_argument("--reservation", type=Path)
+    parser.add_argument("--host-watchdog", type=Path)
+    parser.add_argument("--host-stop-request", type=Path)
     parser.add_argument(
         "--allow-pending-billing-ceiling",
         action="store_true",
@@ -59,12 +64,31 @@ def main() -> int:
             raise RunpodRecoveryError("private lifecycle session is unavailable")
         session_digest = authorization["session_hash"].removeprefix("sha256:")
         output = args.output or (
-            root
-            / ".runpod"
-            / "sessions"
-            / session_digest
-            / EXTERNAL_STOP_RECEIPT_FILENAME
+            root / ".runpod" / "sessions" / session_digest / EXTERNAL_STOP_RECEIPT_FILENAME
         )
+        normal_controls = (
+            args.phase,
+            args.reservation,
+            args.host_watchdog,
+            args.host_stop_request,
+        )
+        if any(value is not None for value in normal_controls):
+            if not all(value is not None for value in normal_controls):
+                raise ValueError(
+                    "normal stop recovery requires phase, reservation, host watchdog, "
+                    "and host stop request together"
+                )
+            assert args.phase is not None
+            assert args.reservation is not None
+            assert args.host_watchdog is not None
+            assert args.host_stop_request is not None
+            validate_host_stop_confirmation(
+                project_root=root,
+                phase=args.phase,
+                reservation_path=args.reservation,
+                watchdog_path=args.host_watchdog,
+                stop_request_path=args.host_stop_request,
+            )
         receipt = attest_external_stop(
             project_root=root,
             client=RunpodRecoveryClient(api_key=api_key),
@@ -72,6 +96,10 @@ def main() -> int:
             allow_pending_billing_ceiling=args.allow_pending_billing_ceiling,
             failed_watchdog_path=args.failed_watchdog,
             failed_log_path=args.failed_log,
+            host_watchdog_path=args.host_watchdog,
+            host_stop_request_path=args.host_stop_request,
+            host_phase=args.phase,
+            host_reservation_path=args.reservation,
         )
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(str(exc)) from exc

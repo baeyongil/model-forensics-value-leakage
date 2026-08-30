@@ -3,6 +3,10 @@
 No paid Pod is authorized by this document. Launch only after the user confirms the exact
 machine, current price, planned maximum runtime, and estimated charge.
 
+This frozen study uses only the already authenticated, stopped research Pod. The creation shape
+below remains documentation of the capability-limited implementation; it is not authorization to
+create another Pod. Every study phase, including baseline, starts through the guarded re-arm flow.
+
 Pod creation and stopped-Pod re-arming must use the production-safe workflow in
 [`docs/runpod_lifecycle.md`](docs/runpod_lifecycle.md). It records the official v2 request shape,
 private secret boundary, duplicate-spend lock, bounded readiness polling, and recovery rules.
@@ -26,10 +30,10 @@ hashes and any existing model-forensics lifecycle claim still fail closed.
    vLLM wheel. A floating image tag or unverified wheel fails preflight.
 
 Before any reservation, use the two-step private-bundle workflow in
-[`README.md`](README.md#freeze-and-review-the-private-paid-bundle). `preview` either exclusively
+[`README.md`](README.md#freeze-and-review-the-fresh-private-paid-bundle). `preview` either exclusively
 creates both content-addressed quote locks from independently reviewed private specifications or
 authenticates locks that already exist. It prints a non-authorizing cost/binding summary. Only
-after the user explicitly approves that exact summary may `approve` create schema-v2
+after the user explicitly approves that exact summary may `approve` create schema-v4
 `.runpod/paid_run_approval.json` with an explicit identifier, timestamp, and phase list. Neither
 action contacts a provider or starts paid work. The approval binds the canonical hash of the full
 software/GPU lock in addition to the exact quote, route, runtime, and budget fields.
@@ -42,32 +46,40 @@ The approved primary launch is an 8-GPU Secure Pod with this exact immutable ima
 `sha256:18d90716b6bb9f4bed820c08e5b80cf6e0a99eb14e611b3446db82729b2d0b18`). The image includes
 `cuda-compat-13-0` and `/start.sh`; do not override its entrypoint or start command.
 
-The v2 create helper must bind and hash this request shape before launch; values marked “from
-quote” come only from the authenticated GPU quote lock:
+The disabled v2 create implementation binds and hashes this secret-redacted request shape; values
+marked “from quote” come only from the authenticated GPU quote lock. This is audit documentation,
+not a launch command:
 
 ```json
 {
-  "cloudType": "SECURE",
-  "computeType": "GPU",
-  "gpuTypeIds": ["NVIDIA H100 80GB HBM3"],
-  "gpuCount": 8,
-  "allowedCudaVersions": ["12.8"],
-  "dataCenterIds": ["FROM_FROZEN_QUOTE"],
-  "imageName": "runpod/pytorch@sha256:e855789ff7e4b1ad76698171b1974a99a5c48c5b3e80a908976987938b090992",
-  "containerDiskInGb": 50,
-  "volumeInGb": 650,
-  "volumeMountPath": "/workspace",
+  "name": "model-forensics-<approved-phase>",
+  "image": "runpod/pytorch@sha256:e855789ff7e4b1ad76698171b1974a99a5c48c5b3e80a908976987938b090992",
+  "disk": 50,
   "ports": ["22/tcp"],
-  "supportPublicIp": true,
-  "dockerEntrypoint": [],
-  "dockerStartCmd": [],
-  "env": {"VLLM_ENABLE_CUDA_COMPATIBILITY": "1"}
+  "env": {
+    "HF_TOKEN": "<secret>",
+    "GPU_BUDGET_SESSION_ID": "<secret>",
+    "HF_HOME": "/workspace/.cache/huggingface",
+    "HF_HUB_CACHE": "/workspace/.cache/huggingface/hub",
+    "TRANSFORMERS_CACHE": "/workspace/.cache/huggingface/transformers",
+    "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
+    "VLLM_ENABLE_CUDA_COMPATIBILITY": "1"
+  },
+  "cloud": "SECURE",
+  "gpu": {"id": "NVIDIA H100 80GB HBM3", "count": 8},
+  "dataCenterIds": ["FROM_FROZEN_QUOTE"],
+  "globalNetworking": false,
+  "mounts": {"persistent": {"size": 650, "path": "/workspace"}},
+  "startJupyter": false,
+  "startSsh": true
 }
 ```
 
 Do not attach a network volume: the watchdog uses the non-destructive stop operation, while a
-network-volume Pod may require termination. Inject `RUNPOD_API_KEY`, `HF_TOKEN`, and any other
-secret using RunPod Secrets; never serialize their values into the launch spec or its hash.
+network-volume Pod may require termination. The launch environment contains only the allow-listed
+Hugging Face token, session nonce, and fixed cache/runtime values. RunPod must separately expose
+its provider-managed Pod identity and Pod-scoped API key at runtime; never serialize those values
+into the launch environment, lifecycle state, or report.
 
 Creation uses the approval-bound v2 request described above. The independent watchdog observes
 and stops the Pod only through RunPod's official REST v1 Pod API: it reads
@@ -89,8 +101,8 @@ fail-closed stop retries. They are not described as provider-verified facts.
 
 ## Hard budget and hardware gate
 
-- Preferred hardware: one homogeneous 8× H100 80GB Pod.
-- Fallback hardware: one homogeneous 8× A100 80GB Pod.
+- Authorized hardware: the existing homogeneous 8× H100 80GB research Pod. A100 is not an
+  approved fallback for this frozen execution.
 - Exactly eight unique full-GPU UUIDs are required; MIG and mixed GPU families are rejected.
 - The quote and approval also freeze the exact provider GPU ID, `SECURE` cloud, allowed data
   centers, CUDA `12.8`, 50 GB container disk, 650 GB volume, and running-storage hourly rate.
@@ -98,7 +110,7 @@ fail-closed stop retries. They are not described as provider-verified facts.
   recommended.
 - GPU hard stop: USD 220.
 - External judge/classifier hard stop: USD 100.
-- Unallocated reserve: USD 5.
+- RunPod storage reserve: USD 5.
 - Total hard stop: USD 325.
 
 The frozen quality-first API design sends every valid final to both Claude Opus 5 and Gemini 3.1
@@ -142,13 +154,63 @@ only immediately before a committed launch. If the Pod is never started, do not 
 `stopped_confirmed` record or settlement; the outstanding reservation remains fail-closed until a
 reviewed no-launch recovery is performed.
 
-## Bootstrap or re-arm the stopped Pod
+## Guarded re-arm and bootstrap of the stopped Pod
 
-After the approved Pod starts, copy or clone only this repository, restore the reservation receipt
-and ledger at their original paths, and inject the same `GPU_BUDGET_SESSION_ID`. From the repository
-root, run the lock-derived fail-closed bootstrap:
+For every paid study phase, including the baseline phase on the existing stopped research Pod,
+keep `make gpu-host-watch-rearm GPU_PHASE="$GPU_PHASE"` running in a dedicated host terminal.
+After its private acknowledgement appears, run `make gpu-rearm GPU_PHASE="$GPU_PHASE"` in a second
+terminal. The re-arm path verifies the host watcher acknowledgement and live PID immediately
+before provider start; direct invocation without that guard fails closed. Full commands and
+recovery rules are in
+[`docs/runpod_lifecycle.md`](docs/runpod_lifecycle.md#re-arm-the-same-stopped-pod).
+
+After start, run the one-shot `make gpu-sync` command documented below. It clones the exact
+approved and pushed source commit into a new clean remote stage, transfers only the authenticated
+lifecycle/reservation/ledger/approval controls and validated completed-session evidence, verifies
+the stage, then recoverably promotes it at exactly
+`/workspace/model-forensics-value-leakage`. The old checkout is preserved under
+`/workspace/.model-forensics-sync-archive/`; the current host-watch session is never copied.
+The transfer requires a live phase/session/Pod-bound acknowledgement, a watcher heartbeat
+no older than 20 seconds, no pending stop request, and exact incurred-ledger coverage. A failure
+after the one-shot claim durably requests an immediate host-watcher stop and independently calls
+the exact-Pod provider stop path, which must confirm `EXITED` or `TERMINATED` before returning.
+Keep the local `RUNPOD_API_KEY` and `HF_TOKEN` exported through `gpu-sync`; they never enter argv or
+the remote bundle and are used only to preflight that independent stop capability before first SSH.
+
+Only a `rearmed` running lifecycle is eligible: the first `created` path has no equivalent
+independently armed host-guard producer and must be stopped and settled before a fresh guarded
+re-arm. Heartbeat timestamps and derived counters may then advance normally, while the
+acknowledgement, watcher process-start identity, execution/limit/deadline invariants, and
+provider-derived direct SSH endpoint hash remain exact. Never fabricate a first-create
+acknowledgement to bypass this gate.
+
+The transfer accepts only the exact `root@<canonical IPv4>` direct-SSH target and numeric public
+port returned for this Pod. Before materialization, claiming, or any SSH/rsync command, it hashes
+that IP/port with the same domain-separated encoding as the live watchdog and compares it in
+constant time with the authenticated sync-plan guard. Hostnames, aliases, alternate users, or an
+endpoint belonging to another Pod fail without issuing a remote command or requesting a stop.
+
+After `gpu-sync` succeeds, open the already host-key-pinned direct SSH session and run the
+lock-derived fail-closed bootstrap from the exact installed destination. Do not forward local
+credentials or override the Pod's provider-managed environment. The sync manifest expires
+five minutes after creation; do not leave a manual gap between sync and bootstrap. If the initial
+manifest/source verifier fails or expires, a pre-armed standard-library failure handler
+prefers the exact lifecycle/reservation/session binding. Missing or corrupt local controls switch
+to an independent read-only provider gate: the ambient Pod id, in-memory session nonce, exact
+research name, pinned image, 8x H100 Secure Cloud hardware, approved location, local storage,
+SSH-only endpoint, allow-listed environment, and no network volume must all agree before any stop
+POST. A mismatch sends no POST; a successful stop must be confirmed as exactly `EXITED` before the
+failed bootstrap returns:
 
 ```bash
+ssh -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -p "$RUNPOD_SSH_PORT" "$RUNPOD_SSH_HOST"
+
+# Run the remaining commands inside the Pod.
+cd /workspace/model-forensics-value-leakage
+GPU_PHASE='behavior_baseline_gpu'  # advance this value for later frozen phases
+test -n "${RUNPOD_POD_ID:-}" && test -n "${RUNPOD_API_KEY:-}" \
+  && test -n "${GPU_BUDGET_SESSION_ID:-}" && test -n "${HF_TOKEN:-}"
 make gpu-bootstrap GPU_PHASE="$GPU_PHASE"
 ```
 
@@ -278,34 +340,40 @@ the 122B model's internal state.
   checkout into a release bundle.
 - Sync needed outputs to the local workspace and verify SHA-256 hashes before declaring the sync
   complete.
-- Derive the private session directory from the authenticated receipt's non-secret hash:
+- After verified output sync, request the immediate non-destructive stop from the independently
+  running **host** watcher. This target derives the exact private session from the authenticated
+  reservation, requires a heartbeat no older than 20 seconds and the original live watcher
+  process identity, then atomically creates only the canonical local request:
 
   ```bash
-  GPU_RESERVATION_RECEIPT=".runpod/reservations/${GPU_PHASE}.json"
-  SESSION_HASH_HEX="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["session_hash"].removeprefix("sha256:"))' "$GPU_RESERVATION_RECEIPT")"
-  SESSION_DIR="$PWD/.runpod/sessions/$SESSION_HASH_HEX"
+  make gpu-stop-request GPU_PHASE="$GPU_PHASE"
   ```
 
-- After verified sync, request an immediate non-destructive stop with
-  `touch "$SESSION_DIR/runpod_stop.request"`; do not wait for the watchdog deadline.
-- Wait until `$SESSION_DIR/runpod_watchdog.json` reports `stopped_confirmed`. The watchdog calls
-  only `POST /v1/pods/{podId}/stop` with no request body and confirms `desiredStatus=EXITED`; it
-  never calls DELETE.
+- Keep Terminal A open until its local
+  `.runpod/sessions/<session-hash>/host_rearm_watchdog.json` reports
+  `stopped_confirmed` with `stop_reason=external_stop_request`. The host watcher calls only
+  `POST /v1/pods/{podId}/stop` with no request body and confirms `desiredStatus=EXITED`; it never
+  calls DELETE. Do not depend on SSH after provider stop and do not retrieve or fabricate a
+  remote `runpod_watchdog.json`.
 - Confirm in the RunPod UI that GPU billing stopped. A stopped Pod may still incur volume/storage
   charges, so remove no-longer-needed storage through the UI only after the local checksum audit.
-- Read the authoritative provider-incurred GPU charge, then reconcile the exact reservation. The
-  settlement command is idempotent only for the identical charge and authenticated receipt:
+- Convert the provider-confirmed host stop into a read-only external-stop receipt and a CAS-bound
+  local lifecycle transition to `stopped` / `EXITED`, then settle schema v2 from that receipt:
 
 ```bash
-make gpu-settle \
-  GPU_PHASE="$GPU_PHASE" \
-  PROVIDER_INCURRED_USD="$AUTHORITATIVE_POST_STOP_PROVIDER_CHARGE"
+make gpu-recover-stop GPU_PHASE="$GPU_PHASE"
+make gpu-settle-external GPU_PHASE="$GPU_PHASE"
 ```
 
-The target derives the session and invokes `scripts/gpu_budget_settle.py` with the authenticated
-receipt, canonical ledger, stopped watchdog state, nonce environment name, and hard caps. The
-provider-incurred amount is reconciliation evidence after confirmed stop; it is not a rate,
-runtime, or budget override.
+`gpu-recover-stop` first authenticates the exact canonical reservation, local request, and host
+watcher stop record. Its provider client has GET capability only: it verifies the lifecycle-bound
+Pod is exactly `EXITED`, reads the exact billing row, writes
+`external_stop_receipt.json`, and content-addresses the host control evidence before atomically
+advancing the local lifecycle. If the billing row has not appeared, it fails closed; rerun after
+the provider posts the row. `gpu-settle-external` derives its amount only from that authenticated
+receipt and requires the receipt's stopped-lifecycle hash to equal the current canonical
+lifecycle. The target invokes `scripts/gpu_budget_settle.py`; its legacy `--watchdog-state` plus
+caller-supplied amount path is disabled for new settlements.
 
 The 650 GB volume costs USD 65/month while running and USD 130/month while stopped at the current
 official rates; the 50 GB container disk adds USD 5/month only while running. The USD 5 storage
@@ -326,8 +394,11 @@ If the exact storage charge is unavailable, leave the USD 5 estimate outstanding
 final budget reconciliation. Never silently remove or relabel it.
 
 An active session may resume only by reusing its existing receipt and the same nonce through the
-active-session verifier; never call reserve or bootstrap again for that session. After
-`stopped_confirmed` and `settled`, the session can never authorize more GPU work. The next phase
+active-session verifier, while the original approval and quote remain fresh; never call reserve or
+bootstrap again for that session. After `stopped_confirmed` and `settled`, the session can never
+authorize more GPU work. A fresh-approval same-phase re-arm is allowed only when the failed attempt
+never created that phase's immutable paid-plan receipt. Once that receipt exists, the phase is
+terminal in this release and re-arm rejects before provider mutation. Otherwise the next phase
 must use a new nonce and receipt, and re-arm validates that every prior private session is both
 stopped and settled. Preserve the private `.runpod/sessions/` records locally for audit but publish
 only hashes and aggregate costs, never Pod IDs, GPU UUIDs, live billing state, or the raw nonce.

@@ -84,12 +84,15 @@ frozen and content-addressed:
 - `.runpod/api_route_quote_lock.json`: the exact four OpenRouter roles, model slugs, current token
   prices, source, and timestamp;
 - `.runpod/paid_run_approval.json`: the user's explicit approval of the exact hashes, routes,
-  phase list, hardware, runtimes, and USD caps.
+  phase list, hardware, runtimes, USD caps, cumulative ledger snapshot, and clean source commit.
 
-The approval document uses schema version 2. Its bindings include a canonical SHA-256 of the
-entire parsed `config/gpu_lock.yaml` mapping, not only the image and wheel fields. Any change to a
-repository commit, Hub revision, lens hash, image metadata, note, or other lock entry therefore
-invalidates the approval even when the container digest and wheel hash are unchanged.
+The approval document uses schema version 4. Its authenticated review binds the exact ledger
+bytes and validated document hash, each per-phase GPU ceiling, all cumulative cost equations and
+caps, every context/quote hash, and the exact clean local Git commit. Its bindings include a
+canonical SHA-256 of the entire parsed `config/gpu_lock.yaml` mapping, not only the image and wheel
+fields. Any change to source, a repository commit, Hub revision, lens hash, image metadata, note,
+ledger snapshot, or other lock entry therefore invalidates the reviewed hash even when the
+container digest and wheel hash are unchanged.
 
 The preregistered quality-first route plan dual-judges every valid final with Claude Opus 5 and
 Gemini 3.1 Pro Preview; Claude Opus 5 also performs primary trajectory measurement, and the two
@@ -116,7 +119,30 @@ the exact live RunPod offer and OpenRouter catalog must be checked, the software
 both quote locks and the approval must be fresh, and the user must explicitly approve the
 displayed costed plan.
 
-### Freeze and review the private paid bundle
+### Commit, push, and rotate the expired private paid bundle
+
+Before writing fresh quote specs, previewing, or reserving anything, verify the source checkout,
+push the exact reviewed commit, and prove the canonical public `main` ref contains it. The only
+permitted mutable tracked file at this boundary is the authenticated cumulative cost ledger:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python -c \
+  'from model_forensics.approval import require_clean_source_commit; print(require_clean_source_commit(".", mutable_paths=("data/manifests/cost_ledger.yaml",)))'
+git push origin HEAD:main
+reviewed_head="$(git rev-parse HEAD)"
+remote_head="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+test "$reviewed_head" = "$remote_head"
+make paid-bundle-rotate
+```
+
+Rotation must occur after that push verification and before any fresh quote specification is
+written. The provider-free target refuses unless the canonical lifecycle is exactly stopped/EXITED,
+no GPU estimate remains outstanding, and every private session has authenticated schema-v2
+settlement or no-start closure evidence. It archives canonical controls byte-for-byte behind a
+hash manifest, never overwrites an archive, and safely resumes an interrupted transaction. See
+[Private paid-bundle rotation](docs/paid_bundle_rotation.md). Rotation does not authorize paid work.
+
+### Freeze and review the fresh private paid bundle
 
 `scripts/freeze_paid_bundle.py` is an offline artifact helper; it does not query a provider,
 reserve a GPU, start a Pod, construct a model backend, or call an API. All of its outputs are
@@ -124,7 +150,7 @@ exclusive, content-addressed files below a non-symlink `.runpod/` directory. It 
 `0700` on private directories and `0600` on private files and refuses to overwrite an existing
 lock or approval.
 
-Prepare independently reviewed, unhashed JSON quote specifications at
+Only now prepare independently reviewed, unhashed JSON quote specifications at
 `.runpod/specs/gpu_quote_spec.json` and `.runpod/specs/api_route_quote_spec.json`. They must contain
 the complete strict quote-lock schemas but omit `content_hash`. Then freeze both locks and inspect
 the non-authorizing, secret-free cost and binding preview:
@@ -142,15 +168,23 @@ PYTHONPATH="$PWD/src" .venv/bin/python scripts/freeze_paid_bundle.py preview \
   --gpu-quote-lock .runpod/gpu_quote_lock.json \
   --api-quote-lock .runpod/api_route_quote_lock.json \
   --gpu-quote-spec .runpod/specs/gpu_quote_spec.json \
-  --api-quote-spec .runpod/specs/api_route_quote_spec.json
+  --api-quote-spec .runpod/specs/api_route_quote_spec.json \
+  --cost-ledger data/manifests/cost_ledger.yaml \
+  --allow-phase behavior_baseline_gpu \
+  --allow-phase behavior_baseline_api
 ```
 
 If authenticated quote locks already exist, rerun `preview` without the two `--*-quote-spec`
-arguments; it reloads and validates them instead of rewriting them. `ready_for_explicit_user_approval`
-is true only while both quotes are fresh. Review every displayed path, hash, route, hardware field,
-phase runtime, and cap. Only after the user explicitly approves that exact preview, provide a
-non-secret approval identifier, an explicit timezone-aware approval timestamp no earlier than the
-applicable quotes, and each approved canonical phase:
+arguments; it reloads and validates them instead of rewriting them.
+`ready_for_explicit_user_approval` is true only while every quote relevant to the listed phase scope
+is fresh, the ledger is valid with no outstanding GPU reservation, the scoped cumulative worst case
+fits every cap, and the source checkout is clean. The preview displays all four frozen GPU phase
+maxima for transparency, but `future_gpu_phase_maxima_usd` includes only GPU phases listed by
+`--allow-phase`; already settled work remains in `ledger_incurred` and is never counted again as
+future work. Review every displayed path, hash, route, hardware field, phase runtime, cost equation,
+cap, phase list, and source commit. Copy the top-level `user_review_hash` only after reviewing that
+exact payload. Then provide that hash, a non-secret approval identifier, an explicit timezone-aware
+approval timestamp no earlier than the applicable quotes, and the identical approved phase list:
 
 ```bash
 PYTHONPATH="$PWD/src" .venv/bin/python scripts/freeze_paid_bundle.py approve \
@@ -160,20 +194,29 @@ PYTHONPATH="$PWD/src" .venv/bin/python scripts/freeze_paid_bundle.py approve \
   --gpu-quote-lock .runpod/gpu_quote_lock.json \
   --api-quote-lock .runpod/api_route_quote_lock.json \
   --output .runpod/paid_run_approval.json \
+  --cost-ledger data/manifests/cost_ledger.yaml \
+  --review-hash "$EXPLICIT_USER_REVIEW_HASH" \
   --approval-id "$EXPLICIT_NONSECRET_APPROVAL_ID" \
   --approved-at "$EXPLICIT_APPROVAL_TIMESTAMP" \
   --allow-phase behavior_baseline_gpu \
   --allow-phase behavior_baseline_api
 ```
 
-Repeat `--allow-phase` only for phases the user actually approved. The helper never infers approval
-from a preview, environment variable, chat message, or existing file; `approve` requires every
-approval field on its command line and emits only hashes and non-secret metadata.
+Repeat `--allow-phase` only for phases the user actually approved, and pass the same set to `preview`
+and `approve`. The canonicalized phase set is inside the user-review hash; duplicates fail, and a
+changed set cannot inherit an earlier review. The helper never infers approval from a preview,
+environment variable, chat message, or existing file; `approve` requires every approval field on
+its command line and emits only hashes and non-secret metadata.
 
 ## Split-phase command reference
 
 GPU generation and external measurement are separate so a provider retry cannot silently reload
 the 122B model, and a GPU resume cannot silently call an API.
+
+Retry scope is deliberately narrow: an active GPU attempt can resume only with its existing nonce,
+receipt, approval, and still-fresh quote. A newly approved same-phase re-arm is supported only when
+the failed attempt never reached the immutable paid-plan receipt. A stopped phase that already has
+that receipt is terminal in this release and is rejected before provider mutation.
 
 | Target | Actual behavior |
 |---|---|
@@ -227,35 +270,60 @@ export GPU_BUDGET_SESSION_ID
 make gpu-reserve GPU_PHASE="$GPU_PHASE"
 ```
 
-Inject the same nonce as a RunPod Secret for that phase, sync the exact reservation receipt and
-ledger without modifying either, start the explicitly approved Pod, and run from the repository
-root on the Pod:
+Keep the host watcher in Terminal A, then re-arm from Terminal B. The guarded re-arm patches the
+new nonce into the exact existing research Pod; do not inject it manually in the RunPod UI:
 
 ```bash
+# Terminal A (leave running for the entire phase)
+make gpu-host-watch-rearm GPU_PHASE="$GPU_PHASE"
+
+# Terminal B, only after the host acknowledgement exists
+make gpu-rearm GPU_PHASE="$GPU_PHASE"
+make gpu-sync GPU_PHASE="$GPU_PHASE" \
+  RUNPOD_SSH_HOST='root@RUNPOD_DIRECT_SSH_CANONICAL_IPV4' \
+  RUNPOD_SSH_PORT='RUNPOD_DIRECT_SSH_PORT'
+```
+
+Terminal B must retain the locally exported `RUNPOD_API_KEY` and `HF_TOKEN` through `gpu-sync`.
+They remain environment-only and are not copied to argv or the remote bundle; the sync process uses
+them to pre-arm an independent exact-Pod emergency stop before its first SSH command. The one-shot
+claim is durable before remote contact, every SSH/rsync step revalidates the live host guard, and a
+post-claim failure invokes both the host-watcher stop request and the bounded provider stop path.
+
+Immediately open that same strict-host-key-pinned direct SSH endpoint and run from the exact
+installed checkout on the Pod:
+
+```bash
+cd /workspace/model-forensics-value-leakage
 make gpu-bootstrap GPU_PHASE="$GPU_PHASE"
 make gpu-active-verify GPU_PHASE="$GPU_PHASE"
 make behavior-baseline-generate
 ```
+
+See [`RUNPOD.md`](RUNPOD.md) for the exact SSH command, five-minute sync-manifest lifetime, and
+per-phase production target. Never broad-copy `.runpod` or bypass `gpu-sync`.
 
 The production target repeats the same active-session library gate immediately before backend
 construction. Both the standalone verifier and CLI require the receipt, canonical cost ledger,
 exact phase, `.runpod/sessions/<session-hash>/` directory, nonce hash, live watchdog PID, `armed`
 watchdog state, and bound hardware preflight. The nonce itself never appears in argv or output.
 
-After checksummed artifact sync, request the non-destructive stop described in
-[`RUNPOD.md`](RUNPOD.md), wait for `stopped_confirmed`, verify billing has stopped in the provider
-UI, and settle using the authoritative charge for that session:
+After checksummed artifact sync, request the non-destructive stop from the still-running local
+host watcher, wait for its local `stopped_confirmed`, then create the read-only provider
+attestation and schema-v2 settlement:
 
 ```bash
-make gpu-settle \
-  GPU_PHASE="$GPU_PHASE" \
-  PROVIDER_INCURRED_USD='AUTHORITATIVE_POST_STOP_PROVIDER_CHARGE'
+make gpu-stop-request GPU_PHASE="$GPU_PHASE"
+# Wait for the host watcher terminal to report stopped_confirmed.
+make gpu-recover-stop GPU_PHASE="$GPU_PHASE"
+make gpu-settle-external GPU_PHASE="$GPU_PHASE"
 ```
 
-`PROVIDER_INCURRED_USD` is reconciliation evidence after stop, not a rate or budget override.
-An unsettled prior reservation, stale active session, mismatched receipt, missing watchdog, or
-cumulative overrun blocks the next phase. The full Pod setup, re-arm, stop, and recovery contract
-is in [`RUNPOD.md`](RUNPOD.md).
+Recovery uses provider GETs only and CAS-binds the local lifecycle to `stopped` / `EXITED` before
+settlement. The settlement amount comes only from the authenticated external-stop receipt; the
+legacy caller-supplied amount path is disabled. An unsettled prior reservation, stale active
+session, mismatched receipt, missing host confirmation, or cumulative overrun blocks the next
+phase. The full Pod setup, re-arm, stop, and recovery contract is in [`RUNPOD.md`](RUNPOD.md).
 
 ## Checkpoint and inference boundaries
 

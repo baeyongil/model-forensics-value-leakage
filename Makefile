@@ -14,6 +14,7 @@ GPU_QUOTE_LOCK ?= .runpod/gpu_quote_lock.json
 API_QUOTE_LOCK ?= .runpod/api_route_quote_lock.json
 PAID_APPROVAL ?= .runpod/paid_run_approval.json
 PAID_RECEIPT_DIR ?= .runpod/paid_phase_receipts
+PAID_BUNDLE_ID ?=
 
 COST_LEDGER ?= data/manifests/cost_ledger.yaml
 ROLLOUTS ?= data/raw/qwen35_122b/rollouts.jsonl
@@ -43,7 +44,8 @@ QWEN4B_SMOKE_OUTPUT ?= data/manifests/qwen4b_prefix_gpu_smoke.json
 # uses a fresh opaque nonce supplied only through GPU_BUDGET_SESSION_ID.
 GPU_PHASE ?=
 GPU_RESERVATION_RECEIPT ?= .runpod/reservations/$(GPU_PHASE).json
-PROVIDER_INCURRED_USD ?=
+RUNPOD_SSH_HOST ?=
+RUNPOD_SSH_PORT ?= 22
 
 TIME_LEDGER ?= data/manifests/time_ledger.yaml
 TIME_CATEGORY ?=
@@ -80,7 +82,7 @@ GPU_ACTIVE_SESSION_ARGS = \
 	--cost-ledger "$(COST_LEDGER)"
 
 define derive-session-directory
-session_dir="$$( $(PYTHON_BOOTSTRAP) -c 'import json, sys; from pathlib import Path; receipt = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")); value = str(receipt["session_hash"]); prefix = "sha256:"; assert value.startswith(prefix) and len(value) == len(prefix) + 64; print((Path.cwd() / ".runpod" / "sessions" / value.removeprefix(prefix)).resolve())' "$(GPU_RESERVATION_RECEIPT)" )"
+session_dir="$$( $(PYTHON) scripts/derive_runpod_session_path.py --project-root "$(CURDIR)" --phase "$(GPU_PHASE)" --reservation "$(GPU_RESERVATION_RECEIPT)" )"
 endef
 
 .PHONY: setup test lint format reproduce reproduce-results stage-results-release \
@@ -88,17 +90,23 @@ endef
 	behavior-treatment-generate behavior-treatment-adjudicate sample \
 	anchors positions resample-generate resample-adjudicate resample lens \
 	analyze report smoke qwen4b-gpu-integration-smoke clean \
-	gpu-reserve gpu-bootstrap gpu-active-verify gpu-settle \
-	time-start time-stop time-status release-check
+	gpu-reserve gpu-bootstrap gpu-active-verify gpu-stop-request \
+	gpu-recover-stop gpu-settle-external gpu-settle \
+	gpu-host-watch-rearm gpu-rearm \
+	gpu-sync \
+	time-start time-stop time-status release-check \
+	paid-bundle-rotate
 
 HF_TARGETS := behavior-baseline-generate behavior-treatment-generate \
-	resample-generate lens qwen4b-gpu-integration-smoke gpu-bootstrap
+	resample-generate lens qwen4b-gpu-integration-smoke gpu-bootstrap \
+	gpu-host-watch-rearm gpu-rearm gpu-sync
 OPENROUTER_TARGETS := behavior-baseline-adjudicate behavior-treatment-adjudicate \
 	anchors positions resample-adjudicate
 
 $(HF_TARGETS): export HF_TOKEN := $(LOCAL_HF)
 $(OPENROUTER_TARGETS): export OPENROUTER_API_KEY := $(LOCAL_OPENROUTER)
 gpu-bootstrap: export RUNPOD_API_KEY := $(LOCAL_RUNPOD)
+gpu-host-watch-rearm gpu-rearm gpu-recover-stop gpu-sync: export RUNPOD_API_KEY := $(LOCAL_RUNPOD)
 
 setup:
 	$(PYTHON_BOOTSTRAP) -m venv .venv
@@ -116,6 +124,13 @@ format:
 
 reproduce:
 	$(PYTHON) -m model_forensics.cli reproduce --config "$(CONFIG)"
+
+# Provider-free archival gate for expired private quote/approval controls.  A
+# Make command-line ID is exported directly rather than interpolated into the
+# shell command; the CLI applies the closed safe-ID grammar.
+paid-bundle-rotate: export PAID_BUNDLE_ID := $(PAID_BUNDLE_ID)
+paid-bundle-rotate:
+	$(PYTHON) scripts/rotate_paid_bundle.py --project-root "$(CURDIR)"
 
 # Public, credential-free reproduction from the aggregate-only released
 # evidence. This never invokes a model backend, provider, or raw-data command.
@@ -281,21 +296,79 @@ gpu-reserve:
 		--gpu-hard-stop-usd 220 \
 		--api-hard-stop-usd 100 \
 		--total-hard-stop-usd 325
-	@quote_values="$$( $(PYTHON) -c 'import sys; from model_forensics.execution_bindings import load_gpu_quote_lock; from model_forensics.gpu_budget import approved_gpu_phase_maximum_usd; quote = load_gpu_quote_lock(sys.argv[1]); phase = sys.argv[2]; allocation = next((item for item in quote.phase_runtime_allocations if item.command_phase == phase), None); assert allocation is not None, f"phase absent from quote lock: {phase}"; maximum = approved_gpu_phase_maximum_usd(gpu_count=quote.gpu_count, quote_hourly_per_gpu_usd=quote.usd_per_gpu_hour, running_storage_hourly_usd=quote.running_storage_usd_per_hour, approved_runtime_hours=allocation.maximum_runtime_hours); print(quote.gpu_count, quote.usd_per_gpu_hour, quote.running_storage_usd_per_hour, allocation.maximum_runtime_hours, maximum, sep="\t")' "$(GPU_QUOTE_LOCK)" "$(GPU_PHASE)" )"; \
-	IFS=$$'\t' read -r gpu_count per_gpu_rate storage_rate runtime_hours phase_maximum <<< "$$quote_values"; \
-	$(PYTHON) scripts/gpu_budget_reserve.py \
+	@$(PYTHON) scripts/gpu_budget_reserve.py \
 		--cost-ledger "$(COST_LEDGER)" \
 		--phase "$(GPU_PHASE)" \
 		--session-id-env GPU_BUDGET_SESSION_ID \
-		--approved-phase-runtime-hours "$$runtime_hours" \
-		--approved-phase-maximum-usd "$$phase_maximum" \
-		--gpu-count "$$gpu_count" \
-		--quote-hourly-per-gpu-usd "$$per_gpu_rate" \
-		--running-storage-hourly-usd "$$storage_rate" \
+		--gpu-quote-lock "$(GPU_QUOTE_LOCK)" \
 		--gpu-hard-stop-usd 220 \
 		--api-hard-stop-usd 100 \
 		--total-hard-stop-usd 325 \
 		--receipt "$(GPU_RESERVATION_RECEIPT)"
+
+# Run this foreground target in a dedicated host terminal before gpu-rearm.
+# It writes the content-addressed acknowledgement only after a read-only
+# provider GET confirms that the lifecycle-bound Pod is still EXITED.
+gpu-host-watch-rearm:
+	$(call require-var,GPU_PHASE)
+	@$(derive-session-directory); \
+	mkdir -p "$$session_dir"; \
+	bootstrap_values="$$( $(PYTHON_BOOTSTRAP) scripts/extract_gpu_bootstrap_inputs.py --gpu-quote-lock "$(GPU_QUOTE_LOCK)" --gpu-lock "$(GPU_LOCK)" --phase "$(GPU_PHASE)" )"; \
+	IFS=$$'\t' read -r gpu_family provider_gpu_id allowed_cuda_versions data_center_ids storage_rate per_gpu_rate runtime_hours _price_source _price_checked_at container_digest _wheel_url _wheel_sha256 _semantic_wheel_url _semantic_wheel_sha256 _semantic_version _semantic_stack_lock_hash _bootstrap_constraints_path _bootstrap_constraints_sha256 _bootstrap_distribution_lock_hash <<< "$$bootstrap_values"; \
+	reservation_values="$$( $(PYTHON) -c 'import sys; from model_forensics.gpu_budget import load_gpu_phase_budget_reservation; r = load_gpu_phase_budget_reservation(sys.argv[1]); print(r.session_hash, r.prior_committed_gpu_usd, r.maximum_safe_runtime_hours, sep="\t")' "$(GPU_RESERVATION_RECEIPT)" )"; \
+	IFS=$$'\t' read -r session_hash prior_committed maximum_safe_runtime <<< "$$reservation_values"; \
+	watchdog_args=(); \
+	IFS=',' read -ra cuda_items <<< "$$allowed_cuda_versions"; \
+	for value in "$${cuda_items[@]}"; do watchdog_args+=(--allowed-cuda-version "$$value"); done; \
+	IFS=',' read -ra center_items <<< "$$data_center_ids"; \
+	for value in "$${center_items[@]}"; do watchdog_args+=(--allowed-data-center-id "$$value"); done; \
+	$(PYTHON) scripts/runpod_watchdog.py \
+		--lifecycle-state "$(CURDIR)/.runpod/pod_lifecycle.json" \
+		--expected-session-hash "$$session_hash" \
+		--expected-phase "$(GPU_PHASE)" \
+		--host-wait-for-rearm \
+		--host-rearm-ack "$$session_dir/host_rearm_watchdog_ack.json" \
+		--running-readiness-timeout-seconds 300 \
+		--expected-gpu-family "$$gpu_family" \
+		--expected-provider-gpu-id "$$provider_gpu_id" \
+		"$${watchdog_args[@]}" \
+		--expected-container-image "$$container_digest" \
+		--expected-gpu-count 8 \
+		--maximum-approved-hourly-per-gpu-usd "$$per_gpu_rate" \
+		--maximum-approved-storage-hourly-usd "$$storage_rate" \
+		--gpu-hard-stop-usd 220 \
+		--maximum-runtime-hours "$$maximum_safe_runtime" \
+		--prior-committed-gpu-usd "$$prior_committed" \
+		--poll-seconds 5 \
+		--state "$$session_dir/host_rearm_watchdog.json" \
+		--stop-request "$$session_dir/runpod_stop.request"
+
+# This target cannot reach PATCH or POST /start until the independently
+# running host watcher has produced and still owns a fresh acknowledgement.
+gpu-rearm:
+	$(call require-var,GPU_PHASE)
+	@$(derive-session-directory); \
+	$(PYTHON) scripts/runpod_pod_lifecycle.py \
+		--project-root . \
+		rearm \
+		--cost-ledger "$(COST_LEDGER)" \
+		--phase "$(GPU_PHASE)" \
+		--reservation "$(GPU_RESERVATION_RECEIPT)" \
+		--host-rearm-ack "$$session_dir/host_rearm_watchdog_ack.json"
+
+# Clone the exact pushed source commit into a clean remote stage, transfer only
+# authenticated private state, and recoverably promote it exactly once.
+gpu-sync:
+	$(call require-var,GPU_PHASE)
+	$(call require-var,RUNPOD_SSH_HOST)
+	@$(PYTHON) scripts/transfer_runpod_sync_bundle.py \
+		--project-root "$(CURDIR)" \
+		--phase "$(GPU_PHASE)" \
+		--reservation "$(GPU_RESERVATION_RECEIPT)" \
+		--cost-ledger "$(COST_LEDGER)" \
+		--remote-host "$(RUNPOD_SSH_HOST)" \
+		--remote-port "$(RUNPOD_SSH_PORT)" \
+		--remote-destination "/workspace/model-forensics-value-leakage"
 
 gpu-bootstrap:
 	$(call require-var,GPU_PHASE)
@@ -338,20 +411,41 @@ gpu-active-verify:
 		--api-hard-stop-usd 100 \
 		--total-hard-stop-usd 325
 
-gpu-settle:
+gpu-stop-request:
 	$(call require-var,GPU_PHASE)
-	$(call require-var,PROVIDER_INCURRED_USD)
+	@$(PYTHON) scripts/runpod_host_stop.py request \
+		--project-root "$(CURDIR)" \
+		--phase "$(GPU_PHASE)" \
+		--reservation "$(GPU_RESERVATION_RECEIPT)"
+
+gpu-recover-stop:
+	$(call require-var,GPU_PHASE)
+	@$(derive-session-directory); \
+	$(PYTHON) scripts/runpod_recover_stop.py \
+		--project-root "$(CURDIR)" \
+		--phase "$(GPU_PHASE)" \
+		--reservation "$(GPU_RESERVATION_RECEIPT)" \
+		--host-watchdog "$$session_dir/host_rearm_watchdog.json" \
+		--host-stop-request "$$session_dir/runpod_stop.request" \
+		--output "$$session_dir/external_stop_receipt.json"
+
+gpu-settle-external:
+	$(call require-var,GPU_PHASE)
 	@$(derive-session-directory); \
 	$(PYTHON) scripts/gpu_budget_settle.py \
 		--reservation-receipt "$(GPU_RESERVATION_RECEIPT)" \
-		--cost-ledger "$(COST_LEDGER)" \
-		--watchdog-state "$$session_dir/runpod_watchdog.json" \
-		--session-id-env GPU_BUDGET_SESSION_ID \
-		--provider-incurred-usd "$(PROVIDER_INCURRED_USD)" \
+		--cost-ledger "$(CURDIR)/data/manifests/cost_ledger.yaml" \
+		--external-stop-receipt "$$session_dir/external_stop_receipt.json" \
+		--lifecycle-state "$(CURDIR)/.runpod/pod_lifecycle.json" \
 		--gpu-hard-stop-usd 220 \
 		--api-hard-stop-usd 100 \
 		--total-hard-stop-usd 325 \
 		--output "$$session_dir/settlement.json"
+
+# Backward-compatible target name; the supported path is always the
+# authenticated external-stop schema-v2 settlement above.  There is no normal
+# Make target for the legacy remote-watchdog schema-v1 settlement.
+gpu-settle: gpu-settle-external
 
 time-start:
 	$(call require-var,TIME_CATEGORY)

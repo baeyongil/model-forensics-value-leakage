@@ -68,6 +68,7 @@ from model_forensics.anchors import (
 from model_forensics.approval import (
     ApprovalBindings,
     load_paid_run_approval,
+    require_clean_source_commit,
     validate_paid_run_approval,
 )
 from model_forensics.behavioral_adjudication_phase import (
@@ -139,6 +140,7 @@ from model_forensics.lens_runner import (
     SMOKE_MODEL_REVISION,
     TRANSFORMERS_REVISION,
 )
+from model_forensics.paid_bundle_rotation import paid_bundle_lock
 from model_forensics.paid_phase_receipt import (
     PAID_PHASE_RECEIPT_PROTOCOL,
     PaidPhaseReceiptStore,
@@ -214,6 +216,38 @@ from model_forensics.vllm_prefix import VLLMRawPrefixBackend
 
 class CLIError(RuntimeError):
     """A user-actionable pipeline error suitable for concise CLI output."""
+
+
+_PAID_BUNDLE_CONSUMER_COMMANDS = frozenset(
+    {
+        "behavior-generate",
+        "behavior-adjudicate",
+        "anchors",
+        "resample-generate",
+        "resample-adjudicate",
+        "positions",
+        "lens",
+    }
+)
+
+
+@contextmanager
+def _paid_bundle_consumer_lock(args: argparse.Namespace):  # type: ignore[no-untyped-def]
+    """Exclude quote rotation for a paid-capable command's complete lifetime."""
+
+    if str(getattr(args, "command", "")) not in _PAID_BUNDLE_CONSUMER_COMMANDS:
+        yield
+        return
+    config_path = Path(str(args.config)).resolve()
+    project_root = config_path.parent.parent
+    private_root = project_root / ".runpod"
+    # Synthetic development fixtures may intentionally have no private paid
+    # state. Rotation also requires this directory, so no peer can race yet.
+    if not os.path.lexists(private_root):
+        yield
+        return
+    with paid_bundle_lock(project_root=project_root, exclusive=False):
+        yield
 
 
 _GPU_SESSION_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{2,63}\Z")
@@ -312,10 +346,20 @@ def _validate_paid_phase(
         api_quote_lock=api_quote_lock,
     )
     approval = load_paid_run_approval(approval_path)
+    ledger_path = _resolve(config, config.paths.manifest_dir) / "cost_ledger.yaml"
+    try:
+        source_commit = require_clean_source_commit(
+            root,
+            mutable_paths=(ledger_path,),
+        )
+    except ValueError as exc:
+        raise CLIError(str(exc)) from exc
     validate_paid_run_approval(
         approval,
         expected=expected,
         command_phase=command_phase,
+        expected_source_commit=source_commit,
+        expected_ledger_path=_path_payload(ledger_path, root),
     )
     return ValidatedPaidGate(
         bindings=expected,
@@ -9981,7 +10025,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        result = args.handler(args)
+        with _paid_bundle_consumer_lock(args):
+            result = args.handler(args)
     except (CLIError, FileNotFoundError, KeyError, RuntimeError, TypeError, ValueError) as exc:
         parser.exit(2, f"error: {exc}\n")
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+import model_forensics.runpod_recovery as recovery_module
 from model_forensics.io import stable_hash
 from model_forensics.runpod_lifecycle import (
     EXACT_PROVIDER_GPU_ID,
@@ -33,6 +34,12 @@ CREATED = "2026-08-29 19:24:57.642 +0000 UTC"
 EXITED = "Exited by user: Sat Aug 29 2026 19:41:22 GMT+0000 (Coordinated Universal Time)"
 OBSERVED = datetime(2026, 8, 29, 20, tzinfo=UTC)
 ALL_IN_RATE = 26.41722222222222
+REARM_STARTED = "2026-08-29 21:04:57.637 +0000 UTC"
+REARM_EXITED = (
+    "Exited by user: Sat Aug 29 2026 21:21:22 GMT+0000 "
+    "(Coordinated Universal Time)"
+)
+REARM_OBSERVED = datetime(2026, 8, 29, 22, tzinfo=UTC)
 
 
 class FakeClient:
@@ -127,6 +134,43 @@ def _project(tmp_path: Path) -> tuple[Path, Path, dict[str, Any]]:
         / "external_stop_receipt.json"
     )
     return lifecycle, output, authorization
+
+
+def _rewrite_lifecycle(lifecycle: Path, mutator: Any) -> dict[str, Any]:
+    state = json.loads(lifecycle.read_text(encoding="utf-8"))
+    mutator(state)
+    state.pop("record_hash", None)
+    state["record_hash"] = stable_hash(state)
+    lifecycle.write_text(
+        json.dumps(state, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    lifecycle.chmod(0o600)
+    return state
+
+
+def _mark_rearmed(lifecycle: Path, *, operation: str = "rearmed") -> dict[str, Any]:
+    def mutate(state: dict[str, Any]) -> None:
+        prior = deepcopy(state["current_authorization"])
+        prior.update(
+            {
+                "phase": "behavior_prior_gpu",
+                "reservation_id": stable_hash({"reservation": "prior"}),
+                "reservation_record_hash": stable_hash({"receipt": "prior"}),
+                "session_hash": stable_hash(
+                    {"opaque_gpu_session_id": "prior-session-fixture"}
+                ),
+                "approval_hash": stable_hash({"approval": "prior"}),
+                "bindings_hash": stable_hash({"bindings": "prior"}),
+                "launch_spec_hash": stable_hash({"launch": "prior"}),
+            }
+        )
+        state["operation"] = operation
+        state["updated_at"] = "2026-08-29T21:05:00Z"
+        state["current_authorization"]["phase"] = "behavior_treatment_gpu"
+        state["authorization_history"] = [prior]
+
+    return _rewrite_lifecycle(lifecycle, mutate)
 
 
 def _pod(**changes: Any) -> dict[str, Any]:
@@ -224,6 +268,137 @@ def test_pending_billing_ceiling_is_explicit_secret_safe_and_idempotent(
     assert output.read_bytes() == before
 
 
+def test_retry_completes_lifecycle_after_crash_following_receipt_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    lifecycle_before = lifecycle.read_bytes()
+    original_replace = recovery_module._atomic_replace_lifecycle
+
+    def crash_after_receipt(
+        _path: Path,
+        _payload: dict[str, Any],
+        *,
+        expected_before: bytes,
+        expected_record_hash: str,
+    ) -> None:
+        assert expected_before == lifecycle_before
+        assert expected_record_hash.startswith("sha256:")
+        raise OSError("injected crash after durable receipt")
+
+    monkeypatch.setattr(recovery_module, "_atomic_replace_lifecycle", crash_after_receipt)
+    with pytest.raises(OSError, match="injected crash"):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=FakeClient(_pod(), [_billing()]),  # type: ignore[arg-type]
+            output_path=output,
+            observed_at=OBSERVED,
+        )
+
+    assert output.is_file()
+    assert lifecycle.read_bytes() == lifecycle_before
+    persisted_receipt = output.read_bytes()
+
+    monkeypatch.setattr(recovery_module, "_atomic_replace_lifecycle", original_replace)
+    retry_client = FakeClient({}, [])
+    recovered = attest_external_stop(
+        project_root=tmp_path,
+        client=retry_client,  # type: ignore[arg-type]
+        output_path=output,
+        observed_at=OBSERVED.replace(minute=30),
+    )
+
+    assert retry_client.calls == []
+    assert output.read_bytes() == persisted_receipt
+    assert recovered == load_external_stop_receipt(output)
+    stopped = json.loads(lifecycle.read_text(encoding="utf-8"))
+    assert stopped["operation"] == "stopped"
+    assert stopped["record_hash"] == recovered["lifecycle_stopped_hash"]
+
+
+def test_receipt_directory_is_fsynced_before_lifecycle_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _lifecycle, output, _authorization = _project(tmp_path)
+    output.parent.mkdir(parents=True)
+    receipt_directory = output.parent.stat()
+    receipt_directory_fsynced = False
+    original_fsync = recovery_module.os.fsync
+    original_replace = recovery_module._atomic_replace_lifecycle
+
+    def tracked_fsync(descriptor: int) -> None:
+        nonlocal receipt_directory_fsynced
+        details = recovery_module.os.fstat(descriptor)
+        if (details.st_dev, details.st_ino) == (
+            receipt_directory.st_dev,
+            receipt_directory.st_ino,
+        ):
+            receipt_directory_fsynced = True
+        original_fsync(descriptor)
+
+    def assert_durable_receipt_before_replace(
+        path: Path,
+        payload: dict[str, Any],
+        *,
+        expected_before: bytes,
+        expected_record_hash: str,
+    ) -> None:
+        assert receipt_directory_fsynced is True
+        original_replace(
+            path,
+            payload,
+            expected_before=expected_before,
+            expected_record_hash=expected_record_hash,
+        )
+
+    monkeypatch.setattr(recovery_module.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(
+        recovery_module,
+        "_atomic_replace_lifecycle",
+        assert_durable_receipt_before_replace,
+    )
+    attest_external_stop(
+        project_root=tmp_path,
+        client=FakeClient(_pod(), [_billing()]),  # type: ignore[arg-type]
+        output_path=output,
+        observed_at=OBSERVED,
+    )
+
+
+def test_concurrent_lifecycle_advance_is_not_overwritten_after_receipt_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    original_write = recovery_module._write_receipt_idempotently
+
+    def write_then_advance(path: Path, payload: dict[str, Any]) -> None:
+        original_write(path, payload)
+        _rewrite_lifecycle(
+            lifecycle,
+            lambda state: state.update(updated_at="2026-08-29T20:01:00Z"),
+        )
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_write_receipt_idempotently",
+        write_then_advance,
+    )
+    with pytest.raises(RunpodRecoveryError, match="changed before the stopped transition"):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=FakeClient(_pod(), [_billing()]),  # type: ignore[arg-type]
+            output_path=output,
+            observed_at=OBSERVED,
+        )
+
+    current = json.loads(lifecycle.read_text(encoding="utf-8"))
+    assert current["operation"] == "created"
+    assert current["updated_at"] == "2026-08-29T20:01:00Z"
+    assert output.is_file()
+
+
 def test_unique_provider_billing_row_is_bound_as_final(tmp_path: Path) -> None:
     _lifecycle, output, _authorization = _project(tmp_path)
     receipt = attest_external_stop(
@@ -238,6 +413,249 @@ def test_unique_provider_billing_row_is_bound_as_final(tmp_path: Path) -> None:
     assert receipt["settlement_amount_usd"] == pytest.approx(7.21)
     assert receipt["billing_evidence"]["time_billed_ms"] == 984363
     assert receipt["billing_evidence"]["provider_billing_row_hash"].startswith("sha256:")
+
+
+def test_rearmed_pod_binds_last_start_to_authenticated_lifecycle_not_creation(
+    tmp_path: Path,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    _mark_rearmed(lifecycle)
+    receipt = attest_external_stop(
+        project_root=tmp_path,
+        client=FakeClient(
+            _pod(lastStartedAt=REARM_STARTED, lastStatusChange=REARM_EXITED),
+            [_billing(time="2026-08-29T21:05:00Z")],
+        ),  # type: ignore[arg-type]
+        output_path=output,
+        observed_at=REARM_OBSERVED,
+    )
+
+    assert receipt["stop_evidence"]["start_context"] == "rearm"
+    assert receipt["stop_evidence"]["created_at"] == "2026-08-29T19:24:57.642000Z"
+    assert receipt["stop_evidence"]["started_at"] == "2026-08-29T21:04:57.637000Z"
+    assert receipt["stop_evidence"]["lifecycle_updated_at"] == (
+        "2026-08-29T21:05:00Z"
+    )
+    assert receipt["billing_query"]["start_time"] == "2026-08-29T21:04:57.637000Z"
+    assert receipt["billing_query"]["end_time"] == "2026-08-29T21:21:22Z"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "rearm_start_requested",
+        "rearm_start_pending",
+        "rearm_timeout",
+        "rearm_verification_failed",
+    ],
+)
+def test_actual_post_start_rearm_recovery_operations_use_current_start_window(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    _mark_rearmed(lifecycle, operation=operation)
+    receipt = attest_external_stop(
+        project_root=tmp_path,
+        client=FakeClient(
+            _pod(lastStartedAt=REARM_STARTED, lastStatusChange=REARM_EXITED),
+            [_billing(time="2026-08-29T21:05:00Z")],
+        ),  # type: ignore[arg-type]
+        output_path=output,
+        observed_at=REARM_OBSERVED,
+    )
+
+    assert receipt["prior_lifecycle_operation"] == operation
+    assert receipt["stop_evidence"]["start_context"] == "rearm"
+
+
+def test_rearm_start_intent_requires_provider_start_to_advance_persisted_baseline(
+    tmp_path: Path,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    _mark_rearmed(lifecycle, operation="rearm_start_intent")
+    _rewrite_lifecycle(
+        lifecycle,
+        lambda state: state["pod"].update(pre_start_last_started_at=STARTED),
+    )
+    receipt = attest_external_stop(
+        project_root=tmp_path,
+        client=FakeClient(
+            _pod(lastStartedAt=REARM_STARTED, lastStatusChange=REARM_EXITED),
+            [_billing(time="2026-08-29T21:05:00Z")],
+        ),  # type: ignore[arg-type]
+        output_path=output,
+        observed_at=REARM_OBSERVED,
+    )
+    assert receipt["prior_lifecycle_operation"] == "rearm_start_intent"
+
+
+def test_rearm_start_intent_without_provider_timestamp_advance_fails_closed(
+    tmp_path: Path,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    _mark_rearmed(lifecycle, operation="rearm_start_intent")
+    _rewrite_lifecycle(
+        lifecycle,
+        lambda state: state["pod"].update(pre_start_last_started_at=REARM_STARTED),
+    )
+    before = lifecycle.read_bytes()
+    with pytest.raises(RunpodRecoveryError, match="did not advance"):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=FakeClient(
+                _pod(lastStartedAt=REARM_STARTED, lastStatusChange=REARM_EXITED),
+                [_billing(time="2026-08-29T21:05:00Z")],
+            ),  # type: ignore[arg-type]
+            output_path=output,
+            observed_at=REARM_OBSERVED,
+        )
+    assert lifecycle.read_bytes() == before
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("operation", ["rearm_intent", "rearm_patched"])
+def test_pre_start_rearm_operations_are_not_recoverable_as_a_billed_run(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    _mark_rearmed(lifecycle, operation=operation)
+    before = lifecycle.read_bytes()
+    client = FakeClient(
+        _pod(lastStartedAt=REARM_STARTED, lastStatusChange=REARM_EXITED),
+        [_billing(time="2026-08-29T21:05:00Z")],
+    )
+    with pytest.raises(RunpodRecoveryError, match="not eligible"):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=client,  # type: ignore[arg-type]
+            output_path=output,
+            observed_at=REARM_OBSERVED,
+        )
+    assert client.calls == []
+    assert lifecycle.read_bytes() == before
+    assert not output.exists()
+
+
+def test_rearm_requires_nonempty_distinct_authenticated_authorization_history(
+    tmp_path: Path,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    _rewrite_lifecycle(
+        lifecycle,
+        lambda state: state.update(
+            operation="rearmed",
+            updated_at="2026-08-29T21:05:00Z",
+        ),
+    )
+    before = lifecycle.read_bytes()
+    with pytest.raises(RunpodRecoveryError, match="authorization history is missing"):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=FakeClient(
+                _pod(lastStartedAt=REARM_STARTED, lastStatusChange=REARM_EXITED),
+                [_billing(time="2026-08-29T21:05:00Z")],
+            ),  # type: ignore[arg-type]
+            output_path=output,
+            observed_at=REARM_OBSERVED,
+        )
+    assert lifecycle.read_bytes() == before
+    assert not output.exists()
+
+    _mark_rearmed(lifecycle)
+
+    def reuse_current_session(state: dict[str, Any]) -> None:
+        state["authorization_history"][0]["session_hash"] = state[
+            "current_authorization"
+        ]["session_hash"]
+
+    _rewrite_lifecycle(lifecycle, reuse_current_session)
+    before = lifecycle.read_bytes()
+    with pytest.raises(RunpodRecoveryError, match="reuses a session or reservation"):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=FakeClient(
+                _pod(lastStartedAt=REARM_STARTED, lastStatusChange=REARM_EXITED),
+                [_billing(time="2026-08-29T21:05:00Z")],
+            ),  # type: ignore[arg-type]
+            output_path=output,
+            observed_at=REARM_OBSERVED,
+        )
+    assert lifecycle.read_bytes() == before
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_updated_at", "last_started_at", "match"),
+    [
+        (
+            "2026-08-29T20:00:00Z",
+            REARM_STARTED,
+            "authenticated lifecycle timestamps disagree",
+        ),
+        (
+            "2026-08-29T22:10:00Z",
+            REARM_STARTED,
+            "lifecycle update timestamp is implausible",
+        ),
+        (
+            "2026-08-29T19:11:00Z",
+            "2026-08-29T19:10:00Z",
+            "re-arm start predates Pod creation",
+        ),
+    ],
+)
+def test_rearm_implausible_lifecycle_and_provider_timestamps_fail_closed(
+    tmp_path: Path,
+    lifecycle_updated_at: str,
+    last_started_at: str,
+    match: str,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    _mark_rearmed(lifecycle)
+    _rewrite_lifecycle(
+        lifecycle,
+        lambda state: state.update(updated_at=lifecycle_updated_at),
+    )
+    before = lifecycle.read_bytes()
+    with pytest.raises(RunpodRecoveryError, match=match):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=FakeClient(
+                _pod(lastStartedAt=last_started_at, lastStatusChange=REARM_EXITED),
+                [_billing(time="2026-08-29T21:05:00Z")],
+            ),  # type: ignore[arg-type]
+            output_path=output,
+            observed_at=REARM_OBSERVED,
+        )
+    assert lifecycle.read_bytes() == before
+    assert not output.exists()
+
+
+def test_timestamp_derived_billing_window_cannot_exceed_approved_runtime(
+    tmp_path: Path,
+) -> None:
+    lifecycle, output, _authorization = _project(tmp_path)
+    before = lifecycle.read_bytes()
+    with pytest.raises(RunpodRecoveryError, match="billing window exceeds"):
+        attest_external_stop(
+            project_root=tmp_path,
+            client=FakeClient(
+                _pod(
+                    lastStatusChange=(
+                        "Exited by user: Sat Aug 29 2026 21:01:00 GMT+0000 "
+                        "(Coordinated Universal Time)"
+                    )
+                ),
+                [],
+            ),  # type: ignore[arg-type]
+            output_path=output,
+            allow_pending_billing_ceiling=True,
+            observed_at=datetime(2026, 8, 29, 21, 5, tzinfo=UTC),
+        )
+    assert lifecycle.read_bytes() == before
+    assert not output.exists()
 
 
 def test_billing_lag_fails_closed_without_explicit_ceiling_opt_in(tmp_path: Path) -> None:
@@ -263,6 +681,9 @@ def test_billing_lag_fails_closed_without_explicit_ceiling_opt_in(tmp_path: Path
         ([_billing(podId="different-pod")], "different Pod"),
         ([_billing(amount=7.6)], "timestamp-derived ceiling"),
         ([_billing(timeBilledMs=99_999_999)], "approved runtime"),
+        ([_billing(time="2020-01-01T00:00:00Z")], "current Pod runtime window"),
+        ([_billing(amount=0)], "allowed range"),
+        ([_billing(timeBilledMs=1)], "does not match the authenticated runtime"),
     ],
 )
 def test_billing_duplicate_wrong_pod_and_bounds_are_rejected(
@@ -354,3 +775,21 @@ def test_real_client_uses_only_exact_rest_v1_get_endpoints_and_redacts_output() 
     assert "/v1/billing/pods?" in calls[1]["url"]
     assert "grouping=podId" in calls[1]["url"]
     assert "startTime=" in calls[1]["url"] and "endTime=" in calls[1]["url"]
+
+
+def test_rehashed_final_receipt_cannot_detach_billing_from_runtime(tmp_path: Path) -> None:
+    _lifecycle, output, _authorization = _project(tmp_path)
+    receipt = attest_external_stop(
+        project_root=tmp_path,
+        client=FakeClient(_pod(), [_billing()]),  # type: ignore[arg-type]
+        output_path=output,
+        observed_at=OBSERVED,
+    )
+    receipt["billing_evidence"]["billing_bucket_time"] = "2020-01-01T00:00:00Z"
+    receipt["billing_evidence_hash"] = stable_hash(receipt["billing_evidence"])
+    unsigned = {key: value for key, value in receipt.items() if key != "record_hash"}
+    receipt["record_hash"] = stable_hash(unsigned)
+    output.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(RunpodRecoveryError, match="current Pod runtime window"):
+        load_external_stop_receipt(output)

@@ -1,14 +1,15 @@
 # Production RunPod lifecycle gate
 
-`scripts/runpod_pod_lifecycle.py` is the only supported creator/re-arm path for the paid Pod. It
-is intentionally not a general RunPod client: there is no delete, terminate, stop, restart, or
-arbitrary update operation. Stopping remains the independently armed watchdog's responsibility;
-that process uses only official REST v1 GET and non-destructive `/stop` operations.
+`scripts/runpod_pod_lifecycle.py` is the only supported re-arm path for the paid Pod. Its frozen
+CLI rejects `create` and `recover-create` before reading credentials or constructing a provider
+client. It is intentionally not a general RunPod client: there is no delete, terminate, stop,
+restart, or arbitrary update operation. Stopping remains the independently armed watchdog's
+responsibility; that process uses only official REST v1 GET and non-destructive `/stop` operations.
 
 The helper authenticates, before constructing an HTTP client:
 
 - the content-addressed GPU quote and API quote;
-- the exact schema-v2 paid-run approval and command phase;
+- the exact schema-v4 paid-run approval and command phase;
 - the full config, preregistration, and GPU/software lock bindings;
 - the phase's active, pre-created reservation and opaque nonce against the canonical cost ledger;
 - the all-in rate and maximum: `8 × GPU rate + running-storage rate`;
@@ -16,8 +17,9 @@ The helper authenticates, before constructing an HTTP client:
   allowlist, 50 GB container disk, and 650 GB host-local persistent `/workspace` mount.
 
 Creation is `POST https://api.runpod.io/v2/pods` using the v2-native shape. Provider list/live
-verification remains read-only v1 `GET https://rest.runpod.io/v1/pods...`. Re-arm uses v2 `PATCH
-/pods/{id}` followed by v2 `POST /pods/{id}/action` with exactly `{"action":"start"}`.
+verification remains read-only REST v1 `GET https://rest.runpod.io/v1/pods...`. Re-arm uses REST
+v1 `PATCH /pods/{id}` to replace the allow-listed environment and REST v1 `POST /pods/{id}/start`
+with no request body.
 
 ## Secret boundary
 
@@ -42,63 +44,20 @@ by the current user, mode `0600`, content-addressed, and ignored by Git. It cont
 Pod ID and SSH details, but no environment object or raw secret. CLI output prints only a Pod-ID
 hash and whether private SSH details exist.
 
-## First creation
+## Fresh creation boundary
 
-Freeze and explicitly approve the current quote/bundle, then reserve the exact phase with the
-same fresh nonce:
+The frozen take-home execution does **not** authorize creation of another Pod. It resumes the
+already authenticated, stopped research Pod through the guarded re-arm procedure below. Although
+the capability-limited lifecycle module retains a tested `create` implementation, a first
+`created` lifecycle has no independently armed host-guard producer and is therefore rejected by
+selective sync and bootstrap. Do not invoke `create`, fabricate a host acknowledgement, or consume
+one of the four study-phase reservations for provisioning.
 
-```bash
-GPU_PHASE='behavior_baseline_gpu'
-make gpu-reserve GPU_PHASE="$GPU_PHASE"
+A future from-scratch run would require a separately preregistered provisioning phase, a quoted
+budget allocation, a first-create host-guard producer, tests, and a new explicit approval before
+the provider POST. Those are outside this frozen execution.
 
-PYTHONPATH=src .venv/bin/python scripts/runpod_pod_lifecycle.py \
-  --project-root . \
-  create \
-  --phase "$GPU_PHASE" \
-  --reservation ".runpod/reservations/$GPU_PHASE.json"
-```
-
-By default, before POST the helper refuses creation if the account has any existing nonterminal
-Pod. A user-confirmed unrelated Pod may coexist only when its exact provider ID has been hashed
-locally as `runpod-pod-id-sha256:` followed by the lowercase SHA-256 of the raw UTF-8 ID, and that
-hash is supplied once with the create-only repeatable option below:
-
-```bash
-PYTHONPATH=src .venv/bin/python scripts/runpod_pod_lifecycle.py \
-  --project-root . \
-  create \
-  --phase "$GPU_PHASE" \
-  --reservation ".runpod/reservations/$GPU_PHASE.json" \
-  --allow-existing-pod-id-hash 'runpod-pod-id-sha256:<64-lowercase-hex>'
-```
-
-The raw unrelated Pod ID must never be put in argv, lifecycle state, or output. Every live
-nonterminal Pod must match exactly one supplied hash; duplicate hashes, stale/extra hashes,
-terminal-Pod hashes, malformed live IDs, and any unacknowledged live Pod all fail closed before
-POST. The canonical sorted hash set is included in the secret-safe launch-intent hash and private
-create authorization for audit. This exception never bypasses the local lifecycle claim: an
-existing `.runpod/pod_lifecycle.json` still prevents a second model-forensics create.
-
-After the account-level coexistence gate, the helper claims a local `create_intent` before the
-paid request, preventing a retry after any uncertain
-network outcome. It verifies the v2 response and polls v1 for at most ten minutes, with no sleep
-longer than 30 seconds, until the exact Pod is running and direct SSH is ready. Pending, terminal,
-verification-failed, and timeout states remain claimed. Do **not** rerun `create`; inspect status.
-
-```bash
-PYTHONPATH=src .venv/bin/python scripts/runpod_pod_lifecycle.py \
-  --project-root . \
-  status
-```
-
-Once ready, obtain the Pod ID privately for the existing bootstrap/watchdog workflow without
-printing it:
-
-```bash
-read -r RUNPOD_POD_ID < <(jq -r '.pod.id' .runpod/pod_lifecycle.json)
-export RUNPOD_POD_ID
-make gpu-bootstrap GPU_PHASE="$GPU_PHASE"
-```
+## Bootstrap guarantees
 
 The first bootstrap authenticates and installs the exact sentence-transformers wheel plus its
 inference-critical version set. The environment record hashes each installed distribution's
@@ -132,21 +91,130 @@ phase. Re-arm refuses unless live v1 metadata proves this is the same `EXITED` P
 machine, with the approved image/GPU/cloud/data center/storage/ports/networking and unchanged
 allow-listed environment. It replaces the complete allow-listed environment with values that
 differ only at `GPU_BUDGET_SESSION_ID`, then starts that Pod. It never creates another Pod.
+The same approval content hash cannot authorize a second fresh reservation for the same phase.
+An active attempt may resume only through its existing session path while its original approval and
+quote remain fresh. A fresh-approval re-arm retry is supported only if that phase failed before its
+immutable paid-plan receipt was created. Once the receipt exists and the session is stopped, this
+release treats that phase as terminal and rejects re-arm before any provider mutation; it does not
+silently replace provenance under a newly reviewed approval.
 
 ```bash
-GPU_PHASE='behavior_treatment_gpu'
+GPU_PHASE='behavior_baseline_gpu'  # advance this value for later frozen phases
 GPU_BUDGET_SESSION_ID="$(openssl rand -hex 32)"
 export GPU_BUDGET_SESSION_ID
 make gpu-reserve GPU_PHASE="$GPU_PHASE"
 
-PYTHONPATH=src .venv/bin/python scripts/runpod_pod_lifecycle.py \
-  --project-root . \
-  rearm \
-  --phase "$GPU_PHASE" \
-  --reservation ".runpod/reservations/$GPU_PHASE.json"
+# Terminal A: keep this independent host stop-capable watcher in the foreground.
+make gpu-host-watch-rearm GPU_PHASE="$GPU_PHASE"
+
+# Terminal B: only after the private host_rearm_watchdog_ack.json exists.
+make gpu-rearm GPU_PHASE="$GPU_PHASE"
 ```
 
-Immediately repeat the private `RUNPOD_POD_ID` extraction and `make gpu-bootstrap` step so the new
-phase's watchdog and local active-session gate are armed. If any lifecycle operation ends in an
-intent/pending/failed state, use `status` and audit the existing Pod; never delete it through this
-helper and never attempt a second create.
+`gpu-host-watch-rearm` first binds the authenticated stopped lifecycle, then performs a
+read-only provider check for `desiredStatus=EXITED`. Only then does it atomically create the
+fresh-session acknowledgement. `gpu-rearm` authenticates that acknowledgement, the watcher's
+boot/process-start identity (not merely its reusable PID), its current heartbeat, current
+phase/session, stopped-lifecycle hash, and Pod-ID hash both before PATCH and again
+immediately before `POST /start`. A missing, stale, tampered, wrong-session, or dead-watcher
+acknowledgement blocks start. The watcher bounds the complete start/readiness observation to five
+minutes; provider GET failures enter the stop-and-confirm loop instead of sleeping forever.
+
+Before remote bootstrap, run the guarded one-shot transfer from the host. The approved source
+commit must already be pushed to the canonical public repository, and strict host-key checking
+must already know the RunPod SSH host:
+
+```bash
+export RUNPOD_SSH_HOST='root@RUNPOD_DIRECT_SSH_CANONICAL_IPV4'
+export RUNPOD_SSH_PORT='RUNPOD_DIRECT_SSH_PORT'
+make gpu-sync GPU_PHASE="$GPU_PHASE" \
+  RUNPOD_SSH_HOST="$RUNPOD_SSH_HOST" RUNPOD_SSH_PORT="$RUNPOD_SSH_PORT"
+```
+
+Keep the host shell's `RUNPOD_API_KEY` and `HF_TOKEN` exported for this command. They are never
+placed in argv or copied remotely. Before the durable one-shot claim and first SSH, the transfer
+authenticates an independent exact-Pod stop client; after the claim, every remote command first
+revalidates the live host guard, and any failure triggers both the durable host-watcher stop request
+and the bounded provider stop-and-confirm path.
+
+Use the literal canonical IPv4 and mapped numeric port from this Pod's direct-SSH endpoint. Do
+not substitute a DNS name, SSH alias, another user, or another Pod's endpoint. The transfer
+recomputes the watchdog's domain-separated IP/port hash and constant-time compares it with the
+authenticated `current_host_guard.direct_ssh_endpoint_hash` before bundle materialization, claim,
+stop signaling, or any SSH/rsync command.
+
+The helper requires a clean local checkout whose `origin` is exactly
+`https://github.com/baeyongil/model-forensics-value-leakage.git` and whose HEAD equals the
+approval/manifest source commit. It clones that exact commit into a new clean directory under
+`/workspace`, authenticates the source before claiming the transfer, then copies only the
+manifest inventory. Both the staged and installed checkout are verified with standard-library
+code before bootstrap or any download. Promotion archives the entire old destination outside the
+project and atomically installs the verified stage; failure rolls the old destination back.
+
+The one-shot claim is created before the first SSH or private-state transfer. Any failure after that
+claim atomically creates the current host session's `runpod_stop.request` and independently stops
+and confirms the exact Pod through the provider API. Never manually rsync `.runpod`,
+`.runpod/sessions`, or the
+repository: broad copying can duplicate the current host claim or mix stale persistent-workspace
+state. The bundle contains no `.env.local`; inject the nonce and credentials through the remote
+environment. `scripts/bootstrap_gpu.sh` re-verifies the exact installed manifest and source as
+its first action, before creating `.runpod` artifacts, provider GETs, downloads, or imports. The
+manifest has a strict five-minute lifetime, so start bootstrap immediately after `gpu-sync` with
+no manual pause. A verifier failure or expiry runs the already-armed standard-library emergency
+handler. It first prefers the authenticated lifecycle/reservation binding. If either synced file
+is missing or corrupt, the fallback trusts neither one: a read-only REST-v1 GET must bind the
+provider-managed ambient `RUNPOD_POD_ID` and in-memory session nonce to the exact research Pod
+name, pinned image, 8x H100 Secure Cloud placement, approved data center, local storage, SSH-only
+endpoint, allow-listed environment, and absence of a network volume. Any mismatch issues zero
+POSTs. Only after every independent field agrees may it request the non-destructive stop, and the
+failed bootstrap does not return until a subsequent provider GET confirms exactly `EXITED`.
+
+Immediately open the already host-key-pinned direct SSH session; do not forward local credentials
+or override the Pod's provider-managed environment:
+
+```bash
+# Host: use the same authenticated endpoint values accepted by gpu-sync.
+ssh -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -p "$RUNPOD_SSH_PORT" "$RUNPOD_SSH_HOST"
+
+# Pod: the re-arm environment already carries the exact nonce, HF token,
+# provider-managed Pod id, and Pod-scoped RunPod key.
+cd /workspace/model-forensics-value-leakage
+GPU_PHASE='behavior_baseline_gpu'  # advance this value for later frozen phases
+test -n "${RUNPOD_POD_ID:-}" && test -n "${RUNPOD_API_KEY:-}" \
+  && test -n "${GPU_BUDGET_SESSION_ID:-}" && test -n "${HF_TOKEN:-}"
+make gpu-bootstrap GPU_PHASE="$GPU_PHASE"
+```
+
+Keep the original host watcher terminal running for the entire phase. If any lifecycle operation
+ends in an intent/pending/failed state, use `status` and audit the existing Pod; never delete it
+through this helper and never attempt a second create.
+
+## Stop, attest, and settle from the host
+
+After the phase outputs have been checksummed and synced, keep the original host watcher running
+and execute:
+
+```bash
+make gpu-stop-request GPU_PHASE="$GPU_PHASE"
+# Wait for local host_rearm_watchdog.json: stopped_confirmed.
+make gpu-recover-stop GPU_PHASE="$GPU_PHASE"
+make gpu-settle-external GPU_PHASE="$GPU_PHASE"
+```
+
+`gpu-stop-request` accepts only the canonical reservation-derived host session. It requires the
+watcher heartbeat to be at most 20 seconds old, authenticates the acknowledgement's live
+boot/process-start identity, and verifies the exact cumulative and split compute/storage rate
+limits before creating the zero-byte request without following or overwriting a path.
+
+The host watcher owns the stop request and provider confirmation. Do not touch a remote stop file,
+depend on post-stop SSH, or copy a remote watchdog record back to the host. Once the local watcher
+records `stopped_confirmed` for `external_stop_request`, `gpu-recover-stop` hashes that local state
+and request into a GET-only provider attestation, then CAS-transitions the lifecycle to
+`stopped` / `EXITED`. `gpu-settle-external` accepts only the canonical receipt, canonical stopped
+lifecycle, reservation and ledger and creates a schema-v2 settlement. New settlement invocations
+cannot use a remote watchdog record or a caller-supplied incurred amount.
+
+If the billing row is not yet available, recovery fails without changing the lifecycle or ledger;
+retry it after the provider posts the row. The no-start reconciliation remains a separate path and
+must not be used for a session whose provider `lastStartedAt` advanced.

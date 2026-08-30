@@ -5,11 +5,15 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from model_forensics.budget import BudgetLimits, CostLedger
+from model_forensics.gpu_budget import reserve_gpu_phase_budget
+from model_forensics.io import stable_hash, write_json
 from model_forensics.runpod_sessions import record_watchdog_process_identity
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "runpod_preflight.py"
@@ -500,6 +504,178 @@ def test_bootstrap_arms_watchdog_before_any_download_and_never_deletes() -> None
     assert "secret_free .venv-gpu/bin/python -m pip install" in script
     assert "with_hf_token .venv-gpu/bin/python scripts/qwen4b_prefix_smoke.py" in script
     assert "-e . --no-deps" in script
+    assert 'LIFECYCLE_STATE="$PWD/.runpod/pod_lifecycle.json"' in script
+    assert '--state "$EMERGENCY_WATCHDOG_STATE"' in script
+    assert 'shasum -a 256' not in script
+
+
+def test_fresh_image_pre_watchdog_chain_needs_neither_pydantic_nor_pyyaml(
+    tmp_path: Path,
+) -> None:
+    """Exercise every local gate before watchdog arming with imports blocked."""
+
+    root = Path(__file__).resolve().parents[1]
+    session_id = "fresh-image-session-nonce"
+    phase = "behavior_baseline_gpu"
+    private = tmp_path / ".runpod"
+    receipt = private / "reservations" / "baseline.json"
+    ledger_path = tmp_path / "cost_ledger.yaml"
+    ledger = CostLedger(
+        ledger_path,
+        BudgetLimits(gpu=220, api=100, total=325),
+    )
+    reservation = reserve_gpu_phase_budget(
+        ledger=ledger,
+        phase=phase,
+        session_id=session_id,
+        approved_phase_maximum_usd=48,
+        approved_maximum_runtime_hours=2,
+        live_hourly_total_usd=24,
+    )
+    write_json(receipt, reservation.manifest())
+
+    blocker = tmp_path / "blocker"
+    blocker.mkdir()
+    (blocker / "sitecustomize.py").write_text(
+        """
+import builtins
+
+_real_import = builtins.__import__
+
+def _blocked_import(name, *args, **kwargs):
+    if name.split('.', 1)[0] in {'pydantic', 'yaml'}:
+        raise ModuleNotFoundError(f'fresh image intentionally lacks {name}')
+    return _real_import(name, *args, **kwargs)
+
+builtins.__import__ = _blocked_import
+""".lstrip(),
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((str(blocker), str(root / "src"))),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GPU_BUDGET_SESSION_ID": session_id,
+    }
+    pending = private / "gpu_budget_bootstrap.pending.json"
+    budget = subprocess.run(
+        [
+            sys.executable,
+            os.fspath(root / "scripts" / "gpu_budget_preflight.py"),
+            "--reservation-receipt",
+            os.fspath(receipt),
+            "--cost-ledger",
+            os.fspath(ledger_path),
+            "--phase",
+            phase,
+            "--session-id-env",
+            "GPU_BUDGET_SESSION_ID",
+            "--expected-approved-runtime-hours",
+            "2",
+            "--expected-live-hourly-total-usd",
+            "24",
+            "--gpu-hard-stop-usd",
+            "220",
+            "--api-hard-stop-usd",
+            "100",
+            "--total-hard-stop-usd",
+            "325",
+            "--output",
+            os.fspath(pending),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert budget.returncode == 0, budget.stderr
+
+    prepared = subprocess.run(
+        [
+            sys.executable,
+            os.fspath(root / "scripts" / "runpod_session_prepare.py"),
+            "--sessions-root",
+            ".runpod/sessions",
+            "--pending-budget-bootstrap",
+            ".runpod/gpu_budget_bootstrap.pending.json",
+            "--cost-ledger",
+            os.fspath(ledger_path),
+            "--gpu-hard-stop-usd",
+            "220",
+            "--api-hard-stop-usd",
+            "100",
+            "--total-hard-stop-usd",
+            "325",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    session_directory = Path(prepared.stdout.strip())
+    assert session_directory == (
+        private / "sessions" / reservation.session_hash.removeprefix("sha256:")
+    ).resolve()
+    assert (session_directory / "gpu_budget_bootstrap.json").is_file()
+
+    immutable_spec = {"gpu": {"count": 8, "id": GPU_ID}, "image": IMAGE}
+    current_authorization = {
+        "acknowledged_existing_pod_id_hashes": [],
+        "approval_hash": stable_hash({"approval": 1}),
+        "approved_phase_maximum_usd": 48.0,
+        "approved_runtime_hours": 2.0,
+        "bindings_hash": stable_hash({"bindings": 1}),
+        "gpu_lock_hash": stable_hash({"gpu_lock": 1}),
+        "immutable_spec_hash": stable_hash(immutable_spec),
+        "launch_spec_hash": stable_hash({"launch": 1}),
+        "live_hourly_total_usd": 24.0,
+        "phase": phase,
+        "quote_hash": stable_hash({"quote": 1}),
+        "reservation_id": reservation.reservation_id,
+        "reservation_record_hash": reservation.manifest()["record_hash"],
+        "session_hash": reservation.session_hash,
+    }
+    lifecycle = {
+        "schema_version": 1,
+        "protocol_version": "runpod-pod-lifecycle-v1",
+        "operation": "rearmed",
+        "updated_at": "2026-08-30T00:00:00Z",
+        "immutable_spec": immutable_spec,
+        "current_authorization": current_authorization,
+        "authorization_history": [],
+        "pod": {"id": "pod123456", "status": "RUNNING"},
+    }
+    lifecycle["record_hash"] = stable_hash(lifecycle)
+    lifecycle_path = private / "pod_lifecycle.json"
+    write_json(lifecycle_path, lifecycle)
+    lifecycle_path.chmod(0o600)
+    binding_probe = (
+        "from model_forensics.runpod_watchdog import bind_lifecycle_pod; "
+        "import sys; "
+        "print(bind_lifecycle_pod(lifecycle_state_path=sys.argv[1], "
+        "expected_session_hash=sys.argv[2], expected_phase=sys.argv[3], "
+        "ambient_pod_id='pod123456'))"
+    )
+    bound = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            binding_probe,
+            os.fspath(lifecycle_path.resolve()),
+            reservation.session_hash,
+            phase,
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert bound.returncode == 0, bound.stderr
+    assert bound.stdout.strip() == "pod123456"
 
 
 def test_bootstrap_secret_wrappers_remove_inherited_private_exports() -> None:

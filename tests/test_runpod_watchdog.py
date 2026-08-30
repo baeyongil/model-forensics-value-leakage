@@ -13,10 +13,13 @@ from model_forensics.runpod_watchdog import (
     RunpodStopClient,
     WatchdogError,
     WatchdogLimits,
+    _host_ack_payload,
+    _write_host_rearm_ack,
     bind_lifecycle_pod,
     derive_deadline,
     parse_pod_metadata,
     run_watchdog,
+    validate_host_rearm_ack,
     validate_live_metadata,
     wait_for_rearm_then_run_watchdog,
 )
@@ -31,6 +34,45 @@ SESSION_HASH = stable_hash({"opaque_gpu_session_id": SESSION_FIXTURE_VALUE})
 HF_TOKEN_HASH = stable_hash({"hf_token": HF_FIXTURE_VALUE})
 OLD_SESSION_FIXTURE_VALUE = "old-session-fixture-value"
 OLD_SESSION_HASH = stable_hash({"opaque_gpu_session_id": OLD_SESSION_FIXTURE_VALUE})
+
+
+def test_host_ack_rejects_reused_pid_with_changed_start_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_identity = stable_hash({"process_start": "first"})
+    second_identity = stable_hash({"process_start": "second"})
+    monkeypatch.setattr(
+        watchdog_module,
+        "_host_process_identity_hash",
+        lambda _pid: first_identity,
+    )
+    now = datetime.now(UTC)
+    payload = _host_ack_payload(
+        expected_session_hash=SESSION_HASH,
+        expected_phase="behavior_treatment_gpu",
+        lifecycle_before_hash=stable_hash({"lifecycle": "stopped"}),
+        pod_id="pod_123",
+        watcher_pid=4242,
+        acknowledged_at=now,
+    )
+    acknowledgement = tmp_path / "host_rearm_watchdog_ack.json"
+    _write_host_rearm_ack(acknowledgement, payload)
+    monkeypatch.setattr(
+        watchdog_module,
+        "_host_process_identity_hash",
+        lambda _pid: second_identity,
+    )
+
+    with pytest.raises(WatchdogError, match="process identity changed"):
+        validate_host_rearm_ack(
+            acknowledgement,
+            expected_session_hash=SESSION_HASH,
+            expected_phase="behavior_treatment_gpu",
+            expected_lifecycle_hash=stable_hash({"lifecycle": "stopped"}),
+            expected_pod_id="pod_123",
+            observed_at=now,
+        )
 
 
 def _payload(
@@ -773,6 +815,7 @@ def test_host_watcher_acknowledges_before_rearm_without_remote_state(
         session_hash=OLD_SESSION_HASH,
     )
     state_path = tmp_path / ".runpod" / "host_watchdog.json"
+    acknowledgement_path = state_path.with_name("host_rearm_watchdog_ack.json")
 
     def get_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
         del url, api_key, timeout
@@ -792,6 +835,9 @@ def test_host_watcher_acknowledges_before_rearm_without_remote_state(
     def pause_after_ack(seconds: float) -> None:
         del seconds
         assert read_json(state_path)["status"] == "waiting_for_start"
+        assert read_json(acknowledgement_path)["status"] == (
+            "armed_and_provider_exited_verified"
+        )
         raise WatcherPaused
 
     with pytest.raises(WatcherPaused):
@@ -807,9 +853,160 @@ def test_host_watcher_acknowledges_before_rearm_without_remote_state(
             expected_container_image=IMAGE,
             limits=WatchdogLimits(220, 1.5),
             state_path=state_path,
+            acknowledgement_path=acknowledgement_path,
             client=client,
             sleep=pause_after_ack,
         )
+
+
+def test_host_watcher_bounds_desired_status_errors_and_attempts_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_RUNPOD_KEY", "secret")
+    monkeypatch.setenv("TEST_HF_TOKEN", HF_FIXTURE_VALUE)
+    lifecycle = _write_lifecycle_state(
+        tmp_path,
+        operation="stopped",
+        pod_status="EXITED",
+        session_hash=OLD_SESSION_HASH,
+    )
+    clock = [0.0]
+    stop_calls = 0
+
+    def unavailable_get(url: str, api_key: str, timeout: float) -> tuple[int, str]:
+        del url, api_key, timeout
+        return 503, "{}"
+
+    def stop_transport(
+        url: str,
+        api_key: str,
+        timeout: float,
+        payload: dict[str, str] | None,
+    ) -> tuple[int, str]:
+        nonlocal stop_calls
+        del url, api_key, timeout, payload
+        stop_calls += 1
+        return 200, "{}"
+
+    def advance(seconds: float) -> None:
+        clock[0] += seconds
+
+    state_path = tmp_path / ".runpod" / "host_watchdog.json"
+    acknowledgement_path = state_path.with_name("host_rearm_watchdog_ack.json")
+    client = RunpodStopClient(
+        pod_id="pod_123",
+        expected_session_hash=SESSION_HASH,
+        api_key_env="TEST_RUNPOD_KEY",
+        hf_token_env="TEST_HF_TOKEN",
+        transport=stop_transport,
+        metadata_transport=unavailable_get,
+    )
+
+    with pytest.raises(WatchdogError, match="failed to confirm Pod stop"):
+        wait_for_rearm_then_run_watchdog(
+            lifecycle_state_path=lifecycle,
+            expected_session_hash=SESSION_HASH,
+            expected_phase="behavior_treatment_gpu",
+            pod_id="pod_123",
+            expected_gpu_family="H100_80GB",
+            expected_provider_gpu_id=GPU_ID,
+            allowed_data_center_ids=DATA_CENTERS,
+            allowed_cuda_versions=CUDA_VERSIONS,
+            expected_container_image=IMAGE,
+            limits=WatchdogLimits(220, 1.5),
+            state_path=state_path,
+            acknowledgement_path=acknowledgement_path,
+            client=client,
+            running_readiness_timeout_seconds=10,
+            stop_attempts=1,
+            sleep=advance,
+            monotonic=lambda: clock[0],
+        )
+
+    assert stop_calls == 1
+    assert not acknowledgement_path.exists()
+    stopped = read_json(state_path)
+    assert stopped["status"] == "stop_unconfirmed"
+    assert stopped["stop_reason"] == "rearm_start_or_readiness_timeout"
+
+
+def test_host_watcher_stops_if_lifecycle_becomes_unreadable_after_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_RUNPOD_KEY", "secret")
+    monkeypatch.setenv("TEST_HF_TOKEN", HF_FIXTURE_VALUE)
+    lifecycle = _write_lifecycle_state(
+        tmp_path,
+        operation="stopped",
+        pod_status="EXITED",
+        session_hash=OLD_SESSION_HASH,
+    )
+    responses = iter(
+        (
+            _payload(status="EXITED"),
+            _payload(status="RUNNING"),
+            _payload(status="EXITED"),
+        )
+    )
+    stop_calls = 0
+    corrupted = False
+
+    def get_transport(url: str, api_key: str, timeout: float) -> tuple[int, str]:
+        del url, api_key, timeout
+        return 200, json.dumps(next(responses))
+
+    def stop_transport(
+        url: str,
+        api_key: str,
+        timeout: float,
+        payload: dict[str, str] | None,
+    ) -> tuple[int, str]:
+        nonlocal stop_calls
+        del url, api_key, timeout, payload
+        stop_calls += 1
+        return 200, "{}"
+
+    def corrupt_after_ack(_seconds: float) -> None:
+        nonlocal corrupted
+        if not corrupted:
+            lifecycle.write_text("not-json\n", encoding="utf-8")
+            corrupted = True
+
+    state_path = tmp_path / ".runpod" / "host_watchdog.json"
+    acknowledgement_path = state_path.with_name("host_rearm_watchdog_ack.json")
+    client = RunpodStopClient(
+        pod_id="pod_123",
+        expected_session_hash=SESSION_HASH,
+        api_key_env="TEST_RUNPOD_KEY",
+        hf_token_env="TEST_HF_TOKEN",
+        transport=stop_transport,
+        metadata_transport=get_transport,
+    )
+
+    with pytest.raises(WatchdogError, match="lifecycle binding is invalid"):
+        wait_for_rearm_then_run_watchdog(
+            lifecycle_state_path=lifecycle,
+            expected_session_hash=SESSION_HASH,
+            expected_phase="behavior_treatment_gpu",
+            pod_id="pod_123",
+            expected_gpu_family="H100_80GB",
+            expected_provider_gpu_id=GPU_ID,
+            allowed_data_center_ids=DATA_CENTERS,
+            allowed_cuda_versions=CUDA_VERSIONS,
+            expected_container_image=IMAGE,
+            limits=WatchdogLimits(220, 1.5),
+            state_path=state_path,
+            acknowledgement_path=acknowledgement_path,
+            client=client,
+            stop_attempts=1,
+            sleep=corrupt_after_ack,
+        )
+
+    assert acknowledgement_path.is_file()
+    assert stop_calls == 1
+    stopped = read_json(state_path)
+    assert stopped["status"] == "stopped_confirmed"
+    assert stopped["stop_reason"] == "lifecycle_read_failed_during_rearm"
 
 
 def test_host_watcher_survives_rearm_client_crash_after_start(
@@ -823,6 +1020,9 @@ def test_host_watcher_survives_rearm_client_crash_after_start(
         pod_status="EXITED",
         session_hash=OLD_SESSION_HASH,
     )
+    old_authorization = json.loads(lifecycle.read_text(encoding="utf-8"))[
+        "current_authorization"
+    ]
     base = datetime(2026, 8, 29, 12, tzinfo=UTC)
     responses = iter(
         (
@@ -864,7 +1064,7 @@ def test_host_watcher_survives_rearm_client_crash_after_start(
             pod_status="EXITED",
             phase="behavior_treatment_gpu",
             session_hash=SESSION_HASH,
-            history=[{"session_hash": OLD_SESSION_HASH}],
+            history=[old_authorization],
         )
 
     client = RunpodStopClient(
@@ -887,6 +1087,9 @@ def test_host_watcher_survives_rearm_client_crash_after_start(
         expected_container_image=IMAGE,
         limits=WatchdogLimits(220, 1 / 3600),
         state_path=tmp_path / ".runpod" / "host_watchdog.json",
+        acknowledgement_path=(
+            tmp_path / ".runpod" / "host_rearm_watchdog_ack.json"
+        ),
         client=client,
         sleep=simulate_rearm_process_crash,
         now=lambda: base + timedelta(seconds=2),

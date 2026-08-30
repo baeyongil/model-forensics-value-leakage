@@ -33,6 +33,7 @@ from typing import Any
 from model_forensics.approval import (
     ApprovalBindings,
     PaidRunApproval,
+    require_clean_source_commit,
     validate_paid_run_approval,
 )
 from model_forensics.budget import CostLedger
@@ -42,6 +43,27 @@ from model_forensics.gpu_budget import (
     validate_gpu_phase_bootstrap,
 )
 from model_forensics.io import stable_hash
+from model_forensics.runpod_contract import (
+    CANDIDATE_DATA_CENTER_IDS,
+    EXACT_CLOUD,
+    EXACT_CONTAINER_DISK_GB,
+    EXACT_CUDA_VERSIONS,
+    EXACT_GPU_COUNT,
+    EXACT_GPU_FAMILY,
+    EXACT_PORTS,
+    EXACT_PROVIDER_GPU_ID,
+    EXACT_VOLUME_DISK_GB,
+    EXACT_VOLUME_MOUNT_PATH,
+    GPU_COMMAND_PHASES,
+    HF_TOKEN_ENV_NAME,
+    LIFECYCLE_PROTOCOL,
+    LIFECYCLE_STATE_FILENAME,
+    PROVIDER_MANAGED_ENV_KEYS,
+    REQUESTED_POD_ENV_KEYS,
+    SESSION_ENV_NAME,
+    STATIC_POD_ENV,
+    TERMINAL_POD_STATUSES,
+)
 
 RUNPOD_V2_BASE = "https://api.runpod.io/v2"
 RUNPOD_V1_BASE = "https://rest.runpod.io/v1"
@@ -49,35 +71,37 @@ RUNPOD_V2_PODS_URL = f"{RUNPOD_V2_BASE}/pods"
 RUNPOD_V1_PODS_URL = f"{RUNPOD_V1_BASE}/pods"
 RUNPOD_V1_EXACT_QUERY = "includeMachine=true&includeNetworkVolume=true&includeTemplate=true"
 
-LIFECYCLE_PROTOCOL = "runpod-pod-lifecycle-v1"
-LIFECYCLE_STATE_FILENAME = "pod_lifecycle.json"
-EXACT_PROVIDER_GPU_ID = "NVIDIA H100 80GB HBM3"
-EXACT_GPU_FAMILY = "H100_80GB"
-EXACT_GPU_COUNT = 8
-EXACT_CLOUD = "SECURE"
-EXACT_CUDA_VERSIONS = ("12.8",)
-CANDIDATE_DATA_CENTER_IDS = frozenset({"CA-MTL-1", "EUR-IS-3"})
-EXACT_CONTAINER_DISK_GB = 50
-EXACT_VOLUME_DISK_GB = 650
-EXACT_VOLUME_MOUNT_PATH = "/workspace"
-EXACT_PORTS = ("22/tcp",)
-
-SESSION_ENV_NAME = "GPU_BUDGET_SESSION_ID"
-HF_TOKEN_ENV_NAME = "HF_TOKEN"
-STATIC_POD_ENV = {
-    "HF_HOME": "/workspace/.cache/huggingface",
-    "HF_HUB_CACHE": "/workspace/.cache/huggingface/hub",
-    "TRANSFORMERS_CACHE": "/workspace/.cache/huggingface/transformers",
-    "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
-    "VLLM_ENABLE_CUDA_COMPATIBILITY": "1",
-}
-REQUESTED_POD_ENV_KEYS = frozenset({HF_TOKEN_ENV_NAME, SESSION_ENV_NAME, *STATIC_POD_ENV})
-PROVIDER_MANAGED_ENV_KEYS = frozenset({"PUBLIC_KEY"})
-TERMINAL_POD_STATUSES = frozenset({"EXITED", "TERMINATED"})
 _POD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{5,127}\Z")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,127}\Z")
 _HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EXISTING_POD_ID_HASH_RE = re.compile(r"runpod-pod-id-sha256:[0-9a-f]{64}\Z")
+_AUTHORIZATION_KEYS = {
+    "acknowledged_existing_pod_id_hashes",
+    "approval_hash",
+    "approved_phase_maximum_usd",
+    "approved_runtime_hours",
+    "bindings_hash",
+    "gpu_lock_hash",
+    "immutable_spec_hash",
+    "launch_spec_hash",
+    "live_hourly_total_usd",
+    "phase",
+    "quote_hash",
+    "reservation_id",
+    "reservation_record_hash",
+    "session_hash",
+}
+_AUTHORIZATION_HASH_FIELDS = (
+    "reservation_id",
+    "reservation_record_hash",
+    "session_hash",
+    "approval_hash",
+    "bindings_hash",
+    "gpu_lock_hash",
+    "quote_hash",
+    "immutable_spec_hash",
+    "launch_spec_hash",
+)
 _MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
 
 
@@ -225,6 +249,7 @@ def _immutable_spec(bindings: ApprovalBindings) -> dict[str, Any]:
 
 def authorize_gpu_lifecycle(
     *,
+    project_root: str | Path,
     approval: PaidRunApproval,
     expected_bindings: ApprovalBindings,
     reservation: GpuPhaseBudgetReservation,
@@ -236,11 +261,24 @@ def authorize_gpu_lifecycle(
     """Authenticate approval, frozen quote/spec, and one active reservation."""
 
     nonce = _validate_opaque_secret(session_nonce, label="GPU session nonce")
+    root = Path(project_root).resolve()
+    try:
+        ledger_relative = ledger.path.resolve().relative_to(root).as_posix()
+    except (OSError, ValueError) as exc:
+        raise RunpodLifecycleError("GPU lifecycle ledger escapes the project root") from exc
+    if ledger_relative != "data/manifests/cost_ledger.yaml":
+        raise RunpodLifecycleError("GPU lifecycle requires the canonical cumulative ledger")
+    source_commit = require_clean_source_commit(
+        root,
+        mutable_paths=(ledger.path,),
+    )
     validate_paid_run_approval(
         approval,
         expected=expected_bindings,
         command_phase=phase,
         now=now,
+        expected_source_commit=source_commit,
+        expected_ledger_path=ledger_relative,
     )
     spec = _immutable_spec(expected_bindings)
     runtime = _exact_runtime(expected_bindings, phase)
@@ -988,6 +1026,112 @@ def _secure_existing_state_file(path: Path) -> None:
     path.chmod(0o600)
 
 
+def _authorization_from_manifest(
+    value: Any,
+    *,
+    immutable_spec: Mapping[str, Any],
+    label: str,
+) -> LifecycleAuthorization:
+    if not isinstance(value, Mapping) or set(value) != _AUTHORIZATION_KEYS:
+        raise RunpodLifecycleError(f"private lifecycle {label} authorization is malformed")
+    phase = value.get("phase")
+    if not isinstance(phase, str) or phase not in GPU_COMMAND_PHASES:
+        raise RunpodLifecycleError(f"private lifecycle {label} phase is malformed")
+    for field in _AUTHORIZATION_HASH_FIELDS:
+        observed = value.get(field)
+        if not isinstance(observed, str) or _HASH_RE.fullmatch(observed) is None:
+            raise RunpodLifecycleError(
+                f"private lifecycle {label} authorization hash is malformed"
+            )
+    immutable_spec_hash = stable_hash(dict(immutable_spec))
+    if value["immutable_spec_hash"] != immutable_spec_hash:
+        raise RunpodLifecycleError(
+            f"private lifecycle {label} immutable launch specification drifted"
+        )
+    acknowledged = value.get("acknowledged_existing_pod_id_hashes")
+    if not isinstance(acknowledged, list):
+        raise RunpodLifecycleError(
+            f"private lifecycle {label} Pod acknowledgement list is malformed"
+        )
+    try:
+        canonical_acknowledged = _canonical_existing_pod_id_hashes(acknowledged)
+    except RunpodLifecycleError as exc:
+        raise RunpodLifecycleError(
+            f"private lifecycle {label} Pod acknowledgement list is malformed"
+        ) from exc
+    if acknowledged != list(canonical_acknowledged):
+        raise RunpodLifecycleError(
+            f"private lifecycle {label} Pod acknowledgement list is not canonical"
+        )
+    numeric: dict[str, float] = {}
+    for field in (
+        "approved_runtime_hours",
+        "approved_phase_maximum_usd",
+        "live_hourly_total_usd",
+    ):
+        raw = value.get(field)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise RunpodLifecycleError(
+                f"private lifecycle {label} authorization cost is malformed"
+            )
+        parsed = float(raw)
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise RunpodLifecycleError(
+                f"private lifecycle {label} authorization cost is malformed"
+            )
+        numeric[field] = parsed
+    return LifecycleAuthorization(
+        phase=phase,
+        reservation_id=str(value["reservation_id"]),
+        reservation_record_hash=str(value["reservation_record_hash"]),
+        session_hash=str(value["session_hash"]),
+        approval_hash=str(value["approval_hash"]),
+        bindings_hash=str(value["bindings_hash"]),
+        gpu_lock_hash=str(value["gpu_lock_hash"]),
+        quote_hash=str(value["quote_hash"]),
+        immutable_spec=dict(immutable_spec),
+        immutable_spec_hash=immutable_spec_hash,
+        approved_runtime_hours=numeric["approved_runtime_hours"],
+        approved_phase_maximum_usd=numeric["approved_phase_maximum_usd"],
+        live_hourly_total_usd=numeric["live_hourly_total_usd"],
+    )
+
+
+def _validate_authorization_history(state: Mapping[str, Any]) -> None:
+    spec = state.get("immutable_spec")
+    current = state.get("current_authorization")
+    history = state.get("authorization_history")
+    if not isinstance(spec, Mapping) or not isinstance(history, list):
+        raise RunpodLifecycleError("private lifecycle authorization history is malformed")
+    authorizations = [
+        _authorization_from_manifest(
+            item,
+            immutable_spec=spec,
+            label=f"historical[{index}]",
+        )
+        for index, item in enumerate(history)
+    ]
+    authorizations.append(
+        _authorization_from_manifest(
+            current,
+            immutable_spec=spec,
+            label="current",
+        )
+    )
+    sessions = [item.session_hash for item in authorizations]
+    reservations = [item.reservation_id for item in authorizations]
+    approval_phases = [(item.approval_hash, item.phase) for item in authorizations]
+    if (
+        len(sessions) != len(set(sessions))
+        or len(reservations) != len(set(reservations))
+        or len(approval_phases) != len(set(approval_phases))
+    ):
+        raise RunpodLifecycleError(
+            "private lifecycle authorization history reuses a session, reservation, "
+            "or approval-phase pair"
+        )
+
+
 def _load_state(path: Path) -> dict[str, Any]:
     _secure_existing_state_file(path)
     try:
@@ -1014,10 +1158,7 @@ def _load_state(path: Path) -> dict[str, Any]:
     unsigned = {key: item for key, item in value.items() if key != "record_hash"}
     if value.get("record_hash") != stable_hash(unsigned):
         raise RunpodLifecycleError("private lifecycle state content hash mismatch")
-    if not isinstance(value.get("current_authorization"), Mapping):
-        raise RunpodLifecycleError("private lifecycle authorization is malformed")
-    if not isinstance(value.get("authorization_history"), list):
-        raise RunpodLifecycleError("private lifecycle history is malformed")
+    _validate_authorization_history(value)
     return value
 
 
@@ -1462,34 +1603,10 @@ def read_lifecycle_status(
 
 def _authorization_from_state(state: Mapping[str, Any]) -> LifecycleAuthorization:
     spec = _require_exact_mapping(state.get("immutable_spec"), label="immutable spec")
-    current = _require_exact_mapping(state.get("current_authorization"), label="authorization")
-    required_hashes = (
-        "reservation_record_hash",
-        "session_hash",
-        "approval_hash",
-        "bindings_hash",
-        "gpu_lock_hash",
-        "quote_hash",
-        "immutable_spec_hash",
-    )
-    if any(not isinstance(current.get(key), str) for key in required_hashes):
-        raise RunpodLifecycleError("private lifecycle authorization is malformed")
-    if current.get("immutable_spec_hash") != stable_hash(dict(spec)):
-        raise RunpodLifecycleError("private immutable launch specification drifted")
-    return LifecycleAuthorization(
-        phase=str(current.get("phase")),
-        reservation_id=str(current.get("reservation_id")),
-        reservation_record_hash=str(current["reservation_record_hash"]),
-        session_hash=str(current["session_hash"]),
-        approval_hash=str(current["approval_hash"]),
-        bindings_hash=str(current["bindings_hash"]),
-        gpu_lock_hash=str(current["gpu_lock_hash"]),
-        quote_hash=str(current["quote_hash"]),
-        immutable_spec=dict(spec),
-        immutable_spec_hash=str(current["immutable_spec_hash"]),
-        approved_runtime_hours=float(current.get("approved_runtime_hours")),
-        approved_phase_maximum_usd=float(current.get("approved_phase_maximum_usd")),
-        live_hourly_total_usd=float(current.get("live_hourly_total_usd")),
+    return _authorization_from_manifest(
+        state.get("current_authorization"),
+        immutable_spec=spec,
+        label="current",
     )
 
 
@@ -1499,6 +1616,137 @@ def _require_prior_reservation_settled(*, ledger: CostLedger, reservation_id: st
     ]
     if len(matching) != 1 or matching[0].get("status") != "incurred":
         raise RunpodLifecycleError("prior GPU reservation must be settled before re-arm")
+
+
+def _reject_post_receipt_same_phase_retry(
+    *,
+    project_root: Path,
+    phase: str,
+) -> None:
+    """Fail before provider contact when a phase already crossed its plan lock.
+
+    The v1 paid-phase receipt is intentionally one immutable approval/plan
+    record.  A fresh approval cannot replace it without a versioned provenance
+    protocol, so a stopped post-receipt phase is terminal in this release.
+    """
+
+    directory = project_root / ".runpod" / "paid_phase_receipts"
+    if not os.path.lexists(directory):
+        return
+    details = directory.lstat()
+    if (
+        directory.is_symlink()
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+    ):
+        raise RunpodLifecycleError("private paid-phase receipt directory is unsafe")
+    path = directory / f"{phase}.json"
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or not path.is_file():
+        raise RunpodLifecycleError("private paid-phase receipt is unsafe")
+    receipt_details = path.lstat()
+    if (
+        not stat.S_ISREG(receipt_details.st_mode)
+        or receipt_details.st_uid != os.getuid()
+        or receipt_details.st_nlink != 1
+        or receipt_details.st_size > _MAX_HTTP_BODY_BYTES
+    ):
+        raise RunpodLifecycleError("private paid-phase receipt is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            identity = lambda item: (  # noqa: E731 - compact authenticated-read tuple
+                item.st_dev,
+                item.st_ino,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+                item.st_nlink,
+                item.st_uid,
+            )
+            if (
+                identity(opened) != identity(receipt_details)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > _MAX_HTTP_BODY_BYTES
+            ):
+                raise RunpodLifecycleError(
+                    "private paid-phase receipt changed before authenticated read"
+                )
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = os.read(
+                    descriptor,
+                    min(1024 * 1024, _MAX_HTTP_BODY_BYTES + 1 - size),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > _MAX_HTTP_BODY_BYTES:
+                    raise RunpodLifecycleError("private paid-phase receipt is unsafe")
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = path.lstat()
+        if (
+            identity(after) != identity(opened)
+            or identity(current) != identity(opened)
+            or size != opened.st_size
+        ):
+            raise RunpodLifecycleError(
+                "private paid-phase receipt changed during authenticated read"
+            )
+        receipt = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except RunpodLifecycleError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunpodLifecycleError("private paid-phase receipt is unreadable") from exc
+    base_keys = {
+        "schema_version",
+        "protocol_version",
+        "command_phase",
+        "approval_content_hash",
+        "approval_id_hash",
+        "bindings_hash",
+        "plan_hash",
+        "receipt_hash",
+    }
+    if not isinstance(receipt, dict) or frozenset(receipt) not in {
+        frozenset(base_keys),
+        frozenset({*base_keys, "api_completion_preflight"}),
+    }:
+        raise RunpodLifecycleError("private paid-phase receipt schema is invalid")
+    from model_forensics.paid_phase_receipt import PAID_PHASE_RECEIPT_PROTOCOL
+
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("protocol_version") != PAID_PHASE_RECEIPT_PROTOCOL
+        or receipt.get("command_phase") != phase
+        or any(
+            not isinstance(receipt.get(field), str)
+            or _HASH_RE.fullmatch(str(receipt[field])) is None
+            for field in (
+                "approval_content_hash",
+                "approval_id_hash",
+                "bindings_hash",
+                "plan_hash",
+                "receipt_hash",
+            )
+        )
+        or receipt.get("receipt_hash")
+        != stable_hash({key: value for key, value in receipt.items() if key != "receipt_hash"})
+    ):
+        raise RunpodLifecycleError("private paid-phase receipt authentication failed")
+    raise RunpodLifecycleError(
+        "same-phase retry is unsupported after its immutable paid-plan receipt exists"
+    )
 
 
 def _validate_readiness_wait(*, maximum_wait_seconds: float, poll_interval_seconds: float) -> None:
@@ -1535,6 +1783,9 @@ def _wait_for_running_v1(
     machine_hash = identity_pod.get("machine_id_hash")
     if not isinstance(machine_hash, str):
         raise RunpodLifecycleError("RunPod Pod machine identity is unavailable")
+    pre_start_last_started_at = identity_pod.get("pre_start_last_started_at")
+    if not isinstance(pre_start_last_started_at, str):
+        raise RunpodLifecycleError("RunPod pre-start timestamp evidence is unavailable")
     deadline = monotonic() + maximum_wait_seconds
     current_state = dict(state)
     while True:
@@ -1568,6 +1819,7 @@ def _wait_for_running_v1(
                 expected_machine_hash=machine_hash,
                 require_running_ssh=False,
             )
+            sanitized["pre_start_last_started_at"] = pre_start_last_started_at
             _verify_provider_binding(stored_pod=identity_pod, live_pod=sanitized)
         except RunpodLifecycleError:
             failed = _pending_state(
@@ -1610,6 +1862,7 @@ def rearm_approved_pod(
     ledger: CostLedger,
     hf_token: str,
     session_nonce: str,
+    host_watchdog_ack_path: str | Path,
     now: datetime | None = None,
     maximum_wait_seconds: float = 600.0,
     poll_interval_seconds: float = 10.0,
@@ -1648,6 +1901,19 @@ def rearm_approved_pod(
     }
     if authorization.session_hash in used_session_hashes:
         raise RunpodLifecycleError("re-arm session nonce was already used")
+    used_approval_phases = {
+        (str(item.get("approval_hash")), str(item.get("phase")))
+        for item in [*history, previous_manifest]
+        if isinstance(item, Mapping)
+    }
+    if (authorization.approval_hash, authorization.phase) in used_approval_phases:
+        raise RunpodLifecycleError(
+            "re-arm approval was already used for this paid command phase"
+        )
+    _reject_post_receipt_same_phase_retry(
+        project_root=Path(project_root).resolve(),
+        phase=authorization.phase,
+    )
     _require_prior_reservation_settled(
         ledger=ledger,
         reservation_id=previous.reservation_id,
@@ -1656,6 +1922,51 @@ def rearm_approved_pod(
     name = pod.get("name")
     if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
         raise RunpodLifecycleError("private Pod name is missing or malformed")
+    from model_forensics.runpod_watchdog import (
+        HOST_REARM_ACK_FILENAME,
+        WatchdogError,
+        validate_host_rearm_ack,
+        validate_host_rearm_waiting_state,
+    )
+
+    expected_ack_path = (
+        state_path.parent
+        / "sessions"
+        / authorization.session_hash.removeprefix("sha256:")
+        / HOST_REARM_ACK_FILENAME
+    ).resolve()
+    observed_ack_path = Path(host_watchdog_ack_path).resolve()
+    if observed_ack_path != expected_ack_path:
+        raise RunpodLifecycleError(
+            "host re-arm watchdog acknowledgement path disagrees with the fresh session"
+        )
+    lifecycle_before_hash = state.get("record_hash")
+    if not isinstance(lifecycle_before_hash, str):
+        raise RunpodLifecycleError("private stopped lifecycle hash is missing")
+
+    def require_live_host_watcher() -> None:
+        try:
+            validate_host_rearm_ack(
+                observed_ack_path,
+                expected_session_hash=authorization.session_hash,
+                expected_phase=authorization.phase,
+                expected_lifecycle_hash=lifecycle_before_hash,
+                expected_pod_id=pod_id,
+                observed_at=now,
+            )
+            validate_host_rearm_waiting_state(
+                observed_ack_path.with_name("host_rearm_watchdog.json"),
+                expected_pod_id=pod_id,
+                expected_maximum_runtime_hours=authorization.approved_runtime_hours,
+                expected_hourly_total_usd=authorization.live_hourly_total_usd,
+                observed_at=now,
+            )
+        except (OSError, ValueError, WatchdogError) as exc:
+            raise RunpodLifecycleError(
+                "live host re-arm watchdog acknowledgement or heartbeat is invalid"
+            ) from exc
+
+    require_live_host_watcher()
     new_environment = pod_environment(hf_token=hf_token, session_nonce=session_nonce)
     stored_machine_hash = pod.get("machine_id_hash")
     if stored_machine_hash is not None and not isinstance(stored_machine_hash, str):
@@ -1671,6 +1982,17 @@ def rearm_approved_pod(
         expected_session_hash=previous.session_hash,
         expected_machine_hash=stored_machine_hash,
     )
+    pre_start_last_started_at = live.get("lastStartedAt")
+    if (
+        not isinstance(pre_start_last_started_at, str)
+        or not pre_start_last_started_at.strip()
+        or len(pre_start_last_started_at) > 256
+        or any(ord(character) < 32 for character in pre_start_last_started_at)
+    ):
+        raise RunpodLifecycleError(
+            "RunPod pre-start lastStartedAt evidence is missing or malformed"
+        )
+    sanitized_live["pre_start_last_started_at"] = pre_start_last_started_at
     _verify_provider_binding(stored_pod=pod, live_pod=sanitized_live)
     old_environment = _require_exact_environment(
         live.get("env"),
@@ -1719,16 +2041,34 @@ def rearm_approved_pod(
         expected_machine_hash=str(sanitized_live["machine_id_hash"]),
     )
     _verify_provider_binding(stored_pod=sanitized_live, live_pod=sanitized_patched)
+    if patched_raw.get("lastStartedAt") != pre_start_last_started_at:
+        raise RunpodLifecycleError(
+            "RunPod lastStartedAt changed before the authorized start request"
+        )
+    start_identity_pod = {
+        **sanitized_patched,
+        "pre_start_last_started_at": pre_start_last_started_at,
+    }
     patched_state = {
         **intent,
         "operation": "rearm_patched",
         "updated_at": _utc_timestamp(now),
-        "pod": sanitized_patched,
+        "pod": start_identity_pod,
     }
     _replace_state(state_path, patched_state)
+    start_intent = {
+        **patched_state,
+        "operation": "rearm_start_intent",
+        "updated_at": _utc_timestamp(now),
+    }
+    _replace_state(state_path, start_intent)
+    # Persist the uncertain-mutation boundary first, then re-check immediately
+    # before the only billable mutation. A watcher that exited after its first
+    # acknowledgement must never authorize POST /start.
+    require_live_host_watcher()
     client.start_pod_v1(pod_id=pod_id)
     start_requested = {
-        **patched_state,
+        **start_intent,
         "operation": "rearm_start_requested",
         "updated_at": _utc_timestamp(now),
     }
@@ -1737,7 +2077,7 @@ def rearm_approved_pod(
         client=client,
         state_path=state_path,
         state=start_requested,
-        identity_pod=sanitized_patched,
+        identity_pod=start_identity_pod,
         authorization=authorization,
         expected_environment=patch_environment,
         expected_name=name,

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Create, inspect, or re-arm the one approved RunPod Pod.
+"""Inspect or re-arm the one approved RunPod Pod.
 
-All paid mutations are guarded by the independently constructed approval
-bindings and a pre-created active GPU budget reservation.  Provider and model
-tokens are read from the environment and never printed or persisted.
+The underlying module retains creation/recovery primitives for forensic tests,
+but this frozen take-home CLI disables fresh creation before any credential or
+provider client is constructed. All paid re-arm mutations are guarded by the
+independently constructed approval bindings and a pre-created active GPU budget
+reservation.
 """
 
 from __future__ import annotations
@@ -39,15 +41,14 @@ from model_forensics.gpu_budget import (
     GpuPhaseBudgetReservation,
     load_gpu_phase_budget_reservation,
 )
+from model_forensics.paid_bundle_rotation import paid_bundle_lock
 from model_forensics.runpod_lifecycle import (
     HttpTransport,
     RunpodLifecycleClient,
     authorize_gpu_lifecycle,
-    create_approved_pod,
     lifecycle_state_path,
     read_lifecycle_status,
     rearm_approved_pod,
-    recover_created_pod,
     urllib_http_transport,
 )
 
@@ -231,7 +232,7 @@ def _add_paid_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--approval", default=f".runpod/{APPROVAL_FILENAME}")
     parser.add_argument("--reservation", required=True)
-    parser.add_argument("--cost-ledger", default="cost_ledger.yaml")
+    parser.add_argument("--cost-ledger", default="data/manifests/cost_ledger.yaml")
     parser.add_argument("--phase", required=True)
     parser.add_argument("--session-id-env", default="GPU_BUDGET_SESSION_ID")
     parser.add_argument("--hf-token-env", default="HF_TOKEN")
@@ -268,6 +269,7 @@ def _parser() -> argparse.ArgumentParser:
 
     rearm = subparsers.add_parser("rearm", help="re-arm and start the same stopped Pod")
     _add_paid_arguments(rearm)
+    rearm.add_argument("--host-rearm-ack", required=True)
     return parser
 
 
@@ -283,48 +285,34 @@ def main(
 ) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.operation in {"create", "recover-create"}:
+            raise LifecycleCliError(
+                "fresh Pod creation is disabled for this frozen execution; "
+                "use the authenticated stopped-Pod re-arm path"
+            )
         root = Path(args.project_root).resolve()
-        api_key = _secret_from_environment(args.api_key_env, label="RunPod API key")
         if args.operation == "status":
+            api_key = _secret_from_environment(args.api_key_env, label="RunPod API key")
             client = RunpodLifecycleClient(api_key=api_key, transport=transport)
             result = read_lifecycle_status(project_root=root, client=client)
         else:
-            context = _load_paid_context(args)
-            nonce = _secret_from_environment(args.session_id_env, label="GPU session nonce")
-            hf_token = _secret_from_environment(args.hf_token_env, label="Hugging Face token")
-            authorization = authorize_gpu_lifecycle(
-                approval=context.approval,
-                expected_bindings=context.bindings,
-                reservation=context.reservation,
-                ledger=context.ledger,
-                phase=args.phase,
-                session_nonce=nonce,
-            )
-            # Construct the provider client only after every offline approval,
-            # quote, immutable-spec, ledger, reservation, and nonce gate passes.
-            client = RunpodLifecycleClient(api_key=api_key, transport=transport)
-            if args.operation == "create":
-                name = args.name or f"model-forensics-{args.phase.removesuffix('_gpu')}"
-                result = create_approved_pod(
+            with paid_bundle_lock(project_root=root, exclusive=False):
+                api_key = _secret_from_environment(args.api_key_env, label="RunPod API key")
+                context = _load_paid_context(args)
+                nonce = _secret_from_environment(args.session_id_env, label="GPU session nonce")
+                hf_token = _secret_from_environment(args.hf_token_env, label="Hugging Face token")
+                authorization = authorize_gpu_lifecycle(
                     project_root=context.root,
-                    client=client,
-                    authorization=authorization,
-                    name=name,
-                    hf_token=hf_token,
-                    session_nonce=nonce,
-                    acknowledged_existing_pod_id_hashes=(
-                        args.allow_existing_pod_id_hash
-                    ),
-                )
-            elif args.operation == "recover-create":
-                result = recover_created_pod(
-                    project_root=context.root,
-                    client=client,
-                    authorization=authorization,
-                    hf_token=hf_token,
+                    approval=context.approval,
+                    expected_bindings=context.bindings,
+                    reservation=context.reservation,
+                    ledger=context.ledger,
+                    phase=args.phase,
                     session_nonce=nonce,
                 )
-            else:
+                # Keep the shared bundle lock until every provider mutation and
+                # verification has returned.
+                client = RunpodLifecycleClient(api_key=api_key, transport=transport)
                 result = rearm_approved_pod(
                     project_root=context.root,
                     client=client,
@@ -332,6 +320,7 @@ def main(
                     ledger=context.ledger,
                     hf_token=hf_token,
                     session_nonce=nonce,
+                    host_watchdog_ack_path=args.host_rearm_ack,
                 )
         print(json.dumps(_safe_output(result, root=root), ensure_ascii=True, sort_keys=True))
         return 0
